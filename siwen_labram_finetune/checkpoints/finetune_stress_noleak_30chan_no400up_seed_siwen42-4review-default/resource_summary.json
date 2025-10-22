@@ -1,0 +1,14 @@
+{
+    "total_training_time_seconds": 646.3550934791565,
+    "total_training_time_readable": "0:10:46",
+    "total_epochs": 50,
+    "average_time_per_epoch_seconds": 12.927102031707763,
+    "gpu_0_avg_memory_allocated_GB": 0.12539851311409828,
+    "gpu_0_max_memory_allocated_GB": 17.43715524673462,
+    "gpu_0_avg_utilization_%": 29.980198019801982,
+    "gpu_0_max_utilization_%": 91.0,
+    "avg_cpu_percent": 36.02376237623763,
+    "max_cpu_percent": 68.5,
+    "avg_ram_used_GB": 248.5819251560929,
+    "max_ram_used_GB": 482.6491241455078
+}
