@@ -1,4 +1,6 @@
 #!/bin/bash
+
+# Stress Dataset setting
 chan=30
 CUDA_VISIBLE_DEVICES=0 python run_class_finetuning.py \
      --output_dir ./checkpoints/finetune_stress_noleak_${chan}chan_no400up_seed_siwen42-4review-default \
