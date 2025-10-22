@@ -32,9 +32,12 @@ import utils
 from scipy import interpolate
 import modeling_finetune
 
+import psutil  # 添加這行
+import GPUtil  # 添加這行（需要先安裝: pip install gputil）
+
 def get_args():
     parser = argparse.ArgumentParser('LaBraM fine-tuning and evaluation script for EEG classification', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int)
+    parser.add_argument('--batch_size', default=512, type=int)
     parser.add_argument('--epochs', default=30, type=int)
     parser.add_argument('--update_freq', default=1, type=int)
     parser.add_argument('--save_ckpt_freq', default=5, type=int)
@@ -118,6 +121,10 @@ def get_args():
                         help='Do not random erase first (clean) augmentation split')
 
     # * Finetuning params
+    parser.add_argument('--dataset_path', default='',
+                        help='path to dataset')                        
+    parser.add_argument('--channel_size', default=30, type=int,
+                        help='number of the classification types')
     parser.add_argument('--finetune', default='',
                         help='finetune from checkpoint')
     parser.add_argument('--model_key', default='model|module', type=str)
@@ -226,10 +233,16 @@ def get_dataset(args):
         args.nb_classes = 6
         metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
     elif args.dataset == 'Stress':
-        train_dataset, test_dataset, val_dataset = utils.prepare_TUAB_dataset("D:/LaBraM-main/Stress_noleak_30chan_no400up_seed7")
-        ch_names = ['FP1', 'FP2', 'F7', 'F3', 'FZ', 'F4', 'F8', 'FT7', 'FC3', 'FCZ', 'FC4', 'FT8', 'T3', 'C3', 'CZ', 'C4', 'T4', 'TP7', 'CP3', 'CPZ', 'CP4', 'TP8', 'T5', 'P3', 'PZ', 'P4', 'T6', 'O1', 'OZ', 'O2']
-        #ch_names = ['FP1','FP2','F3','FZ','F4','FC3','FCZ','FC4','C3','CZ','C4']
-        #ch_names= ['FP1','F7','F3','F8','FZ','FC4', 'FT8', 'T3', 'C3', 'CZ', 'T4', 'TP7', 'CP3', 'CPZ', 'CP4','T5', 'P3', 'PZ', 'P4', 'T6']
+        train_dataset, test_dataset, val_dataset = utils.prepare_TUAB_dataset(args.dataset_path)
+        ch_names = []
+        if args.channel_size == 30:
+            ch_names = ['FP1', 'FP2', 'F7', 'F3', 'FZ', 'F4', 'F8', 'FT7', 'FC3', 'FCZ', 'FC4', 'FT8', 'T3', 'C3', 'CZ', 'C4', 'T4', 'TP7', 'CP3', 'CPZ', 'CP4', 'TP8', 'T5', 'P3', 'PZ', 'P4', 'T6', 'O1', 'OZ', 'O2']
+        elif args.channel_size == 20:
+            ch_names= ['FP1','F7','F3','F8','FZ','FC4', 'FT8', 'T3', 'C3', 'CZ', 'T4', 'TP7', 'CP3', 'CPZ', 'CP4','T5', 'P3', 'PZ', 'P4', 'T6']
+        elif args.channel_size == 11:
+            ch_names = ['FP1','FP2','F3','FZ','F4','FC3','FCZ','FC4','C3','CZ','C4']
+        else:
+            raise ValueError(f"Undefined channel size: {args.channel_size}")
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
         args.nb_classes = 1
         metrics = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
@@ -245,6 +258,56 @@ def main(args, ds_init):
     print(args)
 
     device = torch.device(args.device)
+
+    
+    # 初始化資源監控
+    training_start_time = time.time()
+    gpu_logs = []
+    
+    def log_gpu_usage(epoch, step=None):
+        """記錄GPU使用情況"""
+        if torch.cuda.is_available():
+            gpu_stats = {
+                'epoch': epoch,
+                'step': step,
+                'timestamp': time.time() - training_start_time,
+            }
+            
+            # 使用 torch 獲取GPU信息
+            for i in range(torch.cuda.device_count()):
+                gpu_stats[f'gpu_{i}_memory_allocated_GB'] = torch.cuda.memory_allocated(i) / 1024**3
+                gpu_stats[f'gpu_{i}_memory_reserved_GB'] = torch.cuda.memory_reserved(i) / 1024**3
+                gpu_stats[f'gpu_{i}_max_memory_allocated_GB'] = torch.cuda.max_memory_allocated(i) / 1024**3
+            
+            # 使用 GPUtil 獲取更詳細信息（如果可用）
+            try:
+                gpus = GPUtil.getGPUs()
+                for i, gpu in enumerate(gpus):
+                    gpu_stats[f'gpu_{i}_utilization_%'] = gpu.load * 100
+                    gpu_stats[f'gpu_{i}_temperature_C'] = gpu.temperature
+                    gpu_stats[f'gpu_{i}_memory_used_GB'] = gpu.memoryUsed / 1024
+                    gpu_stats[f'gpu_{i}_memory_total_GB'] = gpu.memoryTotal / 1024
+            except:
+                pass
+            
+            # CPU和系統資源
+            gpu_stats['cpu_percent'] = psutil.cpu_percent(interval=0.1)
+            gpu_stats['ram_used_GB'] = psutil.virtual_memory().used / 1024**3
+            gpu_stats['ram_percent'] = psutil.virtual_memory().percent
+            
+            gpu_logs.append(gpu_stats)
+            return gpu_stats
+        return None
+    
+    # 記錄訓練開始時的GPU狀態
+    initial_gpu_stats = log_gpu_usage(epoch=-1, step=0)
+    if initial_gpu_stats and utils.is_main_process():
+        print("\n" + "="*50)
+        print("Initial GPU Status:")
+        for key, value in initial_gpu_stats.items():
+            if key not in ['epoch', 'step', 'timestamp']:
+                print(f"  {key}: {value:.2f}")
+        print("="*50 + "\n")
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
@@ -484,6 +547,12 @@ def main(args, ds_init):
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
+
+        
+        epoch_start_time = time.time()
+        # 記錄epoch開始時的GPU狀態
+        log_gpu_usage(epoch=epoch, step=0)
+
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer,
             device, epoch, loss_scaler, args.clip_grad, model_ema,
@@ -493,6 +562,25 @@ def main(args, ds_init):
             ch_names=ch_names, is_binary=args.nb_classes == 1
         )
         
+        
+        epoch_time = time.time() - epoch_start_time
+        # 記錄epoch結束時的GPU狀態
+        gpu_stats = log_gpu_usage(epoch=epoch, step='end')
+        
+        # 打印epoch時間和GPU使用情況
+        if utils.is_main_process():
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch} completed in {epoch_time/60:.2f} minutes ({epoch_time:.2f} seconds)")
+            if gpu_stats:
+                print(f"GPU Memory Usage:")
+                for i in range(torch.cuda.device_count()):
+                    if f'gpu_{i}_memory_allocated_GB' in gpu_stats:
+                        print(f"  GPU {i}: {gpu_stats[f'gpu_{i}_memory_allocated_GB']:.2f} GB allocated, "
+                              f"{gpu_stats[f'gpu_{i}_max_memory_allocated_GB']:.2f} GB max")
+                    if f'gpu_{i}_utilization_%' in gpu_stats:
+                        print(f"  GPU {i} Utilization: {gpu_stats[f'gpu_{i}_utilization_%']:.1f}%")
+            print(f"{'='*60}\n")
+
         if args.output_dir and args.save_ckpt:
             utils.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
@@ -564,7 +652,56 @@ def main(args, ds_init):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-
+    
+    # 保存詳細的資源使用報告
+    if args.output_dir and utils.is_main_process():
+        # 計算平均GPU使用率
+        if gpu_logs:
+            import pandas as pd
+            df = pd.DataFrame(gpu_logs)
+            
+            # 生成摘要統計
+            summary = {
+                'total_training_time_seconds': time.time() - training_start_time,
+                'total_training_time_readable': str(datetime.timedelta(seconds=int(time.time() - training_start_time))),
+                'total_epochs': args.epochs,
+                'average_time_per_epoch_seconds': (time.time() - training_start_time) / args.epochs,
+            }
+            
+            # GPU統計
+            for i in range(torch.cuda.device_count()):
+                if f'gpu_{i}_memory_allocated_GB' in df.columns:
+                    summary[f'gpu_{i}_avg_memory_allocated_GB'] = df[f'gpu_{i}_memory_allocated_GB'].mean()
+                    summary[f'gpu_{i}_max_memory_allocated_GB'] = df[f'gpu_{i}_max_memory_allocated_GB'].max()
+                if f'gpu_{i}_utilization_%' in df.columns:
+                    summary[f'gpu_{i}_avg_utilization_%'] = df[f'gpu_{i}_utilization_%'].mean()
+                    summary[f'gpu_{i}_max_utilization_%'] = df[f'gpu_{i}_utilization_%'].max()
+            
+            # CPU和RAM統計
+            if 'cpu_percent' in df.columns:
+                summary['avg_cpu_percent'] = df['cpu_percent'].mean()
+                summary['max_cpu_percent'] = df['cpu_percent'].max()
+            if 'ram_used_GB' in df.columns:
+                summary['avg_ram_used_GB'] = df['ram_used_GB'].mean()
+                summary['max_ram_used_GB'] = df['ram_used_GB'].max()
+            
+            # 保存摘要
+            with open(os.path.join(args.output_dir, "resource_summary.json"), "w") as f:
+                json.dump(summary, f, indent=4)
+            
+            # 保存詳細日誌
+            df.to_csv(os.path.join(args.output_dir, "resource_logs.csv"), index=False)
+            
+            # 打印摘要
+            print("\n" + "="*60)
+            print("Training Resource Summary:")
+            print("="*60)
+            for key, value in summary.items():
+                if isinstance(value, float):
+                    print(f"{key}: {value:.2f}")
+                else:
+                    print(f"{key}: {value}")
+            print("="*60 + "\n")
 
 if __name__ == '__main__':
     opts, ds_init = get_args()
