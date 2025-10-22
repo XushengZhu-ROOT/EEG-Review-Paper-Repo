@@ -8,8 +8,8 @@ GPU_VISIBLE = "3,4,5"
 
 ### 2. **Download the pretrained EEGPT checkpoint**
 
-Download the EEGPT pretraining checkpoint here:
-👉 [EEGPT Checkpoint]([https://your-checkpoint-link-here](https://figshare.com/s/e37df4f8a907a866df4b))
+Download the EEGPT pretraining checkpoint here:  
+👉 [EEGPT Checkpoint](https://figshare.com/s/e37df4f8a907a866df4b)
 
 After downloading, place it in this folder or update the path inside the script:
 
