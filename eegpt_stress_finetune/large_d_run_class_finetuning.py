@@ -86,7 +86,7 @@ class Config:
     eegpt_seq_len:  int = 1024
 
     # Checkpoint path (Lightning .ckpt from EEGPT pretraining)
-    ckpt_path: str = "./EEGPT_large_D-epoch=098-valid_loss=0.47960.ckpt"
+    ckpt_path: str = "./eegpt_mcae_58chs_4s_large4E.ckpt"
 
     # Model capacity (will be overwritten by ckpt introspection)
     embed_dim: int = 512
