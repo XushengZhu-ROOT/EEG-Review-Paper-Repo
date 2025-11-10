@@ -141,6 +141,7 @@ def get_args():
     # Dataset parameters
     parser.add_argument('--nb_classes', default=0, type=int,
                         help='number of the classification types')
+    parser.add_argument('--pos_weight', default=None, type=float)
 
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
@@ -550,7 +551,10 @@ def main(args, ds_init):
     print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
     if args.nb_classes == 1:
-        criterion = torch.nn.BCEWithLogitsLoss()
+        if args.pos_weight:
+            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([args.pos_weight]).to(device))
+        else:
+            criterion = torch.nn.BCEWithLogitsLoss()
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
