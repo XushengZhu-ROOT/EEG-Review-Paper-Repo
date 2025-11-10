@@ -13,10 +13,13 @@ class CustomDataset(Dataset):
             self,
             data_dir,
             mode='train',
+            channel_size=30,
+            window_size=5,
     ):
         super(CustomDataset, self).__init__()
         self.files = [os.path.join(data_dir, mode, file) for file in os.listdir(os.path.join(data_dir, mode))]
-
+        self.channel_size = channel_size
+        self.window_size = window_size
 
     def __len__(self):
         return len((self.files))
@@ -28,7 +31,7 @@ class CustomDataset(Dataset):
         # print("Shape of data[X]: ", data.shape)
         label = data_dict['y']
         # data = signal.resample(data, 2000, axis=-1)
-        data = data.reshape(30, 5, 200) # for 30 channels
+        data = data.reshape(self.channel_size, self.window_size, 200) # for 30 channels
         return data/100, label
 
     def collate(self, batch):
@@ -41,11 +44,13 @@ class LoadDataset(object):
     def __init__(self, params):
         self.params = params
         self.datasets_dir = params.datasets_dir
+        self.channel_size = params.channel_size
+        self.window_size = params.window_size
 
     def get_data_loader(self):
-        train_set = CustomDataset(self.datasets_dir, mode='train')
-        val_set = CustomDataset(self.datasets_dir, mode='val')
-        test_set = CustomDataset(self.datasets_dir, mode='test')
+        train_set = CustomDataset(self.datasets_dir, mode='train', channel_size=self.channel_size, window_size=self.window_size)
+        val_set = CustomDataset(self.datasets_dir, mode='val', channel_size=self.channel_size, window_size=self.window_size)
+        test_set = CustomDataset(self.datasets_dir, mode='test', channel_size=self.channel_size, window_size=self.window_size)
         print(len(train_set), len(val_set), len(test_set))
         print(len(train_set) + len(val_set) + len(test_set))
         data_loader = {
