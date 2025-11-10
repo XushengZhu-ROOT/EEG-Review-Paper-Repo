@@ -23,28 +23,25 @@ from model import (
     BIOTClassifier,
     Ada_BIOT,
     Labram_style_BIOTClassifier,
-    Labram_style_Ada_BIOT
+    Labram_style_Ada_BIOT,
+    CBraMod_3lyStyle_LayerNorm_BIOT,
+    CBraMod_3lyStyle_LayerNorm_Ada_BIOT
 )
-from utils import TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE
+from utils import KaggleERNLoader, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE
 
 
 class LitModel_finetune(pl.LightningModule):
-    def __init__(self, args, model):
+    def __init__(self, args, model, test_loader=None):
         super().__init__()
         self.model = model
         self.threshold = 0.5
         self.args = args
+        self.test_loader = test_loader 
 
     def training_step(self, batch, batch_idx):
         X, y = batch
         prob = self.model(X)
-
-        # 【修正】對於 BCE 損失，我們只需要正類別 (索引 1) 的 Logit
-        # prob = prob # 選擇 Logit for class 1。尺寸現在是 (B,)
-        prob = prob[:, 1] # 選擇 Logit for class 1。尺寸現在是 (B,)
-        y = y.squeeze(-1)      # 確保 y 的尺寸是 (B,)
-
-        loss = BCE(prob, y)  # focal_loss(prob, y)
+        loss = BCE(prob, y, self.args.pos_weight)
         self.log("train_loss", loss)
         return loss
 
@@ -52,14 +49,8 @@ class LitModel_finetune(pl.LightningModule):
         X, y = batch
         with torch.no_grad():
             prob = self.model(X)
-
-            # 【修正】從 (B, 2) 中選取類別 1 的機率 (索引 1)，並壓縮成 1-D (B,) 
-            # step_result = torch.sigmoid(prob).cpu().numpy()
-            step_result = torch.sigmoid(prob)[:, 1].cpu().numpy()
-
-            # 【修正】確保 y 是 1-D 陣列 (B,)
-            # step_gt = y.cpu().numpy()
-            step_gt = y.cpu().numpy().squeeze() 
+            step_result = torch.sigmoid(prob).cpu().numpy()
+            step_gt = y.cpu().numpy() 
             
         return step_result, step_gt
 
@@ -74,35 +65,108 @@ class LitModel_finetune(pl.LightningModule):
             sum(gt) * (len(gt) - sum(gt)) != 0
         ):  # to prevent all 0 or all 1 and raise the AUROC error
             self.threshold = np.sort(result)[-int(np.sum(gt))]
-            result = binary_metrics_fn(
+            val_result = binary_metrics_fn(
                 gt,
                 result,
                 metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"],
                 threshold=self.threshold,
             )
         else:
-            result = {
+            val_result = {
                 "accuracy": 0.0,
                 "balanced_accuracy": 0.0,
                 "pr_auc": 0.0,
                 "roc_auc": 0.0,
             }
-        self.log("val_acc", result["accuracy"], sync_dist=True)
-        self.log("val_bacc", result["balanced_accuracy"], sync_dist=True)
-        self.log("val_pr_auc", result["pr_auc"], sync_dist=True)
-        self.log("val_auroc", result["roc_auc"], sync_dist=True)
-        print(result)
+        self.log("val_acc", val_result["accuracy"], sync_dist=True)
+        self.log("val_bacc", val_result["balanced_accuracy"], sync_dist=True)
+        self.log("val_pr_auc", val_result["pr_auc"], sync_dist=True)
+        self.log("val_auroc", val_result["roc_auc"], sync_dist=True)
+
+        test_results = self._run_test_epoch()
+
+        if self.logger: # 確保 logger 存在
+            log_dir = self.logger.log_dir
+            log_file = os.path.join(log_dir, "training_logs.jsonl")
+            
+            # 建立日誌條目
+            log_entry = {
+                'epoch': self.current_epoch,
+                'step': self.global_step,
+                'type': 'validation+test',
+                'val_metrics': val_result,
+                'test_metrics': test_results,
+            }
+            
+            # 以附加模式 (append) 寫入，確保每次 epoch 都是新的一行
+            try:
+                with open(log_file, 'a') as f:
+                    f.write(json.dumps(log_entry) + '\n')
+            except Exception as e:
+                print(f"Warning: Could not write to metrics.jsonl: {e}")
+
+    def _run_test_epoch(self):
+        """Run one test epoch manually during validation."""
+        self.model.eval()
+        preds, targets = [], []
+
+        # 取得 test dataloader
+        test_loader = self.test_loader
+        if test_loader is None:
+            print("Warning: No test dataloader found, skipping test evaluation.")
+            return {
+                "accuracy": 0.0,
+                "balanced_accuracy": 0.0,
+                "pr_auc": 0.0,
+                "roc_auc": 0.0,
+            }
+
+        with torch.no_grad():
+            for batch in test_loader:
+                X, y = batch
+                X = X.to(self.device)
+                y = y.to(self.device)
+
+                prob = torch.sigmoid(self.model(X))
+                preds.append(prob.cpu().numpy())
+                targets.append(y.cpu().numpy())
+
+        # 合併所有 batch 結果
+        preds = np.concatenate(preds)
+        targets = np.concatenate(targets)
+
+        # 計算 metrics
+        if np.sum(targets) * (len(targets) - np.sum(targets)) != 0:
+            test_result = binary_metrics_fn(
+                targets,
+                preds,
+                metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"],
+                threshold=self.threshold,
+            )
+        else:
+            test_result = {
+                "accuracy": 0.0,
+                "balanced_accuracy": 0.0,
+                "pr_auc": 0.0,
+                "roc_auc": 0.0,
+            }
+
+        # log for monitoring
+        self.log("test_acc", test_result["accuracy"], sync_dist=True)
+        self.log("test_bacc", test_result["balanced_accuracy"], sync_dist=True)
+        self.log("test_pr_auc", test_result["pr_auc"], sync_dist=True)
+        self.log("test_auroc", test_result["roc_auc"], sync_dist=True)
+
+        self.model.train()  
+        return test_result
 
     def test_step(self, batch, batch_idx):
         X, y = batch
         with torch.no_grad():
             convScore = self.model(X)
 
-            # 【修正】選擇類別 1 的 Logit，然後計算 sigmoid
-            # step_result = torch.sigmoid(convScore).cpu().numpy()
-            # step_gt = y.cpu().numpy()
-            step_result = torch.sigmoid(convScore[:, 1]).cpu().numpy()
-            step_gt = y.squeeze(-1).cpu().numpy() 
+            step_result = torch.sigmoid(convScore).cpu().numpy()
+            step_gt = y.cpu().numpy()
             
         return step_result, step_gt
 
@@ -488,6 +552,7 @@ if __name__ == "__main__":
         "--dataset_channels", type=int, default=None,  # 如果為 None，則使用 in_channels
         help="actual number of channels in dataset (if different from pretrained model)"
     )
+    parser.add_argument('--pos_weight', default=None, type=float)
     parser.add_argument(
         "--model", type=str, default="SPaRCNet", help="which supervised model to use"
     )
