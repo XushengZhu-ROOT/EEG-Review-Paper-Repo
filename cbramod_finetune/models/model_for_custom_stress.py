@@ -28,13 +28,13 @@ class Model(nn.Module):
         elif param.classifier == 'all_patch_reps_onelayer':
             self.classifier = nn.Sequential(
                 Rearrange('b c s d -> b (c s d)'),
-                nn.Linear(30 * 5 * 200, 1),
+                nn.Linear(param.channel_size * param.window_size * 200, 1),
                 Rearrange('b 1 -> (b 1)'),
             )
         elif param.classifier == 'all_patch_reps_twolayer':
             self.classifier = nn.Sequential(
                 Rearrange('b c s d -> b (c s d)'),
-                nn.Linear(30 * 5 * 200, 200),
+                nn.Linear(param.channel_size * param.window_size * 200, 200),
                 nn.ELU(),
                 nn.Dropout(param.dropout),
                 nn.Linear(200, 1),
@@ -43,10 +43,23 @@ class Model(nn.Module):
         elif param.classifier == 'all_patch_reps':
             self.classifier = nn.Sequential(
                 Rearrange('b c s d -> b (c s d)'),
-                nn.Linear(30 * 5 * 200, 5 * 200),
+                nn.Linear(param.channel_size * param.window_size * 200, param.window_size * 200),
                 nn.ELU(),
                 nn.Dropout(param.dropout),
-                nn.Linear(5 * 200, 200),
+                nn.Linear(param.window_size * 200, 200),
+                nn.ELU(),
+                nn.Dropout(param.dropout),
+                nn.Linear(200, 1),
+                Rearrange('b 1 -> (b 1)'),
+            )
+        elif param.classifier == 'all_patch_reps_layernorm':
+            self.classifier = nn.Sequential(
+                Rearrange('b c s d -> b (c s d)'),
+                nn.LayerNorm(param.channel_size * param.window_size * 200),
+                nn.Linear(param.channel_size * param.window_size * 200, param.window_size * 200),
+                nn.ELU(),
+                nn.Dropout(param.dropout),
+                nn.Linear(param.window_size * 200, 200),
                 nn.ELU(),
                 nn.Dropout(param.dropout),
                 nn.Linear(200, 1),
@@ -55,8 +68,8 @@ class Model(nn.Module):
         elif param.classifier == 'Labram_style_classifier':
             self.classifier = nn.Sequential(
                 Rearrange('b c s d -> b (c s d)'),
-                nn.LayerNorm(30 * 5 * 200),
-                nn.Linear(30 * 5 * 200, 1),
+                nn.LayerNorm(param.channel_size * param.window_size * 200),
+                nn.Linear(param.channel_size * param.window_size * 200, 1),
                 Rearrange('b 1 -> (b 1)'),
             )
             
