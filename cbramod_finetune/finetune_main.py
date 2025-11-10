@@ -1,17 +1,41 @@
 import argparse
 import random
+import yaml
+import os
 
 import numpy as np
 import torch
 
 from datasets import faced_dataset, seedv_dataset, physio_dataset, shu_dataset, isruc_dataset, chb_dataset, \
     speech_dataset, mumtaz_dataset, seedvig_dataset, stress_dataset, tuev_dataset, tuab_dataset, bciciv2a_dataset, \
-    custom_stress_dataset
+    custom_stress_dataset, kaggleern_dataset
 from finetune_trainer import Trainer
 from models import model_for_faced, model_for_seedv, model_for_physio, model_for_shu, model_for_isruc, model_for_chb, \
     model_for_speech, model_for_mumtaz, model_for_seedvig, model_for_stress, model_for_tuev, model_for_tuab, \
-    model_for_bciciv2a, model_for_custom_stress
+    model_for_bciciv2a, model_for_custom_stress, model_for_kaggleern
 
+def save_config(params):
+    """Saves the configuration parameters to a YAML file."""
+    try:
+        os.makedirs(params.model_dir, exist_ok=True)
+        config_path = os.path.join(params.model_dir, 'config.yaml')
+        params_dict = vars(params)
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(params_dict, f, default_flow_style=False, allow_unicode=True)
+        print(f"Configuration saved to {config_path}")
+    except Exception as e:
+        print(f"Error saving configuration: {e}")
+
+def save_architecture(model, model_dir):
+    """Saves the model architecture to a text file."""
+    try:
+        os.makedirs(model_dir, exist_ok=True)
+        arch_path = os.path.join(model_dir, 'model_architecture.txt')
+        with open(arch_path, 'w', encoding='utf-8') as f:
+            f.write(str(model))
+        print(f"Model architecture saved to {arch_path}")
+    except Exception as e:
+        print(f"Error saving model architecture: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description='Big model downstream')
@@ -57,6 +81,7 @@ def main():
 
     params = parser.parse_args()
     print(params)
+    save_config(params)
 
     setup_seed(params.seed)
     torch.cuda.set_device(params.cuda)
@@ -65,84 +90,98 @@ def main():
         load_dataset = faced_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_faced.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_multiclass()
     elif params.downstream_dataset == 'SEED-V':
         load_dataset = seedv_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_seedv.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_multiclass()
     elif params.downstream_dataset == 'PhysioNet-MI':
         load_dataset = physio_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_physio.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_multiclass()
     elif params.downstream_dataset == 'SHU-MI':
         load_dataset = shu_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_shu.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_binaryclass()
     elif params.downstream_dataset == 'ISRUC':
         load_dataset = isruc_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_isruc.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_multiclass()
     elif params.downstream_dataset == 'CHB-MIT':
         load_dataset = chb_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_chb.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_binaryclass()
     elif params.downstream_dataset == 'BCIC2020-3':
         load_dataset = speech_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_speech.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_multiclass()
     elif params.downstream_dataset == 'Mumtaz2016':
         load_dataset = mumtaz_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_mumtaz.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_binaryclass()
     elif params.downstream_dataset == 'SEED-VIG':
         load_dataset = seedvig_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_seedvig.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_regression()
     elif params.downstream_dataset == 'MentalArithmetic':
         load_dataset = stress_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_stress.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_binaryclass()
     elif params.downstream_dataset == 'TUEV':
         load_dataset = tuev_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_tuev.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_multiclass()
     elif params.downstream_dataset == 'TUAB':
         load_dataset = tuab_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_tuab.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_binaryclass()
     elif params.downstream_dataset == 'BCIC-IV-2a':
         load_dataset = bciciv2a_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_bciciv2a.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_multiclass()
     elif params.downstream_dataset == 'CustomStress':
         load_dataset = custom_stress_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_custom_stress.Model(params)
+        save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_binaryclass()
     print('Done!!!!!')
