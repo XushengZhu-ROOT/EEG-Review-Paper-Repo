@@ -52,6 +52,13 @@ class Model(nn.Module):
                 nn.Linear(200, 1),
                 Rearrange('b 1 -> (b 1)'),
             )
+        elif param.classifier == 'Labram_style_classifier':
+            self.classifier = nn.Sequential(
+                Rearrange('b c s d -> b (c s d)'),
+                nn.LayerNorm(param.channel_size * param.window_size * 200),
+                nn.Linear(param.channel_size * param.window_size * 200, 1),
+                Rearrange('b 1 -> (b 1)'),
+            )
 
     def forward(self, x):
         bz, ch_num, seq_len, patch_size = x.shape
