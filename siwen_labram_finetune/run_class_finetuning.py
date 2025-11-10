@@ -76,6 +76,12 @@ def get_args():
     parser.add_argument('--model_ema_decay', type=float, default=0.9999, help='')
     parser.add_argument('--model_ema_force_cpu', action='store_true', default=False, help='')
 
+    parser.add_argument('--classifier_window_size', default=5, type=int,
+                        help='time window size for classifier [labram_base_patch200_200_cbramod3lyclassifier]')
+    parser.add_argument('--classifier_dropout', default=0.1, type=float,
+                        help='dropout for layers of classifier [labram_base_patch200_200_cbramod3lyclassifier]')
+
+
     # Optimizer parameters
     parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
                         help='Optimizer (default: "adamw"')
@@ -201,40 +207,86 @@ def get_args():
     return parser.parse_args(), ds_init
 
 def get_models(args):
-    model = create_model(
-        args.model,
-        pretrained=False,
-        num_classes=args.nb_classes,
-        drop_rate=args.drop,
-        drop_path_rate=args.drop_path,
-        attn_drop_rate=args.attn_drop_rate,
-        drop_block_rate=None,
-        use_mean_pooling=args.use_mean_pooling,
-        init_scale=args.init_scale,
-        use_rel_pos_bias=args.rel_pos_bias,
-        use_abs_pos_emb=args.abs_pos_emb,
-        init_values=args.layer_scale_init_value,
-        qkv_bias=args.qkv_bias,
-    )
+    if 'cbramod3lyclassifier' in args.model:
+        model = create_model(
+            args.model,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            drop_rate=args.drop,
+            drop_path_rate=args.drop_path,
+            attn_drop_rate=args.attn_drop_rate,
+            drop_block_rate=None,
+            use_mean_pooling=args.use_mean_pooling,
+            init_scale=args.init_scale,
+            use_rel_pos_bias=args.rel_pos_bias,
+            use_abs_pos_emb=args.abs_pos_emb,
+            init_values=args.layer_scale_init_value,
+            qkv_bias=args.qkv_bias,
+            channel_size=args.channel_size,
+            window_size=args.classifier_window_size,
+            classifier_dropout=args.classifier_dropout,
+        )
+    elif 'returnpatchtoken' in args.model:
+        model = create_model(
+            args.model,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            drop_rate=args.drop,
+            drop_path_rate=args.drop_path,
+            attn_drop_rate=args.attn_drop_rate,
+            drop_block_rate=None,
+            use_mean_pooling=args.use_mean_pooling,
+            init_scale=args.init_scale,
+            use_rel_pos_bias=args.rel_pos_bias,
+            use_abs_pos_emb=args.abs_pos_emb,
+            init_values=args.layer_scale_init_value,
+            qkv_bias=args.qkv_bias,
+            channel_size=args.channel_size,
+            window_size=args.classifier_window_size,
+        )
+    else:
+        model = create_model(
+            args.model,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            drop_rate=args.drop,
+            drop_path_rate=args.drop_path,
+            attn_drop_rate=args.attn_drop_rate,
+            drop_block_rate=None,
+            use_mean_pooling=args.use_mean_pooling,
+            init_scale=args.init_scale,
+            use_rel_pos_bias=args.rel_pos_bias,
+            use_abs_pos_emb=args.abs_pos_emb,
+            init_values=args.layer_scale_init_value,
+            qkv_bias=args.qkv_bias,
+        )
 
     return model
 
 
 def get_dataset(args):
     if args.dataset == 'TUAB':
-        train_dataset, test_dataset, val_dataset = utils.prepare_TUAB_dataset("D:/LaBraM-main/TUAB")
+        train_dataset, test_dataset, val_dataset = utils.prepare_TUAB_dataset(args.dataset_path)
         ch_names = ['EEG FP1', 'EEG FP2-REF', 'EEG F3-REF', 'EEG F4-REF', 'EEG C3-REF', 'EEG C4-REF', 'EEG P3-REF', 'EEG P4-REF', 'EEG O1-REF', 'EEG O2-REF', 'EEG F7-REF', \
                     'EEG F8-REF', 'EEG T3-REF', 'EEG T4-REF', 'EEG T5-REF', 'EEG T6-REF', 'EEG A1-REF', 'EEG A2-REF', 'EEG FZ-REF', 'EEG CZ-REF', 'EEG PZ-REF', 'EEG T1-REF', 'EEG T2-REF']
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
         args.nb_classes = 1
         metrics = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
     elif args.dataset == 'TUEV':
-        train_dataset, test_dataset, val_dataset = utils.prepare_TUEV_dataset("path/to/TUEV")
+        train_dataset, test_dataset, val_dataset = utils.prepare_TUEV_dataset(args.dataset_path)
         ch_names = ['EEG FP1-REF', 'EEG FP2-REF', 'EEG F3-REF', 'EEG F4-REF', 'EEG C3-REF', 'EEG C4-REF', 'EEG P3-REF', 'EEG P4-REF', 'EEG O1-REF', 'EEG O2-REF', 'EEG F7-REF', \
                     'EEG F8-REF', 'EEG T3-REF', 'EEG T4-REF', 'EEG T5-REF', 'EEG T6-REF', 'EEG A1-REF', 'EEG A2-REF', 'EEG FZ-REF', 'EEG CZ-REF', 'EEG PZ-REF', 'EEG T1-REF', 'EEG T2-REF']
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
         args.nb_classes = 6
         metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
+    elif args.dataset == 'KaggleERN':
+        train_dataset, test_dataset, val_dataset = utils.prepare_KaggleERN_dataset(args.dataset_path)
+        ch_names = ['FP1', 'FP2', 'AF7', 'AF3', 'AF4', 'AF8', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', \
+            'T7', 'C5', 'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', \
+            'PO7', 'POZ', 'O1', 'O2']
+        ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
+        args.nb_classes = 1
+        metrics = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
     elif args.dataset == 'Stress':
         train_dataset, test_dataset, val_dataset = utils.prepare_TUAB_dataset(args.dataset_path)
         ch_names = []
@@ -244,6 +296,8 @@ def get_dataset(args):
             ch_names= ['FP1','F7','F3','F8','FZ','FC4', 'FT8', 'T3', 'C3', 'CZ', 'T4', 'TP7', 'CP3', 'CPZ', 'CP4','T5', 'P3', 'PZ', 'P4', 'T6']
         elif args.channel_size == 11:
             ch_names = ['FP1','FP2','F3','FZ','F4','FC3','FCZ','FC4','C3','CZ','C4']
+        elif args.channel_size == 16:
+            ch_names = ['C4', 'O2', 'P3', 'FP1', 'F7', 'FP2', 'P4', 'O1', 'F8', 'F3', 'C3', 'F4', 'FT8', 'FT7', 'TP7', 'TP8']
         else:
             raise ValueError(f"Undefined channel size: {args.channel_size}")
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
