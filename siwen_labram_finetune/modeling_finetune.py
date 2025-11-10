@@ -464,17 +464,17 @@ class NeuralTransformer(nn.Module):
         return features
 
 class BinaryClassifierHead_CbramodStyle_3Ly_BCE(nn.Module):
-    def __init__(self, embed_dim=200, num_patches=150, dropout=0.5, init_scale=0.001):
+    def __init__(self, embed_dim=200, channel_size=30, window_size=5, dropout=0.5, init_scale=0.001):
         super().__init__()
-        input_dim = num_patches * embed_dim # 30000
+        input_dim = channel_size * window_size * embed_dim # 30 * 5 * 200 = 30000
         
         # 定義三層 MLP
         self.fc = nn.Sequential(
-            Rearrange('b c d -> b (c d)'), # (b, 150, 200)
-            nn.Linear(input_dim, 5 * embed_dim), # Layer 1: 30000 -> 1000
+            Rearrange('b c d -> b (c d)'), # (b, 150, 200) -> (b, 150*200)
+            nn.Linear(input_dim, window_size * embed_dim), # Layer 1: 30000 -> 1000
             nn.ELU(),
             nn.Dropout(dropout),
-            nn.Linear(5 * embed_dim, embed_dim), # Layer 2: 1000 -> 200
+            nn.Linear(window_size * embed_dim, embed_dim), # Layer 2: 1000 -> 200
             nn.ELU(),
             nn.Dropout(dropout),
             nn.Linear(embed_dim, 1), # Layer 3: 200 -> 1 (統一輸出 1 維 Logit)
@@ -495,7 +495,7 @@ class NeuralTransformer_Cbramod3lyClassifier_BCE(nn.Module):
                  num_heads=10, mlp_ratio=4., qkv_bias=False, qk_norm=None, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None,
                  use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False,
-                 use_mean_pooling=True, init_scale=0.001, classifier_dropout=0.1, **kwargs):
+                 use_mean_pooling=True, init_scale=0.001, channel_size=30, window_size=5, classifier_dropout=0.1, **kwargs):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
@@ -506,6 +506,8 @@ class NeuralTransformer_Cbramod3lyClassifier_BCE(nn.Module):
         self.patch_embed = TemporalConv(out_chans=out_chans) if in_chans == 1 else PatchEmbed(EEG_size=EEG_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         self.time_window = EEG_size // patch_size
         self.patch_size = patch_size
+        self.channel_size = channel_size
+        self.window_size = window_size
         self.classifier_dropout = classifier_dropout
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -529,8 +531,7 @@ class NeuralTransformer_Cbramod3lyClassifier_BCE(nn.Module):
             for i in range(depth)])
         self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
         self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
-        # self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        self.head = BinaryClassifierHead_CbramodStyle_3Ly_BCE(embed_dim=embed_dim, num_patches=150, dropout=self.classifier_dropout) if num_classes > 0 else nn.Identity() # 150 = 30 channel * 5 seconds
+        self.head = BinaryClassifierHead_CbramodStyle_3Ly_BCE(embed_dim=embed_dim, channel_size=self.channel_size, window_size=self.window_size, dropout=self.classifier_dropout) if num_classes > 0 else nn.Identity() # 150 = 30 channel * 5 seconds
 
         if self.pos_embed is not None:
             trunc_normal_(self.pos_embed, std=.02)
@@ -573,7 +574,7 @@ class NeuralTransformer_Cbramod3lyClassifier_BCE(nn.Module):
     def reset_classifier(self, num_classes, global_pool=''):
         self.num_classes = num_classes
         # self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        self.head = BinaryClassifierHead_CbramodStyle_3Ly_BCE(embed_dim=embed_dim, num_patches=150, dropout=self.classifier_dropout) if num_classes > 0 else nn.Identity() 
+        self.head = BinaryClassifierHead_CbramodStyle_3Ly_BCE(embed_dim=embed_dim, channel_size=self.channel_size, window_size=self.window_size, dropout=self.classifier_dropout) if num_classes > 0 else nn.Identity() # 150 = 30 channel * 5 seconds
 
     def forward_features(self, x, input_chans=None, return_patch_tokens=False, return_all_tokens=False, **kwargs):
         batch_size, n, a, t = x.shape
@@ -699,12 +700,13 @@ def labram_base_patch200_200(pretrained=False, **kwargs):
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     model.default_cfg = _cfg()
     return model
+
     
 @register_model
 def labram_base_patch200_200_cbramod3lyclassifier(pretrained=False, **kwargs):
     model = NeuralTransformer_Cbramod3lyClassifier_BCE(
         patch_size=200, embed_dim=200, depth=12, num_heads=10, mlp_ratio=4, qk_norm=partial(nn.LayerNorm, eps=1e-6), # qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), classifier_dropout=0.1, **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     model.default_cfg = _cfg()
     return model
 
