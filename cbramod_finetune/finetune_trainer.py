@@ -46,14 +46,11 @@ class Trainer(object):
         for name, param in self.model.named_parameters():
             if "backbone" in name:
                 backbone_params.append(param)
-
-                if params.frozen:
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
+                param.requires_grad = not params.frozen
             else:
                 other_params.append(param)
 
+        # 設定優化器
         if self.params.optimizer == 'AdamW':
             if self.params.multi_lr: # set different learning rates for different modules
                 self.optimizer = torch.optim.AdamW([
