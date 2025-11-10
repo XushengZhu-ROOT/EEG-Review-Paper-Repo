@@ -121,6 +121,8 @@ def get_args():
                         help='Do not random erase first (clean) augmentation split')
 
     # * Finetuning params
+    parser.add_argument('--freeze_backbone', action='store_true', default=False,
+                        help='Freeze all weights except the classification head (model.head)')
     parser.add_argument('--dataset_path', default='',
                         help='path to dataset')                        
     parser.add_argument('--channel_size', default=30, type=int,
@@ -442,6 +444,38 @@ def main(args, ds_init):
         utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
 
     model.to(device)
+
+    # freeze backbone
+    if args.freeze_backbone:
+        if utils.is_main_process():
+            print("\n" + "="*25 + " FREEZING BACKBONE " + "="*25)
+            print("All model parameters are frozen EXCEPT for the classifier head.")
+	
+        for param in model.parameters():
+            param.requires_grad = False
+	
+        unfrozen_parts = []
+	
+        # unfreeze fc_norm
+        if hasattr(model, 'fc_norm'):
+            for param in model.fc_norm.parameters():
+                param.requires_grad = True
+            unfrozen_parts.append("'model.fc_norm'")
+
+        # unfreeze head
+        if hasattr(model, 'head'):
+            for param in model.head.parameters():
+                param.requires_grad = True
+            unfrozen_parts.append("'model.head'")
+
+        if utils.is_main_process():
+            if not unfrozen_parts:
+                print("WARNING: Model does not have 'head' or 'fc_norm' attributes. No parameters were unfrozen.")
+            else:
+                parts_str = " and ".join(unfrozen_parts)
+                print(f"Successfully unfroze {parts_str} parameters for training.")
+            print("="*70 + "\n")
+
 
     model_ema = None
     if args.model_ema:
