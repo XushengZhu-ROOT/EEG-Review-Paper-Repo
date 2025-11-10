@@ -39,11 +39,27 @@ class PatchFrequencyEmbedding(nn.Module):
         return x
 
 
+class ClassificationHead_3ly(nn.Sequential):
+    def __init__(self, emb_size, n_classes, dropout=0.1):
+        super().__init__()
+        self.clshead = nn.Sequential(
+            nn.Linear(emb_size, emb_size),  
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(emb_size, emb_size),  
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(emb_size, n_classes), 
+        )
+
+    def forward(self, x):
+        out = self.clshead(x)
+        return out
+
 class ClassificationHead(nn.Sequential):
     def __init__(self, emb_size, n_classes):
         super().__init__()
         self.clshead = nn.Sequential(
-            nn.ELU(),
             nn.Linear(emb_size, n_classes),
         )
 
@@ -215,6 +231,34 @@ class Labram_style_Ada_BIOT(nn.Module):
         output = self.fc_norm(output)
         output = self.classifier(output)
         return output
+
+class CBraMod_3lyStyle_LayerNorm_BIOT(nn.Module):
+    def __init__(self, emb_size=256, heads=8, depth=4, n_classes=6, **kwargs):
+        super().__init__()
+        self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth, **kwargs)
+        self.fc_norm = nn.LayerNorm(emb_size)
+        self.classifier = ClassificationHead_3ly(emb_size, n_classes)
+
+    def forward(self, x):
+        x = self.biot(x)
+        x = self.fc_norm(x)
+        x = self.classifier(x)
+        return x
+        
+class CBraMod_3lyStyle_LayerNorm_Ada_BIOT(nn.Module):
+    def __init__(self, input_chan_size, emb_size=256, n_channels=16, heads=8, depth=4, n_classes=6, **kwargs):
+        super().__init__()
+        self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth, **kwargs)
+        self.fc_norm = nn.LayerNorm(emb_size)
+        self.classifier = ClassificationHead_3ly(emb_size, n_classes)
+        self.chan_conv = Conv1dWithConstraint(input_chan_size, n_channels, 1, max_norm=1)
+
+    def forward(self, x):
+        x = self.chan_conv(x)
+        x = self.biot(x)
+        x = self.fc_norm(x)
+        x = self.classifier(x)
+        return x
 
 # unsupervised pre-train module
 class UnsupervisedPretrain(nn.Module):
