@@ -70,25 +70,419 @@ class Trainer(object):
                 self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.params.lr, momentum=0.9,
                                                  weight_decay=self.params.weight_decay)
 
+        # 設定學習率排程器
         self.data_length = len(self.data_loader['train'])
         self.optimizer_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=self.params.epochs * self.data_length, eta_min=1e-6
         )
         print(self.model)
 
-        # ===== 新增：訓練記錄 =====
+        # 訓練記錄初始化
         self.training_start_time = None
-        self.training_logs = []  # 儲存每個 epoch 的訓練日誌
-        self.resource_logs = []  # 儲存資源使用記錄
+        self.training_logs = []
+        self.resource_logs = []
+
+    def train_for_multiclass(self):
+        """多類別分類訓練"""
+        self.training_start_time = time.time()
+        self.log_gpu_usage(epoch=-1, phase='initial', step=0)
+
+        best_metrics = {
+            'val_acc': 0,
+            'val_bacc': 0,
+            'val_kappa': 0,
+            'val_f1': 0,
+            'val_cm': None,
+            'test_acc': 0,
+            'test_bacc': 0,
+            'test_kappa': 0,
+            'test_f1': 0,
+            'test_cm': None,
+            'epoch': 0
+        }
+        
+        for epoch in range(self.params.epochs):
+            self.model.train()
+            epoch_start_time = time.time()
+            self.log_gpu_usage(epoch=epoch, phase='train_start', step=0)
+            
+            losses = []
+            for x, y in tqdm(self.data_loader['train'], mininterval=10):
+                self.optimizer.zero_grad()
+                x = x.cuda()
+                y = y.cuda()
+                pred = self.model(x)
+
+                if self.params.downstream_dataset == 'ISRUC':
+                    loss = self.criterion(pred.transpose(1, 2), y)
+                else:
+                    loss = self.criterion(pred, y)
+
+                loss.backward()
+                losses.append(loss.data.cpu().numpy())
+
+                if self.params.clip_value > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
+                    # torch.nn.utils.clip_grad_value_(self.model.parameters(), self.params.clip_value)
+                
+                self.optimizer.step()
+                self.optimizer_scheduler.step()
+
+            self.log_gpu_usage(epoch=epoch, phase='train_end')
+
+            with torch.no_grad():
+                self.log_gpu_usage(epoch=epoch, phase='val_start')
+                val_acc, val_bacc, val_kappa, val_f1, val_cm = self.val_eval.get_metrics_for_multiclass(self.model)
+                self.log_gpu_usage(epoch=epoch, phase='val_end')
+                
+                self.log_gpu_usage(epoch=epoch, phase='test_start')
+                test_acc, test_bacc, test_kappa, test_f1, test_cm = self.test_eval.get_metrics_for_multiclass(self.model)
+                self.log_gpu_usage(epoch=epoch, phase='test_end')
+
+                epoch_time = time.time() - epoch_start_time
+                current_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+
+                # 儲存 epoch 訓練日誌
+                epoch_log = {
+                    'epoch': epoch + 1,
+                    'train_loss': float(np.mean(losses)),
+                    'val_acc': float(val_acc),
+                    'val_bacc': float(val_bacc),
+                    'val_kappa': float(val_kappa),
+                    'val_f1': float(val_f1),
+                    'test_acc': float(test_acc),
+                    'test_bacc': float(test_bacc),
+                    'test_kappa': float(test_kappa),
+                    'test_f1': float(test_f1),
+                    'learning_rate': float(current_lr),
+                    'epoch_time_seconds': float(epoch_time),
+                    'epoch_time_minutes': float(epoch_time / 60),
+                }
+                self.training_logs.append(epoch_log)
+
+
+                print(f"Epoch {epoch + 1}: Training Loss: {np.mean(losses):.5f}")
+                print(f"  Val  - acc: {val_acc:.5f}, bacc: {val_bacc:.5f}, kappa: {val_kappa:.5f}, f1: {val_f1:.5f}")
+                print(f"  Test - acc: {test_acc:.5f}, bacc: {test_bacc:.5f}, kappa: {test_kappa:.5f}, f1: {test_f1:.5f}")
+                print(f"  LR: {current_lr:.5f}, Time: {epoch_time/60:.2f} mins")
+                print("Val CM:")
+                print(val_cm)
+                print("Test CM:")
+                print(test_cm)
+            
+                # 更新最佳模型（根據驗證集的 kappa）
+                if val_kappa > best_metrics['val_kappa']:
+                    print(">>> Val Kappa increasing... saving weights!")
+                    best_metrics.update({
+                        'val_acc': val_acc,
+                        'val_bacc': val_bacc,
+                        'val_kappa': val_kappa,
+                        'val_f1': val_f1,
+                        'val_cm': val_cm,
+                        'test_acc': test_acc,
+                        'test_bacc': test_bacc,
+                        'test_kappa': test_kappa,
+                        'test_f1': test_f1,
+                        'test_cm': test_cm,
+                        'epoch': epoch + 1
+                    })
+                    self.best_model_states = copy.deepcopy(self.model.state_dict())
+
+        print("\n" + "="*70)
+        print("TRAINING COMPLETED")
+        print("="*70)
+        print(f"Best model from Epoch {best_metrics['epoch']}")
+        print(f"Best Val  - acc: {best_metrics['val_acc']:.5f}, bacc: {best_metrics['val_bacc']:.5f}, \n", \
+                f"kappa: {best_metrics['val_kappa']:.5f}, f1: {val_best_metrics['val_f1']:.5f}")
+        print(f"Best Test - acc: {best_metrics['test_acc']:.5f}, bacc: {best_metrics['test_bacc']:.5f}, \n", \
+                f"kappa: {best_metrics['test_kappa']:.5f}, f1: {best_metrics['test_f1']:.5f}")
+        print("="*70 + "\n")
+
+        # 準備最終結果
+        final_results = {
+            'best_epoch': best_metrics['epoch'],
+            'val_acc': float(best_metrics['val_acc']),
+            'val_bacc': float(best_metrics['val_bacc']),
+            'val_kappa': float(best_metrics['val_kappa']),
+            'val_f1': float(best_metrics['val_f1']),
+            'val_cm': (best_metrics['val_cm'].tolist()),
+            'test_acc': float(best_metrics['test_acc']),
+            'test_bacc': float(best_metrics['test_bacc']),
+            'test_kappa': float(best_metrics['test_kappa']),
+            'test_f1': float(best_metrics['test_f1']),
+            'test_cm': (best_metrics['test_cm'].tolist()),
+        }
+        
+        # 儲存模型
+        if not os.path.isdir(self.params.model_dir):
+            os.makedirs(self.params.model_dir)
+        
+        model_path = os.path.join(
+            self.params.model_dir, 
+            f"best_model_epoch{best_metrics['epoch']}_testKappa{best_metrics['test_kappa']:.5f}_testF1{best_metrics['test_f1']:.5f}.pth"
+        )
+        torch.save(self.best_model_states, model_path)
+        print(f"Model saved to {model_path}")
+        
+        # 儲存訓練記錄
+        self.save_training_logs(final_results)
+
+    def train_for_binaryclass(self):
+        """二分類訓練"""
+        self.training_start_time = time.time()
+        self.log_gpu_usage(epoch=-1, phase='initial', step=0)
+
+        best_metrics = {
+            'epoch': 0,
+            'val_acc': 0,
+            'val_bacc': 0,
+            'val_pr_auc': 0,
+            'val_roc_auc': 0,
+            'val_cm': None,
+            'test_acc': 0,
+            'test_bacc': 0,
+            'test_pr_auc': 0,
+            'test_roc_auc': 0,
+            'test_cm': None,
+        }
+
+        for epoch in range(self.params.epochs):
+            self.model.train()
+            epoch_start_time = time.time()
+            self.log_gpu_usage(epoch=epoch, phase='train_start', step=0)
+
+            losses = []
+            for x, y in tqdm(self.data_loader['train'], mininterval=10):
+                self.optimizer.zero_grad()
+                x = x.cuda()
+                y = y.cuda()
+                pred = self.model(x)
+                loss = self.criterion(pred, y)
+
+                loss.backward()
+                losses.append(loss.data.cpu().numpy())
+
+                if self.params.clip_value > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
+                    # torch.nn.utils.clip_grad_value_(self.model.parameters(), self.params.clip_value)
+                
+                self.optimizer.step()
+                self.optimizer_scheduler.step()
+
+            self.log_gpu_usage(epoch=epoch, phase='train_end')
+
+            with torch.no_grad():
+                self.log_gpu_usage(epoch=epoch, phase='val_start')
+                val_acc, val_bacc, val_pr_auc, val_roc_auc, val_cm = self.val_eval.get_metrics_for_binaryclass(self.model)
+                self.log_gpu_usage(epoch=epoch, phase='val_end')
+                
+                self.log_gpu_usage(epoch=epoch, phase='test_start')
+                test_acc, test_bacc, test_pr_auc, test_roc_auc, test_cm  = self.test_eval.get_metrics_for_binaryclass(self.model)
+                self.log_gpu_usage(epoch=epoch, phase='test_end')
+                
+                epoch_time = time.time() - epoch_start_time
+                current_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+
+                epoch_log = {
+                    'epoch': epoch + 1,
+                    'train_loss': float(np.mean(losses)),
+                    'val_acc': float(val_acc),
+                    'val_bacc': float(val_bacc),
+                    'val_pr_auc': float(val_pr_auc),
+                    'val_roc_auc': float(val_roc_auc),
+                    'val_cm': val_cm.tolist(),
+                    'test_acc': float(test_acc),
+                    'test_bacc': float(test_bacc),
+                    'test_pr_auc': float(val_pr_auc),
+                    'test_roc_auc': float(test_roc_auc),
+                    'test_cm': test_cm.tolist(),
+                    'learning_rate': float(current_lr),
+                    'epoch_time_seconds': float(epoch_time),
+                    'epoch_time_minutes': float(epoch_time / 60),
+                }
+                self.training_logs.append(epoch_log)
+
+                print(f"Epoch {epoch + 1}: Training Loss: {np.mean(losses):.5f}")
+                print(f"  Val  - acc: {val_acc:.5f}, bacc: {val_bacc:.5f}, pr_auc: {val_pr_auc:.5f}, roc_auc: {val_roc_auc:.5f}")
+                print(f"  Test - acc: {test_acc:.5f}, bacc: {test_bacc:.5f}, pr_auc: {test_pr_auc:.5f}, roc_auc: {test_roc_auc:.5f}")
+                print(f"  LR: {current_lr:.5f}, Time: {epoch_time/60:.2f} mins")
+
+                if val_roc_auc > best_metrics['val_roc_auc']:
+                    print(">>> Val ROC AUC increasing... saving weights!")
+                    best_metrics.update({
+                        'epoch': epoch + 1,
+                        'val_acc': val_acc,
+                        'val_bacc': val_bacc,
+                        'val_pr_auc': val_pr_auc,
+                        'val_roc_auc': val_roc_auc,
+                        'val_cm': val_cm,
+                        'test_acc': test_acc,
+                        'test_bacc': test_bacc,
+                        'test_pr_auc': test_pr_auc,
+                        'test_roc_auc': test_roc_auc,
+                        'test_cm': test_cm,
+                    })
+                    self.best_model_states = copy.deepcopy(self.model.state_dict())
+                    
+        # 最終報告
+        print("\n" + "="*70)
+        print("TRAINING COMPLETED")
+        print("="*70)
+        print(f"Best model from Epoch {best_metrics['epoch']}")
+        print(f"Best Val  - acc: {best_metrics['val_acc']:.5f}, bacc: {best_metrics['val_bacc']:.5f}, \n", \
+              f"pr_auc: {best_metrics['val_pr_auc']:.5f}, roc_auc: {best_metrics['val_roc_auc']:.5f}")
+        print(f"Best Test  - acc: {best_metrics['test_acc']:.5f}, bacc: {best_metrics['test_bacc']:.5f}, \n", \
+              f"pr_auc: {best_metrics['test_pr_auc']:.5f}, roc_auc: {best_metrics['test_roc_auc']:.5f}")
+
+        print("="*70 + "\n")
+
+        final_results = {
+            'best_epoch': best_metrics['epoch'],
+            'val_acc': float(best_metrics['val_acc']),
+            'val_bacc': float(best_metrics['val_bacc']),
+            'val_pr_auc': float(best_metrics['val_pr_auc']),
+            'val_roc_auc': float(best_metrics['val_roc_auc']),
+            'val_cm': (best_metrics['val_cm'].tolist()),
+            'test_acc': float(best_metrics['test_acc']),
+            'test_bacc': float(best_metrics['test_bacc']),
+            'test_pr_auc': float(best_metrics['test_pr_auc']),
+            'test_roc_auc': float(best_metrics['test_roc_auc']),
+            'test_cm': (best_metrics['test_cm'].tolist()),
+        }
+
+        if not os.path.isdir(self.params.model_dir):
+            os.makedirs(self.params.model_dir)
+        
+        model_path = os.path.join(
+            self.params.model_dir, 
+            f"best_model_epoch{best_metrics['epoch']}_testAcc{test_acc:.5f}_testBacc{test_bacc:.5f}.pth"
+        )
+        torch.save(self.model.state_dict(), model_path)
+        print(f"Model saved to {model_path}")
+        
+        self.save_training_logs(final_results)
+
+    def train_for_regression(self):
+        """迴歸訓練"""
+        self.training_start_time = time.time()
+        self.log_gpu_usage(epoch=-1, phase='initial', step=0)
+
+        best_metrics = {
+            'val_r2': -float('inf'),
+            'val_corrcoef': 0,
+            'val_rmse': float('inf'),
+            'test_r2': -float('inf'),
+            'test_corrcoef': 0,
+            'test_rmse': float('inf'),
+            'epoch': 0
+        }
+
+        for epoch in range(self.params.epochs):
+            self.model.train()
+            epoch_start_time = time.time()
+            self.log_gpu_usage(epoch=epoch, phase='train_start', step=0)
+
+            losses = []
+            for x, y in tqdm(self.data_loader['train'], mininterval=10):
+                self.optimizer.zero_grad()
+                x = x.cuda()
+                y = y.cuda()
+                pred = self.model(x)
+                loss = self.criterion(pred, y)
+
+                loss.backward()
+                losses.append(loss.data.cpu().numpy())
+
+                if self.params.clip_value > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
+                    # torch.nn.utils.clip_grad_value_(self.model.parameters(), self.params.clip_value)
+                
+                self.optimizer.step()
+                self.optimizer_scheduler.step()
+
+            self.log_gpu_usage(epoch=epoch, phase='train_end')
+
+            with torch.no_grad():
+                self.log_gpu_usage(epoch=epoch, phase='val_start')
+                val_corrcoef, val_r2, val_rmse = self.val_eval.get_metrics_for_regression(self.model)
+                self.log_gpu_usage(epoch=epoch, phase='val_end')
+                
+                # === 每個 epoch 都執行測試 ===
+                self.log_gpu_usage(epoch=epoch, phase='test_start')
+                test_corrcoef, test_r2, test_rmse = self.test_eval.get_metrics_for_regression(self.model)
+                self.log_gpu_usage(epoch=epoch, phase='test_end')
+                
+                epoch_time = time.time() - epoch_start_time
+                current_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+                
+                epoch_log = {
+                    'epoch': epoch + 1,
+                    'train_loss': float(np.mean(losses)),
+                    'val_corrcoef': float(val_corrcoef),
+                    'val_r2': float(val_r2),
+                    'val_rmse': float(val_rmse),
+                    'test_corrcoef': float(test_corrcoef),
+                    'test_r2': float(test_r2),
+                    'test_rmse': float(test_rmse),
+                    'learning_rate': float(current_lr),
+                    'epoch_time_seconds': float(epoch_time),
+                    'epoch_time_minutes': float(epoch_time / 60),
+                }
+                self.training_logs.append(epoch_log)
+
+                print(f"Epoch {epoch + 1}: Training Loss: {np.mean(losses):.5f}")
+                print(f"  Val  - corrcoef: {val_corrcoef:.5f}, r2: {val_r2:.5f}, rmse: {val_rmse:.5f}")
+                print(f"  Test - corrcoef: {test_corrcoef:.5f}, r2: {test_r2:.5f}, rmse: {test_rmse:.5f}")
+                print(f"  LR: {current_lr:.5f}, Time: {epoch_time/60:.2f} mins")
+
+                if val_r2 > best_metrics['val_r2']:
+                    print(">>> Val R2 increasing... saving weights!")
+                    best_metrics.update({
+                        'val_corrcoef': val_corrcoef,
+                        'val_r2': val_r2,
+                        'val_rmse': val_rmse,
+                        'test_corrcoef': test_corrcoef,
+                        'test_r2': test_r2,
+                        'test_rmse': test_rmse,
+                        'epoch': epoch + 1
+                    })
+                    self.best_model_states = copy.deepcopy(self.model.state_dict())
+                 
+        # 最終報告
+        print("\n" + "="*70)
+        print("TRAINING COMPLETED")
+        print("="*70)
+        print(f"Best model from Epoch {best_metrics['epoch']}")
+        print(f"Best Val  - corrcoef: {best_metrics['val_corrcoef']:.5f}, r2: {best_metrics['val_r2']:.5f}, \n", \
+              f"rmse: {best_metrics['val_rmse']:.5f}")
+        print(f"Best Test - corrcoef: {best_metrics['test_corrcoef']:.5f}, r2: {best_metrics['test_r2']:.5f}, \n", \
+              f"rmse: {best_metrics['test_rmse']:.5f}")
+        print("="*70 + "\n")
+
+        final_results = {
+            'best_epoch': best_metrics['epoch'],
+            'val_corrcoef': float(best_metrics['val_corrcoef']),
+            'val_r2': float(best_metrics['val_r2']),
+            'val_rmse': float(best_metrics['val_rmse']),
+            'test_corrcoef': float(best_metrics['test_corrcoef']),
+            'test_r2': float(best_metrics['test_r2']),
+            'test_rmse': float(best_metrics['test_rmse']),
+        }
+
+        if not os.path.isdir(self.params.model_dir):
+            os.makedirs(self.params.model_dir)
+        
+        model_path = os.path.join(
+            self.params.model_dir, 
+            f"best_model_epoch{best_metrics['epoch']}_testR2{test_r2:.5f}_testRmse{test_rmse:.5f}.pth"
+        )
+        torch.save(self.model.state_dict(), model_path)
+        print(f"Model saved to {model_path}")
+        
+        self.save_training_logs(final_results)
 
     def log_gpu_usage(self, epoch, phase='train', step=None):
-        """
-        記錄GPU和系統資源使用情況
-        1. GPU 記憶體：使用 torch.cuda.memory_allocated() 獲取已分配記憶體（單位：bytes -> GB）
-        2. GPU 使用率：使用 GPUtil 獲取 GPU 負載百分比
-        3. CPU：使用 psutil.cpu_percent() 獲取 CPU 使用率
-        4. RAM：使用 psutil.virtual_memory() 獲取記憶體使用情況
-        """
+        """記錄GPU和系統資源使用情況"""
         if not torch.cuda.is_available():
             return None
             
@@ -99,17 +493,13 @@ class Trainer(object):
             'timestamp': time.time() - self.training_start_time,
         }
         
-        # === GPU 記憶體統計（使用 torch.cuda API）===
-        # 計算方式：torch.cuda.memory_allocated(device_id) 返回當前分配的記憶體（bytes）
-        # 除以 1024^3 轉換為 GB
+        # GPU 記憶體統計
         for i in range(torch.cuda.device_count()):
             gpu_stats[f'gpu_{i}_memory_allocated_GB'] = torch.cuda.memory_allocated(i) / 1024**3
             gpu_stats[f'gpu_{i}_memory_reserved_GB'] = torch.cuda.memory_reserved(i) / 1024**3
             gpu_stats[f'gpu_{i}_max_memory_allocated_GB'] = torch.cuda.max_memory_allocated(i) / 1024**3
         
-        # === GPU 使用率統計（使用 GPUtil）===
-        # 計算方式：GPUtil.getGPUs() 返回 GPU 物件列表，每個 GPU 物件有 load 屬性（0-1之間）
-        # 乘以 100 轉換為百分比
+        # GPU 使用率統計
         if GPUTIL_AVAILABLE:
             try:
                 gpus = GPUtil.getGPUs()
@@ -121,15 +511,10 @@ class Trainer(object):
             except Exception as e:
                 print(f"Warning: Failed to get GPU stats from GPUtil: {e}")
         
-        # === CPU 統計（使用 psutil）===
-        # 計算方式：psutil.cpu_percent(interval=0.1) 返回 CPU 使用百分比
-        # interval=0.1 表示在 0.1 秒內測量
+        # CPU 統計
         gpu_stats['cpu_percent'] = psutil.cpu_percent(interval=0.1)
         
-        # === RAM 統計（使用 psutil）===
-        # 計算方式：psutil.virtual_memory() 返回記憶體統計物件
-        # .used 屬性是已使用記憶體（bytes），除以 1024^3 轉換為 GB
-        # .percent 屬性直接返回使用百分比
+        # RAM 統計
         memory_info = psutil.virtual_memory()
         gpu_stats['ram_used_GB'] = memory_info.used / 1024**3
         gpu_stats['ram_percent'] = memory_info.percent
@@ -137,15 +522,8 @@ class Trainer(object):
         self.resource_logs.append(gpu_stats)
         return gpu_stats
 
-
     def save_training_logs(self, final_results=None):
-        """
-        儲存訓練日誌和資源使用記錄
-        生成：
-        1. training_logs.json - 每個 epoch 的訓練指標
-        2. resource_logs.csv - 詳細的資源使用記錄
-        3. training_summary.json - 訓練摘要統計
-        """
+        """儲存訓練日誌和資源使用記錄"""
         if not os.path.isdir(self.params.model_dir):
             os.makedirs(self.params.model_dir)
         
@@ -259,385 +637,3 @@ class Trainer(object):
                     print(f"  {key}: {value}")
         
         print("="*70 + "\n")
-
-    def train_for_multiclass(self):
-        # 初始化訓練記錄
-        self.training_start_time = time.time()
-        self.log_gpu_usage(epoch=-1, phase='initial', step=0)
-
-        f1_best = 0
-        kappa_best = 0
-        acc_best = 0
-        bacc_best = 0
-        cm_best = None
-        for epoch in range(self.params.epochs):
-            self.model.train()
-
-            start_time = timer()
-            epoch_start_time = time.time()
-            # 記錄 epoch 開始時的資源狀態
-            self.log_gpu_usage(epoch=epoch, phase='train_start', step=0)
-            
-            losses = []
-            for x, y in tqdm(self.data_loader['train'], mininterval=10):
-                self.optimizer.zero_grad()
-                x = x.cuda()
-                y = y.cuda()
-                pred = self.model(x)
-                if self.params.downstream_dataset == 'ISRUC':
-                    loss = self.criterion(pred.transpose(1, 2), y)
-                else:
-                    loss = self.criterion(pred, y)
-
-                loss.backward()
-                losses.append(loss.data.cpu().numpy())
-                if self.params.clip_value > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
-                    # torch.nn.utils.clip_grad_value_(self.model.parameters(), self.params.clip_value)
-                self.optimizer.step()
-                self.optimizer_scheduler.step()
-
-            optim_state = self.optimizer.state_dict()
-
-            # 訓練階段結束時的資源狀態
-            self.log_gpu_usage(epoch=epoch, phase='train_end')
-
-            with torch.no_grad():
-
-                # 驗證階段開始
-                self.log_gpu_usage(epoch=epoch, phase='val_start')
-
-                acc, bacc, kappa, f1, cm = self.val_eval.get_metrics_for_multiclass(self.model)
-
-                # 驗證階段結束
-                self.log_gpu_usage(epoch=epoch, phase='val_end')
-                
-                epoch_time = time.time() - epoch_start_time
-                
-                # 儲存 epoch 訓練日誌
-                epoch_log = {
-                    'epoch': epoch + 1,
-                    'train_loss': float(np.mean(losses)),
-                    'val_acc': float(acc),
-                    'val_bacc': float(bacc),
-                    'val_kappa': float(kappa),
-                    'val_f1': float(f1),
-                    'learning_rate': float(optim_state['param_groups'][0]['lr']),
-                    'epoch_time_seconds': float(epoch_time),
-                    'epoch_time_minutes': float(epoch_time / 60),
-                }
-                self.training_logs.append(epoch_log)
-
-                print(
-                    "Epoch {} : Training Loss: {:.5f}, acc: {:.5f}, balanced acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}, LR: {:.5f}, Time elapsed {:.2f} mins".format(
-                        epoch + 1,
-                        np.mean(losses),
-                        acc,
-                        bacc,
-                        kappa,
-                        f1,
-                        optim_state['param_groups'][0]['lr'],
-                        (timer() - start_time) / 60
-                    )
-                )
-                print(cm)
-                if kappa > kappa_best:
-                    print("kappa increasing....saving weights !! ")
-                    print("Val Evaluation: acc: {:.5f}, balanced acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(
-                        acc,
-                        bacc,
-                        kappa,
-                        f1,
-                    ))
-                    best_f1_epoch = epoch + 1
-                    acc_best = acc
-                    bacc_best = bacc
-                    kappa_best = kappa
-                    f1_best = f1
-                    cm_best = cm
-                    self.best_model_states = copy.deepcopy(self.model.state_dict())
-        self.model.load_state_dict(self.best_model_states)
-        with torch.no_grad():
-            print("***************************Test************************")
-            self.log_gpu_usage(epoch=self.params.epochs, phase='test_start')
-            acc, bacc, kappa, f1, cm = self.test_eval.get_metrics_for_multiclass(self.model)
-            self.log_gpu_usage(epoch=self.params.epochs, phase='test_end')
-            print("***************************Test results************************")
-            print(
-                "Test Evaluation: acc: {:.5f}, balanced acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(
-                    acc,
-                    bacc,
-                    kappa,
-                    f1,
-                )
-            )
-            print(cm)
-
-            # 儲存結果
-            final_results = {
-                'best_epoch': best_f1_epoch,
-                'test_acc': float(acc),
-                'test_bacc': float(bacc),
-                'test_kappa': float(kappa),
-                'test_f1': float(f1),
-                'best_val_acc': float(acc_best),
-                'best_val_bacc': float(bacc_best),
-                'best_val_kappa': float(kappa_best),
-                'best_val_f1': float(f1_best),
-            }
-            
-            if not os.path.isdir(self.params.model_dir):
-                os.makedirs(self.params.model_dir)
-            model_path = self.params.model_dir + "/epoch{}_acc_{:.5f}_bacc_{:.5f}_kappa_{:.5f}_f1_{:.5f}.pth".format(best_f1_epoch, acc, bacc, kappa, f1)
-            torch.save(self.model.state_dict(), model_path)
-            print("model save in " + model_path)
-
-            # 儲存所有訓練記錄
-            self.save_training_logs(final_results)
-
-    def train_for_binaryclass(self):
-        # 初始化訓練記錄
-        self.training_start_time = time.time()
-        self.log_gpu_usage(epoch=-1, phase='initial', step=0)
-
-        acc_best = 0
-        bacc_best = 0
-        roc_auc_best = 0
-        pr_auc_best = 0
-        cm_best = None
-        for epoch in range(self.params.epochs):
-            self.model.train()
-
-            start_time = timer()
-            epoch_start_time = time.time()
-            # 記錄 epoch 開始時的資源狀態
-            self.log_gpu_usage(epoch=epoch, phase='train_start', step=0)
-
-            losses = []
-            for x, y in tqdm(self.data_loader['train'], mininterval=10):
-                self.optimizer.zero_grad()
-                x = x.cuda()
-                y = y.cuda()
-                pred = self.model(x)
-
-                loss = self.criterion(pred, y)
-
-                loss.backward()
-                losses.append(loss.data.cpu().numpy())
-                if self.params.clip_value > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
-                    # torch.nn.utils.clip_grad_value_(self.model.parameters(), self.params.clip_value)
-                self.optimizer.step()
-                self.optimizer_scheduler.step()
-
-            optim_state = self.optimizer.state_dict()
-
-            # 訓練階段結束時的資源狀態
-            self.log_gpu_usage(epoch=epoch, phase='train_end')
-
-            with torch.no_grad():
-                # 記錄驗證階段開始
-                self.log_gpu_usage(epoch=epoch, phase='val_start')
-                acc, bacc, pr_auc, roc_auc, cm = self.val_eval.get_metrics_for_binaryclass(self.model)
-                # 記錄驗證階段結束
-                self.log_gpu_usage(epoch=epoch, phase='val_end')
-                epoch_time = time.time() - epoch_start_time
-
-                # 儲存 epoch 訓練日誌
-                epoch_log = {
-                    'epoch': epoch + 1,
-                    'train_loss': float(np.mean(losses)),
-                    'val_acc': float(acc),
-                    'val_bacc': float(bacc),
-                    'val_pr_auc': float(pr_auc),
-                    'val_roc_auc': float(roc_auc),
-                    'learning_rate': float(optim_state['param_groups'][0]['lr']),
-                    'epoch_time_seconds': float(epoch_time),
-                    'epoch_time_minutes': float(epoch_time / 60),
-                }
-                self.training_logs.append(epoch_log)
-
-                print(
-                    "Epoch {} : Training Loss: {:.5f}, acc: {:.5f}, balanced acc: {:.5f}, pr_auc: {:.5f}, roc_auc: {:.5f}, LR: {:.5f}, Time elapsed {:.2f} mins".format(
-                        epoch + 1,
-                        np.mean(losses),
-                        acc,
-                        bacc,
-                        pr_auc,
-                        roc_auc,
-                        optim_state['param_groups'][0]['lr'],
-                        (timer() - start_time) / 60
-                    )
-                )
-                print(cm)
-                if roc_auc > roc_auc_best:
-                    print("roc_auc increasing....saving weights !! ")
-                    print("Val Evaluation: acc: {:.5f}, balanced acc: {:.5f}, pr_auc: {:.5f}, roc_auc: {:.5f}".format(
-                        acc,
-                        bacc,
-                        pr_auc,
-                        roc_auc,
-                    ))
-                    best_f1_epoch = epoch + 1
-                    acc_best = acc
-                    bacc_best = bacc
-                    pr_auc_best = pr_auc
-                    roc_auc_best = roc_auc
-                    cm_best = cm
-                    self.best_model_states = copy.deepcopy(self.model.state_dict())
-        self.model.load_state_dict(self.best_model_states)
-        with torch.no_grad():
-            print("***************************Test************************")
-            self.log_gpu_usage(epoch=self.params.epochs, phase='test_start')
-            acc, bacc, pr_auc, roc_auc, cm = self.test_eval.get_metrics_for_binaryclass(self.model)
-            self.log_gpu_usage(epoch=self.params.epochs, phase='test_end')
-            print("***************************Test results************************")
-            print(
-                "Test Evaluation: acc: {:.5f}, balanced acc: {:.5f}, pr_auc: {:.5f}, roc_auc: {:.5f}".format(
-                    acc,
-                    bacc,
-                    pr_auc,
-                    roc_auc,
-                )
-            )
-            print(cm)
-
-            # 儲存最終結果
-            final_results = {
-                'best_epoch': best_f1_epoch,
-                'test_acc': float(acc),
-                'test_bacc': float(bacc),
-                'test_pr_auc': float(pr_auc),
-                'test_roc_auc': float(roc_auc),
-                'best_val_acc': float(acc_best),
-                'best_val_bacc': float(bacc_best),
-                'best_val_pr_auc': float(pr_auc_best),
-                'best_val_roc_auc': float(roc_auc_best),
-            }
-            
-            if not os.path.isdir(self.params.model_dir):
-                os.makedirs(self.params.model_dir)
-            model_path = self.params.model_dir + "/epoch{}_acc_{:.5f}_bacc_{:.5f}_pr_{:.5f}_roc_{:.5f}.pth".format(best_f1_epoch, acc, bacc, pr_auc, roc_auc)
-            torch.save(self.model.state_dict(), model_path)
-            print("model save in " + model_path)
-
-            # 儲存所有訓練記錄
-            self.save_training_logs(final_results)
-
-    def train_for_regression(self):
-        # 初始化訓練記錄
-        self.training_start_time = time.time()
-        self.log_gpu_usage(epoch=-1, phase='initial', step=0)
-
-        corrcoef_best = 0
-        r2_best = 0
-        rmse_best = 0
-        for epoch in range(self.params.epochs):
-            self.model.train()
-
-            start_time = timer()
-            epoch_start_time = time.time()
-            # 記錄 epoch 開始時的資源狀態
-            self.log_gpu_usage(epoch=epoch, phase='train_start', step=0)
-
-            losses = []
-            for x, y in tqdm(self.data_loader['train'], mininterval=10):
-                self.optimizer.zero_grad()
-                x = x.cuda()
-                y = y.cuda()
-                pred = self.model(x)
-                loss = self.criterion(pred, y)
-
-                loss.backward()
-                losses.append(loss.data.cpu().numpy())
-                if self.params.clip_value > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_value)
-                    # torch.nn.utils.clip_grad_value_(self.model.parameters(), self.params.clip_value)
-                self.optimizer.step()
-                self.optimizer_scheduler.step()
-
-            optim_state = self.optimizer.state_dict()
-
-            # 記錄訓練階段結束時的資源狀態
-            self.log_gpu_usage(epoch=epoch, phase='train_end')
-
-            with torch.no_grad():
-                # 記錄驗證階段開始
-                self.log_gpu_usage(epoch=epoch, phase='val_start')
-                corrcoef, r2, rmse = self.val_eval.get_metrics_for_regression(self.model)
-                # 記錄驗證階段結束
-                self.log_gpu_usage(epoch=epoch, phase='val_end')
-                
-                epoch_time = time.time() - epoch_start_time
-                
-                # 儲存 epoch 訓練日誌
-                epoch_log = {
-                    'epoch': epoch + 1,
-                    'train_loss': float(np.mean(losses)),
-                    'val_corrcoef': float(corrcoef),
-                    'val_r2': float(r2),
-                    'val_rmse': float(rmse),
-                    'learning_rate': float(optim_state['param_groups'][0]['lr']),
-                    'epoch_time_seconds': float(epoch_time),
-                    'epoch_time_minutes': float(epoch_time / 60),
-                }
-                self.training_logs.append(epoch_log)
-
-                print(
-                    "Epoch {} : Training Loss: {:.5f}, corrcoef: {:.5f}, r2: {:.5f}, rmse: {:.5f}, LR: {:.5f}, Time elapsed {:.2f} mins".format(
-                        epoch + 1,
-                        np.mean(losses),
-                        corrcoef,
-                        r2,
-                        rmse,
-                        optim_state['param_groups'][0]['lr'],
-                        (timer() - start_time) / 60
-                    )
-                )
-                if r2 > r2_best:
-                    print("r2 increasing....saving weights !! ")
-                    print("Val Evaluation: corrcoef: {:.5f}, r2: {:.5f}, rmse: {:.5f}".format(
-                        corrcoef,
-                        r2,
-                        rmse,
-                    ))
-                    best_r2_epoch = epoch + 1
-                    corrcoef_best = corrcoef
-                    r2_best = r2
-                    rmse_best = rmse
-                    self.best_model_states = copy.deepcopy(self.model.state_dict())
-
-        self.model.load_state_dict(self.best_model_states)
-        with torch.no_grad():
-            print("***************************Test************************")
-            self.log_gpu_usage(epoch=self.params.epochs, phase='test_start')
-            corrcoef, r2, rmse = self.test_eval.get_metrics_for_regression(self.model)
-            self.log_gpu_usage(epoch=self.params.epochs, phase='test_end')
-            print("***************************Test results************************")
-            print(
-                "Test Evaluation: corrcoef: {:.5f}, r2: {:.5f}, rmse: {:.5f}".format(
-                    corrcoef,
-                    r2,
-                    rmse,
-                )
-            )
-
-            # 儲存最終結果
-            final_results = {
-                'best_epoch': best_r2_epoch,
-                'test_corrcoef': float(corrcoef),
-                'test_r2': float(r2),
-                'test_rmse': float(rmse),
-                'best_val_corrcoef': float(corrcoef_best),
-                'best_val_r2': float(r2_best),
-                'best_val_rmse': float(rmse_best),
-            }
-
-            if not os.path.isdir(self.params.model_dir):
-                os.makedirs(self.params.model_dir)
-            model_path = self.params.model_dir + "/epoch{}_corrcoef_{:.5f}_r2_{:.5f}_rmse_{:.5f}.pth".format(best_r2_epoch, corrcoef, r2, rmse)
-            torch.save(self.model.state_dict(), model_path)
-            print("model save in " + model_path)
-            
-            # 儲存所有訓練記錄
-            self.save_training_logs(final_results)
