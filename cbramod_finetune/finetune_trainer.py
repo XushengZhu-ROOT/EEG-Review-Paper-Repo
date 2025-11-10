@@ -31,8 +31,11 @@ class Trainer(object):
         self.model = model.cuda()
         if self.params.downstream_dataset in ['FACED', 'SEED-V', 'PhysioNet-MI', 'ISRUC', 'BCIC2020-3', 'TUEV', 'BCIC-IV-2a']:
             self.criterion = CrossEntropyLoss(label_smoothing=self.params.label_smoothing).cuda()
-        elif self.params.downstream_dataset in ['SHU-MI', 'CHB-MIT', 'Mumtaz2016', 'MentalArithmetic', 'TUAB', 'CustomStress']:
-            self.criterion = BCEWithLogitsLoss().cuda()
+        elif self.params.downstream_dataset in ['SHU-MI', 'CHB-MIT', 'Mumtaz2016', 'MentalArithmetic', 'TUAB', 'CustomStress', 'KaggleERN']:
+            if self.params.pos_weight:
+                self.criterion = BCEWithLogitsLoss(pos_weight=torch.tensor([self.params.pos_weight])).cuda()
+            else:
+                self.criterion = BCEWithLogitsLoss().cuda()
         elif self.params.downstream_dataset == 'SEED-VIG':
             self.criterion = MSELoss().cuda()
 
