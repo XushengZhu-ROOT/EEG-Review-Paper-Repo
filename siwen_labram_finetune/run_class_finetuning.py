@@ -17,6 +17,8 @@ import torch
 import torch.backends.cudnn as cudnn
 import json
 import os
+import sys
+import yaml
 
 from pathlib import Path
 from collections import OrderedDict
@@ -314,6 +316,17 @@ def main(args, ds_init):
 
     print(args)
 
+    if args.output_dir and utils.is_main_process():
+        args_dict = vars(args)
+        args_path = os.path.join(args.output_dir, "run_config.yaml")
+        try:
+            with open(args_path, 'w', encoding='utf-8') as f:
+                # 將 args (Namespace) 轉換為 dict 再儲存
+                yaml.dump(args_dict, f, default_flow_style=False, sort_keys=False)
+            print(f"Arguments configuration saved to {args_path}")
+        except Exception as e:
+            print(f"Warning: Error saving arguments to YAML: {e}")
+
     device = torch.device(args.device)
 
     
@@ -547,6 +560,18 @@ def main(args, ds_init):
 
     print("Model = %s" % str(model_without_ddp))
     print('number of params:', n_parameters)
+
+    if args.output_dir and utils.is_main_process():
+        model_structure_path = os.path.join(args.output_dir, "model_structure.txt")
+        try:
+            with open(model_structure_path, 'w', encoding='utf-8') as f:
+                # model_without_ddp 尚未被 DDP or DeepSpeed 封裝
+                f.write(str(model_without_ddp))
+                f.write("\n\n")
+                f.write(f"Total Trainable Parameters: {n_parameters}\n")
+            print(f"Model structure saved to {model_structure_path}")
+        except Exception as e:
+            print(f"Warning: Error saving model structure: {e}")
 
     total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
     num_training_steps_per_epoch = len(dataset_train) // total_batch_size
