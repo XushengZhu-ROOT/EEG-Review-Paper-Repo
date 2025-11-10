@@ -65,14 +65,19 @@ def main():
                         help='datasets_dir')
     parser.add_argument('--num_of_classes', type=int, default=9, help='number of classes')
     parser.add_argument('--model_dir', type=str, default='/data/wjq/models_weights/Big/BigFaced', help='model_dir')
+    parser.add_argument('--channel_size', type=int, default=30, help='channel size, for classifier')
+    parser.add_argument('--window_size', type=int, default=5, help='window size, for classifier')
+    parser.add_argument('--pos_weight', default=None, type=float)
+
     """############ Downstream dataset settings ############"""
 
-    parser.add_argument('--num_workers', type=int, default=16, help='num_workers')
+    parser.add_argument('--num_workers', type=int, default=10, help='num_workers')
     parser.add_argument('--label_smoothing', type=float, default=0.1, help='label_smoothing')
     parser.add_argument('--multi_lr', type=bool, default=True,
                         help='multi_lr')  # set different learning rates for different modules
-    parser.add_argument('--frozen', type=bool,
-                        default=False, help='frozen')
+    parser.add_argument('--frozen', 
+                    action='store_true', 
+                    help='Freeze the model (if this flag is present, set to True)')
     parser.add_argument('--use_pretrained_weights', type=bool,
                         default=True, help='use_pretrained_weights')
     parser.add_argument('--foundation_dir', type=str,
@@ -181,6 +186,13 @@ def main():
         load_dataset = custom_stress_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_custom_stress.Model(params)
+        save_architecture(model, params.model_dir)
+        t = Trainer(params, data_loader, model)
+        t.train_for_binaryclass()
+    elif params.downstream_dataset == 'KaggleERN':
+        load_dataset = kaggleern_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_kaggleern.Model(params)
         save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_binaryclass()
