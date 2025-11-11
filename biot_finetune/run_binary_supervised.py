@@ -1,6 +1,8 @@
 import os
 import argparse
 import pickle
+import yaml
+import json
 
 import torch
 from tqdm import tqdm
@@ -197,6 +199,24 @@ class LitModel_finetune(pl.LightningModule):
         self.log("test_pr_auc", result["pr_auc"], sync_dist=True)
         self.log("test_auroc", result["roc_auc"], sync_dist=True)
 
+        if self.logger: # 確保 logger 存在
+            log_dir = self.logger.log_dir
+            log_file = os.path.join(log_dir, "training_logs.jsonl")
+            
+            # 建立日誌條目
+            log_entry = {
+                'epoch': self.current_epoch,
+                'step': self.global_step,
+                'type': 'test',
+                'metrics': result
+            }
+            
+            # 以附加模式 (append) 寫入
+            try:
+                with open(log_file, 'a') as f:
+                    f.write(json.dumps(log_entry) + '\n')
+            except Exception as e:
+                print(f"Warning: Could not write to metrics.jsonl: {e}")
         return result
 
     def configure_optimizers(self):
@@ -497,23 +517,72 @@ def supervised(args):
         if args.pretrain_model_path and (args.sampling_rate == 200):
             model.biot.load_state_dict(torch.load(args.pretrain_model_path))
             print(f"load pretrain model from {args.pretrain_model_path}")
+    elif args.model == "CBraMod_3lyStyle_LayerNorm-BIOT":
+        if args.dataset_channels ==  args.in_channels:
+            model = CBraMod_3lyStyle_LayerNorm_BIOT(
+                n_classes=args.n_classes,
+                # set the n_channels according to the pretrained model if necessary
+                n_channels=args.in_channels,
+                n_fft=args.token_size,
+                hop_length=args.hop_length,
+            )
+        else:
+            model = CBraMod_3lyStyle_LayerNorm_Ada_BIOT(
+                input_chan_size=args.dataset_channels,
+                n_classes=args.n_classes,
+                # set the n_channels according to the pretrained model if necessary
+                n_channels=args.in_channels,
+                n_fft=args.token_size,
+                hop_length=args.hop_length,
+            )
+        if args.pretrain_model_path and (args.sampling_rate == 200):
+            model.biot.load_state_dict(torch.load(args.pretrain_model_path))
+            print(f"load pretrain model from {args.pretrain_model_path}")
     else:
         raise NotImplementedError
-    lightning_model = LitModel_finetune(args, model)
+
+    if args.freeze_backbone:
+        print("Freezing parameters for model.biot...")
+        for param in model.biot.parameters():
+            param.requires_grad = False
+        print("Parameters frozen.")
+
+    lightning_model = LitModel_finetune(args, model, test_loader=test_loader)
 
     # logger and callbacks
-    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}"
+    version = f"{args.output_dir}/{args.exp_name}-lr{args.lr}-bs{args.batch_size}-wd{args.weight_decay}-sr{args.sampling_rate}-ts{args.token_size}-hl{args.hop_length}"
     logger = TensorBoardLogger(
         save_dir="./",
         version=version,
         name="log",
     )
+
+    # 將所有參數 (args) 儲存為 config.yaml
+    log_dir = os.path.join("./log", version)
+    os.makedirs(log_dir, exist_ok=True)
+    args_dict = vars(args)
+    args_yaml_path = os.path.join(log_dir, "config.yaml")
+    try:
+        with open(args_yaml_path, 'w') as f:
+            yaml.dump(args_dict, f, sort_keys=False)
+        print(f"Configuration saved to {args_yaml_path}")
+    except Exception as e:
+        print(f"Could not save config.yaml: {e}. (Is 'pyyaml' installed?)")
+    # 將模型結構儲存為 model_structure.txt
+    model_txt_path = os.path.join(log_dir, "model_structure.txt")
+    try:
+        with open(model_txt_path, 'w') as f:
+            f.write(str(lightning_model.model))
+        print(f"Model structure saved to {model_txt_path}")
+    except Exception as e:
+        print(f"Error saving model_structure.txt: {e}")
+
     early_stop_callback = EarlyStopping(
-        monitor="val_auroc", patience=15, verbose=False, mode="max"
+        monitor="val_auroc", patience=5, verbose=False, mode="max"
     )
 
     trainer = pl.Trainer(
-        devices=[1],
+        devices=[0],
         accelerator="gpu",
         # strategy=DDPStrategy(find_unused_parameters=False),
         auto_select_gpus=True,
@@ -538,6 +607,7 @@ def supervised(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--exp_name", type=str, default="finetune", help="experiment name")
     parser.add_argument("--epochs", type=int, default=100,
                         help="number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
@@ -575,6 +645,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--pretrain_model_path", type=str, default="", help="pretrained model path"
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default="./", help="saved model path"
     )
     args = parser.parse_args()
 
