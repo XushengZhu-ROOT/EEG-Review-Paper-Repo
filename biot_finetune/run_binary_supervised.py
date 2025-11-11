@@ -229,7 +229,7 @@ class LitModel_finetune(pl.LightningModule):
         return [optimizer]  # , [scheduler]
 
 
-def prepare_CustomStress_dataloader(args):
+def prepare_KaggleERN_dataloader(args):
     # set random seed
     seed = 12345
     torch.manual_seed(seed)
@@ -237,7 +237,13 @@ def prepare_CustomStress_dataloader(args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/work/HHRI-AI/YW/Yirong/LaBramFinetune/augmented_data/Stress_noleak_30chan_no400up_seed_siwen42"
+    dataset_paths = {
+        "KaggleERN": "/work/HHRI-AI/UCSD_EEG/eeg_data/EEG_data/EEGPT_Data/KaggleERN/s42_n56-biot"
+    }
+    if args.dataset not in dataset_paths:
+        raise ValueError(f"Undefined dataset: {args.dataset}")
+
+    root = dataset_paths[args.dataset]
 
     train_files = os.listdir(os.path.join(root, "train"))
     np.random.shuffle(train_files)
@@ -249,7 +255,7 @@ def prepare_CustomStress_dataloader(args):
 
     # prepare training and test data loader
     train_loader = torch.utils.data.DataLoader(
-        TUABLoader(os.path.join(root, "train"),
+        KaggleERNLoader(os.path.join(root, "train"),
                    train_files, args.sampling_rate),
         batch_size=args.batch_size,
         shuffle=True,
@@ -258,14 +264,14 @@ def prepare_CustomStress_dataloader(args):
         persistent_workers=True,
     )
     test_loader = torch.utils.data.DataLoader(
-        TUABLoader(os.path.join(root, "test"), test_files, args.sampling_rate),
+        KaggleERNLoader(os.path.join(root, "test"), test_files, args.sampling_rate),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         persistent_workers=True,
     )
     val_loader = torch.utils.data.DataLoader(
-        TUABLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
+        KaggleERNLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -282,11 +288,15 @@ def prepare_TUAB_dataloader(args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/TUH/tuh3/tuh_eeg_abnormal/v3.0.0/edf/processed"
-    if args.dataset == "CustomStress-16chan":
-        root = "/work/HHRI-AI/YW/Yirong/LaBramFinetune/augmented_data/Stress_noleak_16chan_no400up_swien42"
-    elif args.dataset == "CustomStress-30chan":
-        root = "/work/HHRI-AI/YW/Yirong/LaBramFinetune/augmented_data/Stress_noleak_30chan_no400up_seed_siwen42"
+    dataset_paths = {
+        "TUAB": "/srv/local/data/TUH/tuh3/tuh_eeg_abnormal/v3.0.0/edf/processed",
+        "CustomStress-16chan": "/work/HHRI-AI/YW/Yirong/LaBramFinetune/augmented_data/Stress_noleak_16chan_no400up_siwen42",
+        "CustomStress-30chan": "/work/HHRI-AI/YW/Yirong/LaBramFinetune/augmented_data/Stress_noleak_30chan_no400up_seed_siwen42",
+        }
+    if args.dataset not in dataset_paths:
+        raise ValueError(f"Undefined dataset: {args.dataset}")
+
+    root = dataset_paths[args.dataset]
 
     train_files = os.listdir(os.path.join(root, "train"))
     np.random.shuffle(train_files)
@@ -415,8 +425,10 @@ def prepare_PTB_dataloader(args):
 
 def supervised(args):
     # get data loaders
-    if args.dataset == "TUAB" or "CustomStress" in args.dataset:
+    if args.dataset in ["TUAB", "CustomStress-16chan", "CustomStress-30chan"]:
         train_loader, test_loader, val_loader = prepare_TUAB_dataloader(args)
+    elif args.dataset in ["KaggleERN"]:
+        train_loader, test_loader, val_loader = prepare_KaggleERN_dataloader(args)
     else:
         raise NotImplementedError
 
@@ -590,7 +602,8 @@ def supervised(args):
         enable_checkpointing=True,
         logger=logger,
         max_epochs=args.epochs,
-        callbacks=[early_stop_callback],
+        callbacks=[],
+        # callbacks=[early_stop_callback],
     )
 
     # train the model
