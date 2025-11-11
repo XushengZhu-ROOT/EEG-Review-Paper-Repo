@@ -662,6 +662,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir", type=str, default="./", help="saved model path"
     )
+    parser.add_argument(
+        "--freeze_backbone",
+        action="store_true",
+        help="Freeze the backbone during training (default: False)."
+    )
     args = parser.parse_args()
 
     if args.dataset_channels is None:
