@@ -29,7 +29,7 @@ from torch import inf
 import h5py
 
 from tensorboardX import SummaryWriter
-from data_processor.dataset import ShockDataset
+# from data_processor.dataset import ShockDataset
 import pickle
 from scipy.signal import resample
 from pyhealth.metrics import binary_metrics_fn, multiclass_metrics_fn
@@ -700,14 +700,14 @@ def create_ds_config(args):
         writer.write(json.dumps(ds_config, indent=2))
 
 
-def build_pretraining_dataset(datasets: list, time_window: list, stride_size=200, start_percentage=0, end_percentage=1):
-    shock_dataset_list = []
-    ch_names_list = []
-    for dataset_list, window_size in zip(datasets, time_window):
-        dataset = ShockDataset([Path(file_path) for file_path in dataset_list], window_size * 200, stride_size, start_percentage, end_percentage)
-        shock_dataset_list.append(dataset)
-        ch_names_list.append(dataset.get_ch_names())
-    return shock_dataset_list, ch_names_list
+# def build_pretraining_dataset(datasets: list, time_window: list, stride_size=200, start_percentage=0, end_percentage=1):
+#     shock_dataset_list = []
+#     ch_names_list = []
+#     for dataset_list, window_size in zip(datasets, time_window):
+#         dataset = ShockDataset([Path(file_path) for file_path in dataset_list], window_size * 200, stride_size, start_percentage, end_percentage)
+#         shock_dataset_list.append(dataset)
+#         ch_names_list.append(dataset.get_ch_names())
+#     return shock_dataset_list, ch_names_list
 
 
 def get_input_chans(ch_names):
