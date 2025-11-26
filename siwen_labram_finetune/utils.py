@@ -632,7 +632,7 @@ def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, mode
                 checkpoint = torch.hub.load_state_dict_from_url(
                     args.resume, map_location='cpu', check_hash=True)
             else:
-                checkpoint = torch.load(args.resume, map_location='cpu')
+                checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
             model_without_ddp.load_state_dict(checkpoint['model']) # strict: bool=True, , strict=False
             print("Resume checkpoint %s" % args.resume)
             if 'optimizer' in checkpoint and 'epoch' in checkpoint:
@@ -772,6 +772,34 @@ class KaggleERNLoader(torch.utils.data.Dataset):
         X = torch.FloatTensor(X)
         return X, Y
 
+class SleepLoader(torch.utils.data.Dataset):
+    def __init__(self, root, files, sampling_rate=200, data_key='X', label_key='y'):
+        self.root = root
+        self.files = files
+        self.default_rate = 200
+        self.sampling_rate = sampling_rate
+        self.data_key = data_key
+        self.label_key = label_key
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample_path = os.path.join(self.root, self.files[index])
+        sample = pickle.load(open(sample_path, "rb"))
+
+        if self.data_key not in sample.keys():
+            raise KeyError(f"Data key '{self.data_key}' not found in {sample_path}")
+        if self.label_key not in sample.keys():
+            raise KeyError(f"Label key '{self.label_key}' not found in {sample_path}")
+
+        X = sample[self.data_key]
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, 10 * self.sampling_rate, axis=-1)
+        Y = sample[self.label_key]
+        X = torch.FloatTensor(X)
+        return X, Y
+
 class TUEVLoader(torch.utils.data.Dataset):
     def __init__(self, root, files, sampling_rate=200):
         self.root = root
@@ -854,6 +882,25 @@ def prepare_KaggleERN_dataset(root, data_key='signal', label_key='label'):
     train_dataset = KaggleERNLoader(os.path.join(root, "train"), train_files, data_key=data_key, label_key=label_key)
     test_dataset = KaggleERNLoader(os.path.join(root, "test"), test_files, data_key=data_key, label_key=label_key)
     val_dataset = KaggleERNLoader(os.path.join(root, "val"), val_files, data_key=data_key, label_key=label_key)
+    print(len(train_files), len(val_files), len(test_files))
+    return train_dataset, test_dataset, val_dataset
+
+def prepare_Sleep_dataset(root):
+    # set random seed
+    seed = 12345
+    np.random.seed(seed)
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    np.random.shuffle(train_files)
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    # prepare training and test data loader
+    train_dataset = SleepLoader(os.path.join(root, "train"), train_files, data_key='signal', label_key='label')
+    test_dataset = SleepLoader(os.path.join(root, "test"), test_files, data_key='signal', label_key='label')
+    val_dataset = SleepLoader(os.path.join(root, "val"), val_files, data_key='signal', label_key='label')
     print(len(train_files), len(val_files), len(test_files))
     return train_dataset, test_dataset, val_dataset
 

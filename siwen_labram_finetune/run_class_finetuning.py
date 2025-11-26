@@ -305,6 +305,13 @@ def get_dataset(args):
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
         args.nb_classes = 1
         metrics = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
+    elif args.dataset == 'Sleep':
+        train_dataset, test_dataset, val_dataset = utils.prepare_Sleep_dataset(args.dataset_path)
+        ch_names = ['C3_A2', 'C4_A1', 'F3_A2', 'F4_A1', 'O1_A2', 'O2_A1']
+        ch_names = [name.split(' ')[-1].split('-')[0].split('_')[0] for name in ch_names]
+        args.nb_classes = 5
+        metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
+
     return train_dataset, test_dataset, val_dataset, ch_names, metrics
 
 
@@ -476,7 +483,7 @@ def main(args, ds_init):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.finetune, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.finetune, map_location='cpu')
+            checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
 
         print("Load ckpt from %s" % args.finetune)
         checkpoint_model = None
