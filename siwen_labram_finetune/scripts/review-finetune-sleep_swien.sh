@@ -8,14 +8,13 @@ dataset_path=/home/dung/Documents/EEG-Review-Paper-Repo/isruc_labram
 chan_size=6
 gpu_id=0
 seed=0
+num_classes=5
 #--------- STRESS - Linear Probe (只訓練頭) ---------#
 #---------           - swien config (一組) -------------#
 #---------           - 1 層 Classifier -------------#
 # 1. 只訓練頭, 1層
 
-# chan_size=6
-# model_type=1ly
-# seed=0
+model_type=3ly
 
 # epochs=50
 # lr=1e-3 # 5e-4
@@ -57,7 +56,8 @@ seed=0
 #      --save_ckpt_freq 5 \
 #      --disable_rel_pos_bias \
 #      --abs_pos_emb \
-#      --disable_qkv_bias 
+#      --disable_qkv_bias \
+#      --nb_classes ${num_classes}
 
 
 #--------- STRESS - finetune all (全微調) ---------#
@@ -110,7 +110,8 @@ seed=0
 #      --save_ckpt_freq 5 \
 #      --disable_rel_pos_bias \
 #      --abs_pos_emb \
-#      --disable_qkv_bias 
+#      --disable_qkv_bias \
+#      --nb_classes ${num_classes}
 
 
 
@@ -172,7 +173,8 @@ seed=0
 #             --save_ckpt_freq 5 \
 #             --disable_rel_pos_bias \
 #             --abs_pos_emb \
-#             --disable_qkv_bias 
+#             --disable_qkv_bias \
+#             --nb_classes ${num_classes} 
 #      echo "--- [EXPERIMENT #${exp_count} FINISHED] ---"
 #      echo "" 
 
@@ -190,7 +192,6 @@ LR_LIST=(0.001 0.0005 0.0001)
 WD_LIST=(0.01 0.05 0.001)
 
 freeze_type=all
-model_type=1ly
 if [ "${freeze_type}" = "linear_probe" ]; then
     FREEZE_ARG="--freeze_backbone"
 else
@@ -232,7 +233,8 @@ for bs in "${BS_LIST[@]}"; do
           --layer_decay 0.65 \
           --drop_path 0.1 \
           --disable_rel_pos_bias \
-          --disable_qkv_bias 
+          --disable_qkv_bias \
+          --nb_classes ${num_classes}
      echo "--- [EXPERIMENT #${exp_count} FINISHED] ---"
      echo "" 
 

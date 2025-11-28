@@ -464,7 +464,7 @@ class NeuralTransformer(nn.Module):
         return features
 
 class BinaryClassifierHead_CbramodStyle_3Ly_BCE(nn.Module):
-    def __init__(self, embed_dim=200, channel_size=30, window_size=5, dropout=0.5, init_scale=0.001):
+    def __init__(self, embed_dim=200, channel_size=30, window_size=5, dropout=0.5, init_scale=0.001, num_classes=1):
         super().__init__()
         input_dim = channel_size * window_size * embed_dim # 30 * 5 * 200 = 30000
         
@@ -477,11 +477,11 @@ class BinaryClassifierHead_CbramodStyle_3Ly_BCE(nn.Module):
             nn.Linear(window_size * embed_dim, embed_dim), # Layer 2: 1000 -> 200
             nn.ELU(),
             nn.Dropout(dropout),
-            nn.Linear(embed_dim, 1), # Layer 3: 200 -> 1 (統一輸出 1 維 Logit)
+            nn.Linear(embed_dim, num_classes), # Layer 3: 200 -> num_classes (統一輸出 num_classes 維 Logit)
         )
 
         if init_scale != 1.0:
-            final_linear = self.fc[-1] # 取得 nn.Linear(embed_dim, 1)
+            final_linear = self.fc[-1] # 取得 nn.Linear(embed_dim, num_classes)
             if isinstance(final_linear, nn.Linear):
                  final_linear.weight.data.mul_(init_scale)
                  if final_linear.bias is not None:
@@ -491,7 +491,7 @@ class BinaryClassifierHead_CbramodStyle_3Ly_BCE(nn.Module):
         return self.fc(x)
 
 class NeuralTransformer_Cbramod3lyClassifier_BCE(nn.Module):
-    def __init__(self, EEG_size=1600, patch_size=200, in_chans=1, out_chans=8, num_classes=1000, embed_dim=200, depth=12,
+    def __init__(self, EEG_size=1600, patch_size=200, in_chans=1, out_chans=8, num_classes=1, embed_dim=200, depth=12,
                  num_heads=10, mlp_ratio=4., qkv_bias=False, qk_norm=None, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None,
                  use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False,
@@ -531,7 +531,7 @@ class NeuralTransformer_Cbramod3lyClassifier_BCE(nn.Module):
             for i in range(depth)])
         self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
         self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
-        self.head = BinaryClassifierHead_CbramodStyle_3Ly_BCE(embed_dim=embed_dim, channel_size=self.channel_size, window_size=self.window_size, dropout=self.classifier_dropout) if num_classes > 0 else nn.Identity() # 150 = 30 channel * 5 seconds
+        self.head = BinaryClassifierHead_CbramodStyle_3Ly_BCE(embed_dim=embed_dim, channel_size=self.channel_size, window_size=self.window_size, dropout=self.classifier_dropout, num_classes=num_classes) if num_classes > 0 else nn.Identity() # 150 = 30 channel * 5 seconds
 
         if self.pos_embed is not None:
             trunc_normal_(self.pos_embed, std=.02)
@@ -574,7 +574,7 @@ class NeuralTransformer_Cbramod3lyClassifier_BCE(nn.Module):
     def reset_classifier(self, num_classes, global_pool=''):
         self.num_classes = num_classes
         # self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        self.head = BinaryClassifierHead_CbramodStyle_3Ly_BCE(embed_dim=embed_dim, channel_size=self.channel_size, window_size=self.window_size, dropout=self.classifier_dropout) if num_classes > 0 else nn.Identity() # 150 = 30 channel * 5 seconds
+        self.head = BinaryClassifierHead_CbramodStyle_3Ly_BCE(embed_dim=embed_dim, channel_size=self.channel_size, window_size=self.window_size, dropout=self.classifier_dropout, num_classes=num_classes) if num_classes > 0 else nn.Identity() # 150 = 30 channel * 5 seconds
 
     def forward_features(self, x, input_chans=None, return_patch_tokens=False, return_all_tokens=False, **kwargs):
         batch_size, n, a, t = x.shape
@@ -704,6 +704,7 @@ def labram_base_patch200_200(pretrained=False, **kwargs):
     
 @register_model
 def labram_base_patch200_200_cbramod3lyclassifier(pretrained=False, **kwargs):
+    print('num classes', kwargs.get('num_classes', 1000))
     model = NeuralTransformer_Cbramod3lyClassifier_BCE(
         patch_size=200, embed_dim=200, depth=12, num_heads=10, mlp_ratio=4, qk_norm=partial(nn.LayerNorm, eps=1e-6), # qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
