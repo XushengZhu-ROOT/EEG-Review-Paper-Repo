@@ -113,10 +113,14 @@ class Trainer(object):
                 y = y.cuda()
                 pred = self.model(x)
 
-                if self.params.downstream_dataset == 'ISRUC':
-                    loss = self.criterion(pred.transpose(1, 2), y)
-                else:
-                    loss = self.criterion(pred, y)
+                # if self.params.downstream_dataset == 'ISRUC':
+                #     print('y shape:', y.shape)
+                #     print('y', y)
+                #     print('pred shape:', pred.shape)
+                #     loss = self.criterion(pred.transpose(1, 2), y)
+                # else:
+                #     loss = self.criterion(pred, y)
+                loss = self.criterion(pred, y)
 
                 loss.backward()
                 losses.append(loss.data.cpu().numpy())
@@ -193,7 +197,7 @@ class Trainer(object):
         print("="*70)
         print(f"Best model from Epoch {best_metrics['epoch']}")
         print(f"Best Val  - acc: {best_metrics['val_acc']:.5f}, bacc: {best_metrics['val_bacc']:.5f}, \n", \
-                f"kappa: {best_metrics['val_kappa']:.5f}, f1: {val_best_metrics['val_f1']:.5f}")
+                f"kappa: {best_metrics['val_kappa']:.5f}, f1: {best_metrics['val_f1']:.5f}")
         print(f"Best Test - acc: {best_metrics['test_acc']:.5f}, bacc: {best_metrics['test_bacc']:.5f}, \n", \
                 f"kappa: {best_metrics['test_kappa']:.5f}, f1: {best_metrics['test_f1']:.5f}")
         print("="*70 + "\n")
