@@ -175,8 +175,8 @@ class Trainer(object):
                 print(test_cm)
             
                 # 更新最佳模型（根據驗證集的 kappa）
-                if val_kappa > best_metrics['val_kappa']:
-                    print(">>> Val Kappa increasing... saving weights!")
+                if val_bacc > best_metrics['val_bacc']:
+                    print(">>> Val Balanced Accuracy increasing... saving weights!")
                     best_metrics.update({
                         'val_acc': val_acc,
                         'val_bacc': val_bacc,
@@ -209,12 +209,12 @@ class Trainer(object):
             'val_bacc': float(best_metrics['val_bacc']),
             'val_kappa': float(best_metrics['val_kappa']),
             'val_f1': float(best_metrics['val_f1']),
-            'val_cm': (best_metrics['val_cm'].tolist()),
+            'val_cm': (best_metrics['val_cm'].tolist()) if best_metrics['val_cm'] is not None else None,
             'test_acc': float(best_metrics['test_acc']),
             'test_bacc': float(best_metrics['test_bacc']),
             'test_kappa': float(best_metrics['test_kappa']),
             'test_f1': float(best_metrics['test_f1']),
-            'test_cm': (best_metrics['test_cm'].tolist()),
+            'test_cm': (best_metrics['test_cm'].tolist()) if best_metrics['test_cm'] is not None else None,
         }
         
         # 儲存模型
@@ -225,8 +225,11 @@ class Trainer(object):
             self.params.model_dir, 
             f"best_model_epoch{best_metrics['epoch']}_testKappa{best_metrics['test_kappa']:.5f}_testF1{best_metrics['test_f1']:.5f}.pth"
         )
-        torch.save(self.best_model_states, model_path)
-        print(f"Model saved to {model_path}")
+        if self.best_model_states is not None:
+            torch.save(self.best_model_states, model_path)
+            print(f"Model saved to {model_path}")
+        else:
+            print("No best model found (metrics did not improve). Model not saved.")
         
         # 儲存訓練記錄
         self.save_training_logs(final_results)

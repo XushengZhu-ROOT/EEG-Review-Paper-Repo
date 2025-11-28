@@ -12,6 +12,7 @@ epochs=50
 num_classes=5
 classifier=all_patch_reps #Labram_style_classifier # 1層
 seed=0
+freeze_type=linear_probe
 
 #--------- STRESS - Linear Probe (只訓練頭) ---------#
 #---------           - author config (一組) -------------#
@@ -148,7 +149,6 @@ BS_LIST=(64 256 512)
 LR_LIST=(0.0005 0.0001 0.00005)
 WD_LIST=(0.002 0.00002)
 # 微調全部
-freeze_type=all
 if [ "${freeze_type}" = "linear_probe" ]; then
     FREEZE_ARG="--frozen"
 else
