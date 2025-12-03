@@ -57,6 +57,54 @@ class KaggleERNLoader(torch.utils.data.Dataset):
         X = torch.FloatTensor(X)
         return X, Y
 
+class MotionLoader(torch.utils.data.Dataset):
+    def __init__(self, root, files, sampling_rate=200, in_channels=16):
+        self.root = root
+        self.files = files
+        self.default_rate = 200
+        self.sampling_rate = sampling_rate
+        self.in_channels = in_channels  # <<< 必須加上
+
+        # 20 → 16 channel mapping
+        self.MOTION_16CH = [1,2,4,6,7,17,14,12,15,16,0,3,13,18,5,8]
+
+    def __len__(self):
+        return len(self.files)
+    
+    def __getitem__(self, index):
+
+        for _ in range(len(self.files)):
+            sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+            X = sample["signal"]
+
+            # --- 20ch → 16ch ---
+            X = X[self.MOTION_16CH, :]
+
+            # --- 跳過不是16ch的資料（理論上不會發生） ---
+            if X.shape[0] != self.in_channels:  
+                index = (index + 1) % len(self.files)
+                continue
+
+            # --- resample (if needed) ---
+            if self.sampling_rate != self.default_rate:
+                X = resample(X, 10 * self.sampling_rate, axis=-1)
+
+            # --- 95% quantile normalization ---
+            X = X / (
+                np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+                + 1e-8
+            )
+
+            # --- convert dtype ---
+            X = torch.tensor(X, dtype=torch.float32)
+            Y = torch.tensor(sample["label"] - 1, dtype=torch.long)
+
+            return X, Y
+
+        raise RuntimeError(
+            f"No valid sample with in_channels={self.in_channels} found."
+        )
+        
 class CHBMITLoader(torch.utils.data.Dataset):
     def __init__(self, root, files, sampling_rate=200):
         self.root = root
