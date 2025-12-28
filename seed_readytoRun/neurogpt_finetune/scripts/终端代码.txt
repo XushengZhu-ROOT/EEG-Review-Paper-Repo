@@ -1,0 +1,13 @@
+./review-finetune-motor6class-author-linearprobe.sh
+
+./review-finetune-motor6class-author-full.sh
+
+./review-finetune-motor6class-hpo-full.sh
+
+
+
+./review-finetune-emotion7class-author-linearprobe.sh
+
+
+./review-finetune-emotion7class-author-full.sh
+
