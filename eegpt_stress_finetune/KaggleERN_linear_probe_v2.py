@@ -198,7 +198,7 @@ class Config:
     # Model capacity (will be overwritten by ckpt introspection)
     embed_dim: int = 512
     embed_num: int = 4
-    depth: int = 3
+    depth: int = 8
     num_heads: int = 8
     patch_size: int = 64
     patch_stride: Optional[int] = 32  
