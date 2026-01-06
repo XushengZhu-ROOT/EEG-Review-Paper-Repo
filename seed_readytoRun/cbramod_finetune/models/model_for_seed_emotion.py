@@ -18,20 +18,20 @@ class Model(nn.Module):
             self.backbone.load_state_dict(torch.load(param.foundation_dir, map_location=map_location))
         self.backbone.proj_out = nn.Identity()
         
-        # 7分类任务：所有分类器输出维度改为7
-        num_classes = param.num_of_classes  # 7
+        # 6分类任务：所有分类器输出维度改为6 (已移除neutral类别)
+        num_classes = param.num_of_classes  # 6
         
         if param.classifier == 'avgpooling_patch_reps':
             self.classifier = nn.Sequential(
                 Rearrange('b c s d -> b d c s'),
                 nn.AdaptiveAvgPool2d((1, 1)),
                 nn.Flatten(),
-                nn.Linear(200, num_classes),  # 改为7分类
+                nn.Linear(200, num_classes),  # 6分类
             )
         elif param.classifier == 'all_patch_reps_onelayer':
             self.classifier = nn.Sequential(
                 Rearrange('b c s d -> b (c s d)'),
-                nn.Linear(param.channel_size * param.window_size * 200, num_classes),  # 改为7分类
+                nn.Linear(param.channel_size * param.window_size * 200, num_classes),  # 6分类
             )
         elif param.classifier == 'all_patch_reps_twolayer':
             self.classifier = nn.Sequential(
@@ -39,7 +39,7 @@ class Model(nn.Module):
                 nn.Linear(param.channel_size * param.window_size * 200, 200),
                 nn.ELU(),
                 nn.Dropout(param.dropout),
-                nn.Linear(200, num_classes),  # 改为7分类
+                nn.Linear(200, num_classes),  # 6分类
             )
         elif param.classifier == 'all_patch_reps':
             self.classifier = nn.Sequential(
@@ -50,7 +50,7 @@ class Model(nn.Module):
                 nn.Linear(param.window_size * 200, 200),
                 nn.ELU(),
                 nn.Dropout(param.dropout),
-                nn.Linear(200, num_classes),  # 改为7分类
+                nn.Linear(200, num_classes),  # 6分类
             )
         elif param.classifier == 'all_patch_reps_layernorm':
             self.classifier = nn.Sequential(
@@ -62,20 +62,20 @@ class Model(nn.Module):
                 nn.Linear(param.window_size * 200, 200),
                 nn.ELU(),
                 nn.Dropout(param.dropout),
-                nn.Linear(200, num_classes),  # 改为7分类
+                nn.Linear(200, num_classes),  # 6分类
             )
         elif param.classifier == 'Labram_style_classifier':
             self.classifier = nn.Sequential(
                 Rearrange('b c s d -> b (c s d)'),
                 nn.LayerNorm(param.channel_size * param.window_size * 200),
-                nn.Linear(param.channel_size * param.window_size * 200, num_classes),  # 改为7分类
+                nn.Linear(param.channel_size * param.window_size * 200, num_classes),  # 6分类
             )
         elif param.classifier == 'Labram_style_classifier2':
             self.classifier = nn.Sequential(
                 Rearrange('b c s d -> b (c s) d'),     # (B, channels*windows, 200)
                 Reduce('b n d -> b d', 'mean'),        # (B, 200) - 平均池化
                 nn.LayerNorm(200),
-                nn.Linear(200, num_classes),  # 改为7分类
+                nn.Linear(200, num_classes),  # 6分类
             )
         else:
             raise ValueError(f"Unknown classifier type: {param.classifier}")
@@ -84,5 +84,5 @@ class Model(nn.Module):
         bz, ch_num, seq_len, patch_size = x.shape
         feats = self.backbone(x)
         out = self.classifier(feats)
-        return out  # 输出形状: (batch_size, 7)
+        return out  # 输出形状: (batch_size, 6)
 
