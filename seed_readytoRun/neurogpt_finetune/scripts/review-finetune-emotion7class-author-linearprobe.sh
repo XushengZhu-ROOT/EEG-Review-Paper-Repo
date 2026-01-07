@@ -27,7 +27,7 @@ echo "LR: ${lr}, WD: ${wd}, Batch Size: ${batch_size}"
 CUDA_VISIBLE_DEVICES=${gpu_id} python3 ../src/train_gpt.py \
 --training-style='decoding' \
 --num-decoding-classes=6 \
---training-steps=500  \
+--training-steps=10000  \
 --eval_every_n_steps=500 \
 --log-every-n-steps=500 \
 --num_chunks=${num_chunks} \
