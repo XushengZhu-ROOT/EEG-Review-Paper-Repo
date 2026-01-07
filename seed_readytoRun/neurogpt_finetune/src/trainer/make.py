@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import os
+import re
 from typing import Dict, List, Tuple
 import numpy as np
 import math
+from collections import defaultdict
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -172,12 +174,28 @@ def _cat_data_collator(features: List) -> Dict[str, torch.tensor]:
     result = {}
     for k in features[0].keys():
         if not k.startswith("__"):
-            tensors = [f[k] for f in features]
-            # labels字段特殊处理：如果是0维tensor（标量），使用stack；否则使用cat
-            if k == 'labels' and len(tensors) > 0 and tensors[0].dim() == 0:
-                result[k] = torch.stack(tensors)
+            values = [f[k] for f in features]
+            # 字符串类型字段（如epoch_id）特殊处理：保存为列表
+            if len(values) > 0 and isinstance(values[0], (str, bytes)):
+                result[k] = values  # 保存为列表，不做tensor转换
+            elif len(values) > 0 and isinstance(values[0], torch.Tensor):
+                # labels字段特殊处理：如果是0维tensor（标量），使用stack；否则使用cat
+                if k == 'labels' and values[0].dim() == 0:
+                    result[k] = torch.stack(values)
+                else:
+                    result[k] = torch.cat(values)
             else:
-                result[k] = torch.cat(tensors)
+                # 其他类型（如numpy数组），尝试转换为tensor或保持原样
+                try:
+                    if len(values) > 0 and hasattr(values[0], '__array__'):
+                        # numpy数组或其他可转换为tensor的类型
+                        result[k] = torch.cat([torch.from_numpy(v) if isinstance(v, np.ndarray) else torch.tensor(v) for v in values])
+                    else:
+                        # 保持为列表
+                        result[k] = values
+                except (TypeError, ValueError):
+                    # 如果转换失败，保持为列表
+                    result[k] = values
     return result
 
 
@@ -284,6 +302,142 @@ def make_decoding_accuracy_metrics(num_classes: int):
         return formatted_metrics
 
     return decoding_accuracy_metrics
+
+
+def extract_video_index(epoch_id: str) -> int:
+    """从 epoch_id 中提取 video_index"""
+    match = re.search(r'video_index_(\d+)_chunk', epoch_id)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def extract_subject_id(epoch_id: str) -> int:
+    """从 epoch_id 中提取 subject_id"""
+    match = re.search(r'subject_(\d+)_', epoch_id)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def compute_voting_metrics(predictions: np.ndarray, labels: np.ndarray, epoch_ids: List[str]) -> Dict[str, float]:
+    """
+    基于投票的评估指标计算
+    
+    参数:
+        predictions: (n_samples, num_classes) 预测logits或 (n_samples,) 预测类别
+        labels: (n_samples,) 真实标签
+        epoch_ids: (n_samples,) epoch_id列表
+        
+    返回:
+        包含投票评估指标的字典
+    """
+    # 如果predictions是多维的（logits），转换为类别
+    if predictions.ndim > 1:
+        pred_labels = predictions.argmax(axis=-1)
+    else:
+        pred_labels = predictions
+    
+    # 按视频分组
+    video_groups = defaultdict(lambda: {'preds': [], 'label': None, 'subject_id': None})
+    
+    for i, epoch_id in enumerate(epoch_ids):
+        video_index = extract_video_index(epoch_id)
+        subject_id = extract_subject_id(epoch_id)
+        
+        if video_index is None:
+            continue  # 跳过无法提取video_index的样本
+        
+        video_key = (subject_id, video_index)
+        
+        video_groups[video_key]['preds'].append(int(pred_labels[i]))
+        video_groups[video_key]['label'] = int(labels[i])  # 同一视频的label应该相同
+        video_groups[video_key]['subject_id'] = subject_id
+    
+    # 对每个视频进行投票
+    video_predictions = []
+    video_labels = []
+    video_scores = []  # 用于记录每个视频的得分（0, 0.5, 1）
+    
+    for video_key, video_data in video_groups.items():
+        preds = video_data['preds']
+        true_label = video_data['label']
+        
+        if len(preds) == 0:
+            continue
+        
+        # 多数投票
+        from collections import Counter
+        vote_counts = Counter(preds)
+        max_votes = max(vote_counts.values())
+        
+        # 找出所有得票最多的类别
+        majority_classes = [cls for cls, count in vote_counts.items() if count == max_votes]
+        
+        if len(majority_classes) == 1:
+            # 有唯一的多数类别
+            video_pred = majority_classes[0]
+            score = 1.0 if video_pred == true_label else 0.0
+        else:
+            # 平票情况
+            if true_label in majority_classes:
+                video_pred = true_label  # 如果真实标签在候选中，选择它
+                score = 0.5
+            else:
+                video_pred = majority_classes[0]  # 否则选择第一个（任意选择）
+                score = 0.0
+        
+        video_predictions.append(video_pred)
+        video_labels.append(true_label)
+        video_scores.append(score)
+    
+    if len(video_predictions) == 0:
+        return {
+            'video_accuracy': 0.0,
+            'video_bacc': 0.0,
+            'num_videos': 0,
+        }
+    
+    video_predictions = np.array(video_predictions)
+    video_labels = np.array(video_labels)
+    video_scores = np.array(video_scores)
+    
+    # 视频级别准确率（使用投票得分）
+    video_accuracy = video_scores.mean()
+    
+    # 视频级别平衡准确率（基于最终预测结果）
+    video_bacc = balanced_accuracy_score(video_labels, video_predictions)
+    
+    # 按subject分组计算准确率
+    subject_accuracies = {}
+    subject_groups = defaultdict(lambda: {'preds': [], 'labels': []})
+    
+    for i, (video_key, video_data) in enumerate(video_groups.items()):
+        subject_id = video_data['subject_id']
+        if subject_id is not None:
+            subject_groups[subject_id]['preds'].append(video_predictions[i])
+            subject_groups[subject_id]['labels'].append(video_labels[i])
+    
+    for subject_id, subject_data in subject_groups.items():
+        sub_preds = np.array(subject_data['preds'])
+        sub_labels = np.array(subject_data['labels'])
+        sub_accuracy = accuracy_score(sub_labels, sub_preds)
+        subject_accuracies[f'subject_{subject_id}_accuracy'] = sub_accuracy
+    
+    metrics = {
+        'video_accuracy': round(video_accuracy, 4),
+        'video_bacc': round(video_bacc, 4),
+        'num_videos': len(video_predictions),
+    }
+    
+    # 添加subject级别的准确率
+    metrics.update({f'{k}': round(v, 4) for k, v in subject_accuracies.items()})
+    
+    # 计算平均subject准确率
+    if len(subject_accuracies) > 0:
+        metrics['avg_subject_accuracy'] = round(np.mean(list(subject_accuracies.values())), 4)
+    
+    return metrics
 
 
 def get_compute_metrics(training_style: str, num_classes: int = None):

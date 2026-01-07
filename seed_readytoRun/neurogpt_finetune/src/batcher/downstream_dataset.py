@@ -3,6 +3,7 @@ import pdb
 import torch
 import pickle
 import numpy as np
+import re
 from typing import Tuple, List, Dict
 from batcher.base import EEGDataset
 from scipy.io import loadmat
@@ -423,17 +424,19 @@ class Motor6ClassDataset(EEGDataset):
 
 class Emotion7ClassDataset(EEGDataset):
     """
-    Emotion 7分类数据集类
+    Emotion 6分类数据集类（移除neutral类别）
     - 62通道输入，转换为22通道
-    - 7分类任务 (0-6)
-    - 5秒数据（1250个时间点@250Hz），分成5个chunks（每个chunk 250个时间点，1秒）
+    - 6分类任务 (0-5): happy=0, sad=1, disgust=2, fear=3, surprise=4, anger=5
+    - 跳过neutral类别（原始label=2）
+    - 标签映射：happy=0→0, sad=1→1, disgust=3→2, fear=4→3, surprise=5→4, anger=6→5
+    - 4秒数据（1000个时间点@250Hz），分成4个chunks（每个chunk 250个时间点，1秒）
     """
     def __init__(
         self,
         filenames,
         sample_keys,
-        chunk_len=250,  # 1秒数据，用于分成5个chunks
-        num_chunks=5,  # 5秒数据分成5个chunks
+        chunk_len=250,  # 1秒数据，用于分成4个chunks
+        num_chunks=4,  # 4秒数据分成4个chunks
         ovlp=0,  # 不重叠
         root_path="",
         matrix_p_path=None,
@@ -464,10 +467,10 @@ class Emotion7ClassDataset(EEGDataset):
         except FileNotFoundError:
             print(
                 f"ERROR: P matrix not found at {matrix_p_path}. Cannot perform channel mapping."
-            )
+                )
             raise
 
-        self.trials, self.labels, self.num_trials_per_file = self.get_trials_all()
+        self.trials, self.labels, self.epoch_ids, self.num_trials_per_file = self.get_trials_all()
         print(f"✓ 成功加载 {self.num_trials_per_file} 个样本")
 
     def __len__(self):
@@ -489,15 +492,37 @@ class Emotion7ClassDataset(EEGDataset):
 
         return np.matmul(self.P, data)  # Output shape: (22, N_samples)
 
-    def get_trials_all(self) -> Tuple[np.ndarray, np.ndarray, int]:
+    @staticmethod
+    def extract_video_index(epoch_id: str) -> int:
+        """从 epoch_id 中提取 video_index
+        例如: 'subject_1_video_index_3_chunk001' -> 3
+        """
+        match = re.search(r'video_index_(\d+)_chunk', epoch_id)
+        if match:
+            return int(match.group(1))
+        return None
+
+    @staticmethod
+    def extract_subject_id(epoch_id: str) -> int:
+        """从 epoch_id 中提取 subject_id
+        例如: 'subject_1_video_index_3_chunk001' -> 1
+        """
+        match = re.search(r'subject_(\d+)_', epoch_id)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def get_trials_all(self) -> Tuple[np.ndarray, np.ndarray, List[str], int]:
         """
         加载所有数据并映射通道
-        返回: (trials, labels, num_trials)
+        返回: (trials, labels, epoch_ids, num_trials)
         - 62通道数据映射到22通道
-        - 5秒数据（1250个时间点）保持不变，用于分成5个chunks
+        - 4秒数据（1000个时间点）保持不变，用于分成4个chunks
+        - 保存epoch_id信息用于投票评估
         """
         trials_all = []
         labels_all = []
+        epoch_ids_all = []
         skipped_other = 0
 
         for filename in self.filenames:
@@ -522,8 +547,8 @@ class Emotion7ClassDataset(EEGDataset):
                 skipped_other += 1
                 continue
 
-            # 检查时间长度：应该是1250个时间点（5秒@250Hz）
-            if trial_data.shape[1] != 1250:
+            # 检查时间长度：应该是1000个时间点（4秒@250Hz）
+            if trial_data.shape[1] != 1000:
                 skipped_other += 1
                 continue
 
@@ -533,35 +558,73 @@ class Emotion7ClassDataset(EEGDataset):
                 skipped_other += 1
                 continue
 
+            # 跳过neutral类别（label=2）
+            if label == 2:
+                skipped_other += 1
+                continue
+
+            # 重新映射标签：移除neutral=2后的映射
+            # 原始：happy=0, sad=1, neutral=2, disgust=3, fear=4, surprise=5, anger=6
+            # 新：  happy=0, sad=1, disgust=2, fear=3, surprise=4, anger=5
+            if label > 2:
+                label = label - 1  # 3→2, 4→3, 5→4, 6→5
+
+            # 提取epoch_id
+            if "epoch_id" in sample:
+                epoch_id = sample["epoch_id"]
+            else:
+                # 如果pickle中没有epoch_id，尝试从文件名提取
+                filename_base = os.path.basename(file_path)
+                epoch_id = filename_base.replace(".pickle", "").replace(".pkl", "")
+            
             # 映射到22通道
-            mapped_data = self.map2pret(trial_data)  # (22, 1250)
+            mapped_data = self.map2pret(trial_data)  # (22, 1000)
 
             trials_all.append(mapped_data)
             labels_all.append(label)
+            epoch_ids_all.append(epoch_id)
 
         total_num = len(trials_all)
         
         # 输出统计信息
+        skipped_neutral = 0
+        for filename in self.filenames:
+            try:
+                with open(filename, "rb") as f:
+                    sample = pickle.load(f)
+                if "label" in sample and sample["label"] == 2:
+                    skipped_neutral += 1
+            except:
+                pass
+        
+        if skipped_neutral > 0:
+            print(f"ℹ️  跳过 {skipped_neutral} 个neutral类别（label=2）的样本")
         if skipped_other > 0:
             print(f"⚠️  跳过 {skipped_other} 个其他问题的样本（通道数/时间长度/标签缺失等）")
 
         if total_num == 0:
             raise ValueError("没有成功加载任何样本！请检查数据路径和格式。")
 
-        # Stack所有trial: (Total_Trials, 22, 1250)
+        # Stack所有trial: (Total_Trials, 22, 1000)
         trials_all_arr = np.stack(trials_all, axis=0)
 
-        return self.normalize(trials_all_arr), np.array(labels_all).flatten(), total_num
+        return self.normalize(trials_all_arr), np.array(labels_all).flatten(), epoch_ids_all, total_num
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         获取单个样本
         """
-        trial_data_normalized = self.trials[idx]  # (22, 1250)
-        label = self.labels[idx]  # int (0-6)
+        trial_data_normalized = self.trials[idx]  # (22, 1000)
+        label = self.labels[idx]  # int (0-5, 已移除neutral)
+        epoch_id = self.epoch_ids[idx]  # str
 
-        return self.preprocess_sample(
+        result = self.preprocess_sample(
             sample=trial_data_normalized,
-            seq_len=self.num_chunks,  # 5
+            seq_len=self.num_chunks,
             labels=label,
         )
+        
+        # 添加epoch_id信息（用于投票评估）
+        result['epoch_id'] = epoch_id
+        
+        return result

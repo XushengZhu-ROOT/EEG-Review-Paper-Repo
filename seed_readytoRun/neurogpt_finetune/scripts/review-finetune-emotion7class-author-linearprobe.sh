@@ -4,11 +4,11 @@ dataset=emotion7class
 dataset_path="../seed_data"
 matrix_p_path="../tMatrix_22x62_seed.npy"
 gpu_id=0
-pos_weight=-1.0  # 7分类任务，不需要pos_weight
+pos_weight=-1.0  # 6分类任务（移除neutral），不需要pos_weight
 
 # 数据预处理参数
-num_chunks=5  # 5秒数据分成5个chunks
-chunk_len=250  # 1秒 = 250个时间点 @ 250Hz（与预训练模型匹配）
+num_chunks=2  # 4秒数据分成4个chunks
+chunk_len=500  # 1秒 = 250个时间点 @ 250Hz（与预训练模型匹配）
 chunk_ovlp=0   # 不重叠
 
 # 模型参数
@@ -26,8 +26,8 @@ echo "LR: ${lr}, WD: ${wd}, Batch Size: ${batch_size}"
 
 CUDA_VISIBLE_DEVICES=${gpu_id} python3 ../src/train_gpt.py \
 --training-style='decoding' \
---num-decoding-classes=7 \
---training-steps=10000  \
+--num-decoding-classes=6 \
+--training-steps=500  \
 --eval_every_n_steps=500 \
 --log-every-n-steps=500 \
 --num_chunks=${num_chunks} \

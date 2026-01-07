@@ -69,7 +69,7 @@ sys.path.insert(0, os.path.join(script_path, "../"))
 from batcher.base import EEGDataset
 from decoder.make_decoder import make_decoder
 from embedder.make import make_embedder
-from trainer.make import make_trainer
+from trainer.make import make_trainer, compute_voting_metrics, extract_video_index, extract_subject_id
 from trainer.base import Trainer
 from decoder.unembedder import make_unembedder
 
@@ -537,6 +537,188 @@ def train(config: Dict = None) -> Trainer:
             os.path.join(config["log_dir"], "test_label_ids.npy"),
             test_prediction.label_ids,
         )
+        
+        # 投票评估（仅对emotion7class数据集）
+        if config["dataset_name"] == "emotion7class" and hasattr(test_dataset, 'epoch_ids'):
+            print("\n=== 进行投票评估 ===")
+            
+            # 从dataset中收集所有epoch_ids（predict的顺序应该和dataset的顺序一致）
+            sample_epoch_ids = test_dataset.epoch_ids
+            n_samples = len(sample_epoch_ids)
+            n_predictions = len(test_prediction.predictions)
+            
+            # 检测实际的chunks数量
+            if n_predictions % n_samples == 0:
+                actual_chunks_per_sample = n_predictions // n_samples
+                
+                # 为每个chunk的预测分配epoch_id
+                chunk_epoch_ids = []
+                chunk_labels = []
+                chunk_predictions = []
+                
+                for i, epoch_id in enumerate(sample_epoch_ids):
+                    # 为这个样本的所有chunks分配相同的epoch_id
+                    for chunk_idx in range(actual_chunks_per_sample):
+                        pred_idx = i * actual_chunks_per_sample + chunk_idx
+                        chunk_epoch_ids.append(epoch_id)
+                        
+                        # 获取这个chunk的预测
+                        if test_prediction.predictions.ndim == 1:
+                            chunk_pred = test_prediction.predictions[pred_idx]
+                        else:
+                            chunk_pred = test_prediction.predictions[pred_idx].argmax()
+                        chunk_predictions.append(chunk_pred)
+                        
+                        # label也应该重复
+                        if i < len(test_prediction.label_ids):
+                            chunk_labels.append(test_prediction.label_ids[i])
+                
+                # 如果label_ids的数量已经等于predictions，说明已经正确展开
+                if len(test_prediction.label_ids) == n_predictions:
+                    chunk_labels = test_prediction.label_ids
+                elif len(test_prediction.label_ids) == n_samples:
+                    # label_ids是样本级别的，需要展开到chunk级别
+                    chunk_labels = []
+                    for i, label in enumerate(test_prediction.label_ids):
+                        for _ in range(actual_chunks_per_sample):
+                            chunk_labels.append(label)
+                    chunk_labels = np.array(chunk_labels)
+                else:
+                    # 其他情况，使用已有的label_ids
+                    chunk_labels = test_prediction.label_ids[:n_predictions]
+                
+                # 使用展开后的predictions（argmax后的类别）
+                chunk_predictions_array = np.array(chunk_predictions)
+                
+                # 使用展开后的predictions（chunk级别的类别预测）
+                voting_metrics = compute_voting_metrics(
+                    chunk_predictions_array,  # 使用已经argmax后的类别
+                    chunk_labels,
+                    chunk_epoch_ids
+                )
+                
+                # 计算视频级别的预测和标签用于混淆矩阵
+                from collections import Counter
+                video_predictions = []
+                video_labels = []
+                video_groups = {}
+                
+                for i, epoch_id in enumerate(chunk_epoch_ids):
+                    video_index = extract_video_index(epoch_id)
+                    subject_id = extract_subject_id(epoch_id)
+                    
+                    if video_index is not None:
+                        video_key = (subject_id, video_index)
+                        if video_key not in video_groups:
+                            video_groups[video_key] = {'preds': [], 'label': None}
+                        video_groups[video_key]['preds'].append(int(chunk_predictions_array[i]))
+                        video_groups[video_key]['label'] = int(chunk_labels[i])
+                
+                # 进行投票得到视频级别的预测
+                for video_key, video_data in video_groups.items():
+                    preds = video_data['preds']
+                    true_label = video_data['label']
+                    
+                    if len(preds) == 0:
+                        continue
+                    
+                    # 多数投票
+                    vote_counts = Counter(preds)
+                    max_votes = max(vote_counts.values())
+                    majority_classes = [cls for cls, count in vote_counts.items() if count == max_votes]
+                    
+                    if len(majority_classes) == 1:
+                        video_pred = majority_classes[0]
+                    else:
+                        # 平票情况：如果真实标签在候选中，选择它；否则选择第一个
+                        if true_label in majority_classes:
+                            video_pred = true_label
+                        else:
+                            video_pred = majority_classes[0]
+                    
+                    video_predictions.append(video_pred)
+                    video_labels.append(true_label)
+                
+                video_predictions = np.array(video_predictions)
+                video_labels = np.array(video_labels)
+                
+                # 计算混淆矩阵
+                from sklearn.metrics import confusion_matrix
+                import matplotlib.pyplot as plt
+                import seaborn as sns
+                
+                num_classes = 6  # emotion 6分类（移除neutral后）
+                cm = confusion_matrix(video_labels, video_predictions, labels=list(range(num_classes)))
+                
+                # 保存混淆矩阵为CSV
+                cm_df = pd.DataFrame(
+                    cm, 
+                    index=[f'True {i}' for i in range(num_classes)],
+                    columns=[f'Pred {i}' for i in range(num_classes)]
+                )
+                cm_df.to_csv(
+                    os.path.join(config["log_dir"], "test_voting_confusion_matrix.csv")
+                )
+                
+                # 保存混淆矩阵可视化
+                plt.figure(figsize=(10, 8))
+                sns.heatmap(
+                    cm, 
+                    annot=True, 
+                    fmt='d', 
+                    cmap='Blues',
+                    xticklabels=[f'Class {i}' for i in range(num_classes)],
+                    yticklabels=[f'Class {i}' for i in range(num_classes)]
+                )
+                plt.title('Confusion Matrix - Video Level Voting')
+                plt.ylabel('True Label')
+                plt.xlabel('Predicted Label')
+                plt.tight_layout()
+                plt.savefig(
+                    os.path.join(config["log_dir"], "test_voting_confusion_matrix.png"),
+                    dpi=300,
+                    bbox_inches='tight'
+                )
+                plt.close()
+            else:
+                # 如果无法整除，说明有其他问题
+                print(f"  ⚠️  警告: predictions数量 ({n_predictions}) 不是样本数量 ({n_samples}) 的整数倍")
+                print(f"  尝试使用前 {n_samples} 个predictions进行投票评估")
+                
+                # 只使用前n_samples个predictions，对应的epoch_ids和labels
+                voting_metrics = compute_voting_metrics(
+                    test_prediction.predictions[:n_samples],
+                    test_prediction.label_ids[:n_samples],
+                    sample_epoch_ids[:n_samples]
+                )
+            
+            # 保存投票评估结果
+            voting_metrics_df = pd.DataFrame([voting_metrics], index=[0])
+            voting_metrics_df.to_csv(
+                os.path.join(config["log_dir"], "test_voting_metrics.csv"), 
+                index=False
+            )
+            
+            # 保存epoch_ids供后续分析（保存chunk级别的epoch_ids）
+            if 'chunk_epoch_ids' in locals():
+                np.save(
+                    os.path.join(config["log_dir"], "test_epoch_ids.npy"),
+                    np.array(chunk_epoch_ids, dtype=object),
+                )
+            else:
+                np.save(
+                    os.path.join(config["log_dir"], "test_epoch_ids.npy"),
+                    np.array(sample_epoch_ids, dtype=object),
+                )
+            
+            print(f"✓ 投票评估结果已保存到: test_voting_metrics.csv")
+            if 'chunk_epoch_ids' in locals():
+                print(f"✓ 混淆矩阵已保存到: test_voting_confusion_matrix.csv 和 test_voting_confusion_matrix.png")
+            print(f"  视频级别准确率: {voting_metrics['video_accuracy']:.4f}")
+            print(f"  视频级别BACC: {voting_metrics['video_bacc']:.4f}")
+            print(f"  评估的视频数量: {voting_metrics['num_videos']}")
+            if 'avg_subject_accuracy' in voting_metrics:
+                print(f"  平均Subject准确率: {voting_metrics['avg_subject_accuracy']:.4f}")
 
     return trainer
 
