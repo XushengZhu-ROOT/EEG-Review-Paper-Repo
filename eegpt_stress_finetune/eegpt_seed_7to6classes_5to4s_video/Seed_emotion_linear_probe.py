@@ -156,7 +156,7 @@ def majority_vote_with_tie_handling(predictions: np.ndarray, true_label: int) ->
     return predicted_label, score
 
 # ===== Hyperparam sweep (paired by index; zip() will stop at the shortest list) =====
-BS_LIST = [16]
+BS_LIST = [64]
 LR_LIST = [4e-4]
 WD_LIST = [1e-2]
 
