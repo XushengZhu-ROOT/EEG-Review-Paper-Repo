@@ -49,7 +49,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     else:
         optimizer.zero_grad()
 
-    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, batch_data in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        # 处理可能包含epoch_id的情况（Seed数据集）
+        if len(batch_data) == 3:
+            samples, targets, _ = batch_data  # 忽略epoch_id（训练时不需要）
+        else:
+            samples, targets = batch_data
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
@@ -64,13 +69,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         samples = samples.float().to(device, non_blocking=True) / 100
         # Reshape data for model input
-        # If data is [B, N, T] with T=1000, reshape to [B, N, 5, 200] (5 patches of 200 time points each)
+        # If data is [B, N, T] with T=800, reshape to [B, N, 4, 200] (4 patches of 200 time points each)
         # Otherwise, reshape to [B, N, 1, T] for Motor dataset format
         if len(samples.shape) == 3:  # [B, N, T]
             B, N, T = samples.shape
-            if T == 1000:  # Seed dataset: 5 seconds @ 200Hz = 1000 time points
-                # Reshape to [B, N, 5, 200] - 5 patches of 200 time points each
-                samples = samples.view(B, N, 5, 200)
+            if T == 800:  # Seed dataset: 4 seconds @ 200Hz = 800 time points
+                # Reshape to [B, N, 4, 200] - 4 patches of 200 time points each
+                samples = samples.view(B, N, 4, 200)
             else:
                 # Motor dataset format: [B, N, 1, T]
                 samples = samples.unsqueeze(2)
@@ -201,18 +206,25 @@ def evaluate(data_loader, model, device, header='Test:', ch_names=None, metrics=
     model.eval()
     pred = []
     true = []
+    epoch_ids = []  # 收集epoch_id用于视频级投票
     for step, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
         EEG = batch[0]
-        target = batch[-1]
+        # 检查是否有epoch_id（Seed数据集返回3个值：X, Y, epoch_id）
+        if len(batch) == 3:
+            target = batch[1]  # batch[0]=EEG, batch[1]=targets, batch[2]=epoch_ids
+            epoch_id_batch = batch[2]
+            epoch_ids.extend(epoch_id_batch)
+        else:
+            target = batch[-1]
         EEG = EEG.float().to(device, non_blocking=True) / 100
         # Reshape data for model input
-        # If data is [B, N, T] with T=1000, reshape to [B, N, 5, 200] (5 patches of 200 time points each)
+        # If data is [B, N, T] with T=800, reshape to [B, N, 4, 200] (4 patches of 200 time points each)
         # Otherwise, reshape to [B, N, 1, T] for Motor dataset format
         if len(EEG.shape) == 3:  # [B, N, T]
             B, N, T = EEG.shape
-            if T == 1000:  # Seed dataset: 5 seconds @ 200Hz = 1000 time points
-                # Reshape to [B, N, 5, 200] - 5 patches of 200 time points each
-                EEG = EEG.view(B, N, 5, 200)
+            if T == 800:  # Seed dataset: 4 seconds @ 200Hz = 800 time points
+                # Reshape to [B, N, 4, 200] - 4 patches of 200 time points each
+                EEG = EEG.view(B, N, 4, 200)
             else:
                 # Motor dataset format: [B, N, 1, T]
                 EEG = EEG.unsqueeze(2)
@@ -265,23 +277,30 @@ def evaluate(data_loader, model, device, header='Test:', ch_names=None, metrics=
     ret = utils.get_metrics(pred, true, metrics, is_binary, 0.5)
     ret['loss'] = metric_logger.loss.global_avg
     
+    # 获取预测类别和真实类别（用于混淆矩阵和视频级投票）
+    if len(pred.shape) > 1:
+        pred_classes = np.argmax(pred, axis=1)
+    else:
+        pred_classes = (pred > 0.5).astype(int)
+    
+    # 确保true是整数类别
+    if len(true.shape) > 1:
+        true_classes = np.argmax(true, axis=1) if true.shape[1] > 1 else true.flatten().astype(int)
+    else:
+        true_classes = true.astype(int)
+        
     # 计算混淆矩阵（仅对多分类任务）
     if not is_binary:
         from sklearn.metrics import confusion_matrix
-        # 对于多分类，需要获取预测类别
-        if len(pred.shape) > 1:
-            pred_classes = np.argmax(pred, axis=1)
-        else:
-            pred_classes = (pred > 0.5).astype(int)
-        
-        # 确保true是整数类别
-        if len(true.shape) > 1:
-            true_classes = np.argmax(true, axis=1) if true.shape[1] > 1 else true.flatten().astype(int)
-        else:
-            true_classes = true.astype(int)
-        
         cm = confusion_matrix(true_classes, pred_classes)
         # 将混淆矩阵转换为列表以便JSON序列化
         ret['confusion_matrix'] = cm.tolist()
+    
+    # 如果收集到了epoch_id，进行视频级投票评估（仅对Seed数据集）
+    if len(epoch_ids) > 0 and len(epoch_ids) == len(pred_classes):
+        video_level_metrics = utils.compute_video_level_metrics(
+            pred_classes, true_classes, epoch_ids, is_binary
+        )
+        ret.update(video_level_metrics)
     
     return ret

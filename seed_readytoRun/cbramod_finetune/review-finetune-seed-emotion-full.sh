@@ -4,7 +4,7 @@ dataset_path=./seed_data
 exp_name=exp_author_config
 gpu_id=0
 chan_size=62
-window_size=5
+window_size=4
 epochs=50
 lr=0.0001
 wd=0.00002
@@ -26,7 +26,7 @@ python finetune_main.py \
     --downstream_dataset ${dataset} \
     --datasets_dir ${dataset_path} \
     --optimizer  AdamW \
-    --num_of_classes 7 \
+    --num_of_classes 6 \
     --channel_size ${chan_size} \
     --window_size ${window_size} \
     ${FREEZE_ARG} \

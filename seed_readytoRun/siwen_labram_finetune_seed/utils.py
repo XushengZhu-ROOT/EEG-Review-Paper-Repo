@@ -908,11 +908,28 @@ class SeedLoader(torch.utils.data.Dataset):
         # 确保标签在0-6范围内
         if Y < 0 or Y > 6:
             raise ValueError(f"Invalid label {Y} in {sample_path}, expected 0-6")
+        
+        # 跳过neutral类别（label=2），并重新映射标签
+        # 原始映射: 0=happy, 1=sad, 2=neutral, 3=disgust, 4=fear, 5=surprise, 6=anger
+        # 新映射: 0=happy, 1=sad, 2=disgust, 3=fear, 4=surprise, 5=anger (跳过neutral)
+        if Y == 2:  # neutral类别，跳过
+            return None
+        
+        # 重新映射标签：0->0, 1->1, 3->2, 4->3, 5->4, 6->5
+        label_mapping = {0: 0, 1: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+        Y = label_mapping[Y]
 
         if self.sampling_rate != self.default_rate:
             X = resample(X, 10 * self.sampling_rate, axis=-1)
 
-        return torch.FloatTensor(X), Y
+        # 获取epoch_id（用于视频级投票评估）
+        epoch_id = sample.get('epoch_id', None)
+        if epoch_id is None:
+            # 如果pickle中没有epoch_id，从文件名提取
+            filename = os.path.basename(self.files[index]).replace('.pickle', '')
+            epoch_id = filename
+
+        return torch.FloatTensor(X), Y, epoch_id
 
 # 全局变量用于统计被跳过的样本数量（避免重复打印太多警告）
 _skip_collate_stats = {'total_batches': 0, 'skipped_samples': 0, 'last_warning_step': -100}
@@ -1197,3 +1214,123 @@ def get_metrics(output, target, metrics, is_binary, threshold=0.5):
             target, output, metrics=metrics
         )
     return results
+
+
+def extract_video_index(epoch_id):
+    """从 epoch_id 中提取 video_index"""
+    import re
+    match = re.search(r'video_index_(\d+)_chunk', epoch_id)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def extract_subject_id(epoch_id):
+    """从 epoch_id 中提取 subject_id"""
+    import re
+    match = re.search(r'subject_(\d+)_', epoch_id)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def compute_video_level_metrics(pred_classes, true_classes, epoch_ids, is_binary):
+    """
+    计算视频级和subject级的评估指标
+    
+    参数:
+        pred_classes: 预测类别数组 (n_samples,)
+        true_classes: 真实类别数组 (n_samples,)
+        epoch_ids: epoch_id列表 (n_samples,)
+        is_binary: 是否为二分类任务
+    
+    返回:
+        包含视频级和subject级指标的字典
+    """
+    from collections import defaultdict, Counter
+    import numpy as np
+    
+    # 按video_index分组
+    video_groups = defaultdict(list)
+    for i, epoch_id in enumerate(epoch_ids):
+        video_index = extract_video_index(epoch_id)
+        if video_index is not None:
+            video_groups[video_index].append({
+                'pred': pred_classes[i],
+                'true': true_classes[i],
+                'epoch_id': epoch_id
+            })
+    
+    # 对每个视频进行投票
+    video_results = []
+    for video_index, chunks in sorted(video_groups.items()):
+        if len(chunks) == 0:
+            continue
+        
+        # 统计每个类别的投票数
+        preds = [ch['pred'] for ch in chunks]
+        true_label = chunks[0]['true']  # 同一视频的true label应该相同
+        
+        vote_counts = Counter(preds)
+        max_votes = max(vote_counts.values())
+        
+        # 找出得票最多的类别
+        winners = [label for label, count in vote_counts.items() if count == max_votes]
+        
+        if len(winners) == 1:
+            # 唯一胜者
+            pred_label = winners[0]
+            is_correct = 1.0 if pred_label == true_label else 0.0
+        else:
+            # 平票情况：如果真实标签在平票候选中，算0.5
+            if true_label in winners:
+                is_correct = 0.5
+            else:
+                is_correct = 0.0
+        
+        video_results.append({
+            'video_index': video_index,
+            'pred_label': winners[0] if len(winners) == 1 else winners,
+            'true_label': true_label,
+            'is_correct': is_correct,
+            'num_chunks': len(chunks)
+        })
+    
+    # 计算视频级准确率
+    if len(video_results) > 0:
+        video_accuracy = sum(v['is_correct'] for v in video_results) / len(video_results)
+    else:
+        video_accuracy = 0.0
+    
+    # 按subject分组计算准确率
+    subject_groups = defaultdict(list)
+    for result in video_results:
+        # 从对应的chunks中提取subject_id
+        chunks = video_groups[result['video_index']]
+        if chunks and len(chunks) > 0:
+            subject_id = extract_subject_id(chunks[0]['epoch_id'])
+            if subject_id is not None:
+                subject_groups[subject_id].append(result)
+    
+    # 计算每个subject的准确率
+    subject_accuracies = {}
+    for subject_id, videos in subject_groups.items():
+        if len(videos) > 0:
+            total_correct = sum(v['is_correct'] for v in videos)
+            subject_accuracies[f'subject_{subject_id}_accuracy'] = total_correct / len(videos)
+            subject_accuracies[f'subject_{subject_id}_num_videos'] = len(videos)
+    
+    # 计算平均subject准确率
+    if len(subject_accuracies) > 0:
+        subject_acc_values = [v for k, v in subject_accuracies.items() if k.endswith('_accuracy')]
+        mean_subject_accuracy = np.mean(subject_acc_values) if subject_acc_values else 0.0
+    else:
+        mean_subject_accuracy = 0.0
+    
+    return {
+        'video_level_accuracy': video_accuracy,
+        'video_level_num_videos': len(video_results),
+        'mean_subject_accuracy': mean_subject_accuracy,
+        'num_subjects': len(subject_groups),
+        **subject_accuracies
+    }

@@ -108,7 +108,12 @@ class Trainer(object):
             self.log_gpu_usage(epoch=epoch, phase='train_start', step=0)
             
             losses = []
-            for x, y in tqdm(self.data_loader['train'], mininterval=10):
+            for batch in tqdm(self.data_loader['train'], mininterval=10):
+                # 兼容处理：batch可能是(x, y)或(x, y, epoch_ids)
+                if len(batch) == 3:
+                    x, y, _ = batch  # 忽略epoch_ids，训练时不需要
+                else:
+                    x, y = batch
                 self.optimizer.zero_grad()
                 x = x.cuda()
                 y = y.cuda()
@@ -138,6 +143,16 @@ class Trainer(object):
                 
                 self.log_gpu_usage(epoch=epoch, phase='test_start')
                 test_acc, test_bacc, test_kappa, test_f1, test_cm = self.test_eval.get_metrics_for_multiclass(self.model)
+                
+                # 如果是SEED-Emotion数据集，额外进行投票评估
+                val_voting_results = None
+                test_voting_results = None
+                if self.params.downstream_dataset == 'SEED-Emotion':
+                    print("\n--- 投票评估 (Val) ---")
+                    val_voting_results = self.val_eval.get_metrics_with_voting(self.model)
+                    print("\n--- 投票评估 (Test) ---")
+                    test_voting_results = self.test_eval.get_metrics_with_voting(self.model)
+                
                 self.log_gpu_usage(epoch=epoch, phase='test_end')
 
                 epoch_time = time.time() - epoch_start_time
@@ -159,17 +174,35 @@ class Trainer(object):
                     'epoch_time_seconds': float(epoch_time),
                     'epoch_time_minutes': float(epoch_time / 60),
                 }
+                
+                # 如果是SEED-Emotion，添加投票评估结果
+                if val_voting_results is not None and test_voting_results is not None:
+                    epoch_log.update({
+                        'val_voting_video_acc': float(val_voting_results['video_acc']),
+                        'val_voting_subject_acc': float(val_voting_results['overall_subject_acc']),
+                        'test_voting_video_acc': float(test_voting_results['video_acc']),
+                        'test_voting_subject_acc': float(test_voting_results['overall_subject_acc']),
+                    })
+                
                 self.training_logs.append(epoch_log)
 
 
                 print(f"Epoch {epoch + 1}: Training Loss: {np.mean(losses):.5f}")
                 print(f"  Val  - acc: {val_acc:.5f}, bacc: {val_bacc:.5f}, kappa: {val_kappa:.5f}, f1: {val_f1:.5f}")
                 print(f"  Test - acc: {test_acc:.5f}, bacc: {test_bacc:.5f}, kappa: {test_kappa:.5f}, f1: {test_f1:.5f}")
+                if val_voting_results is not None and test_voting_results is not None:
+                    print(f"  Val Voting  - video_acc: {val_voting_results['video_acc']:.5f}, subject_acc: {val_voting_results['overall_subject_acc']:.5f}")
+                    print(f"  Test Voting - video_acc: {test_voting_results['video_acc']:.5f}, subject_acc: {test_voting_results['overall_subject_acc']:.5f}")
                 print(f"  LR: {current_lr:.5f}, Time: {epoch_time/60:.2f} mins")
-                print("Val CM:")
+                print("Val CM (chunk level):")
                 print(val_cm)
-                print("Test CM:")
+                print("Test CM (chunk level):")
                 print(test_cm)
+                if val_voting_results is not None and test_voting_results is not None:
+                    print("Val Voting CM (video level):")
+                    print(val_voting_results['video_cm'])
+                    print("Test Voting CM (video level):")
+                    print(test_voting_results['video_cm'])
             
                 # 更新最佳模型（根據驗證集的 bacc）
                 if val_bacc > best_metrics['val_bacc']:
@@ -187,6 +220,12 @@ class Trainer(object):
                         'test_cm': test_cm,
                         'epoch': epoch + 1
                     })
+                    # 如果是SEED-Emotion，保存投票评估结果
+                    if val_voting_results is not None and test_voting_results is not None:
+                        best_metrics.update({
+                            'val_voting_results': val_voting_results,
+                            'test_voting_results': test_voting_results,
+                        })
                     # 使用更高效的方法克隆模型状态（只克隆tensor，不深拷贝整个结构）
                     # 使用 clone() 比 copy.deepcopy() 快很多，因为只克隆tensor本身
                     self.best_model_states = {k: v.clone() for k, v in self.model.state_dict().items()}
@@ -199,6 +238,17 @@ class Trainer(object):
                 f"kappa: {best_metrics['val_kappa']:.5f}, f1: {best_metrics['val_f1']:.5f}")
         print(f"Best Test - acc: {best_metrics['test_acc']:.5f}, bacc: {best_metrics['test_bacc']:.5f}, \n", \
                 f"kappa: {best_metrics['test_kappa']:.5f}, f1: {best_metrics['test_f1']:.5f}")
+        if 'val_voting_results' in best_metrics and 'test_voting_results' in best_metrics:
+            val_voting = best_metrics['val_voting_results']
+            test_voting = best_metrics['test_voting_results']
+            print(f"\nBest Voting Results (at best epoch):")
+            print(f"  Val  - video_acc: {val_voting['video_acc']:.5f}, subject_acc: {val_voting['overall_subject_acc']:.5f}")
+            print(f"  Test - video_acc: {test_voting['video_acc']:.5f}, subject_acc: {test_voting['overall_subject_acc']:.5f}")
+            print(f"\nBest Voting Confusion Matrices:")
+            print("Val Voting CM (video level):")
+            print(val_voting['video_cm'])
+            print("Test Voting CM (video level):")
+            print(test_voting['video_cm'])
         print("="*70 + "\n")
 
         # 準備最終結果
@@ -215,6 +265,21 @@ class Trainer(object):
             'test_f1': float(best_metrics['test_f1']),
             'test_cm': (best_metrics['test_cm'].tolist()),
         }
+        
+        # 如果是SEED-Emotion，添加投票评估结果到最终结果
+        if 'val_voting_results' in best_metrics and 'test_voting_results' in best_metrics:
+            val_voting = best_metrics['val_voting_results']
+            test_voting = best_metrics['test_voting_results']
+            final_results.update({
+                'val_voting_video_acc': float(val_voting['video_acc']),
+                'val_voting_subject_acc': float(val_voting['overall_subject_acc']),
+                'val_voting_subject_accs': {k: float(v) for k, v in val_voting['subject_accs'].items()},
+                'val_voting_video_cm': val_voting['video_cm'].tolist(),
+                'test_voting_video_acc': float(test_voting['video_acc']),
+                'test_voting_subject_acc': float(test_voting['overall_subject_acc']),
+                'test_voting_subject_accs': {k: float(v) for k, v in test_voting['subject_accs'].items()},
+                'test_voting_video_cm': test_voting['video_cm'].tolist(),
+            })
         
         # 儲存模型（只保存一個最佳模型，基於val_bacc）
         if not os.path.isdir(self.params.model_dir):
@@ -268,7 +333,12 @@ class Trainer(object):
             self.log_gpu_usage(epoch=epoch, phase='train_start', step=0)
 
             losses = []
-            for x, y in tqdm(self.data_loader['train'], mininterval=10):
+            for batch in tqdm(self.data_loader['train'], mininterval=10):
+                # 兼容处理：batch可能是(x, y)或(x, y, epoch_ids)
+                if len(batch) == 3:
+                    x, y, _ = batch  # 忽略epoch_ids，训练时不需要
+                else:
+                    x, y = batch
                 self.optimizer.zero_grad()
                 x = x.cuda()
                 y = y.cuda()
@@ -399,7 +469,12 @@ class Trainer(object):
             self.log_gpu_usage(epoch=epoch, phase='train_start', step=0)
 
             losses = []
-            for x, y in tqdm(self.data_loader['train'], mininterval=10):
+            for batch in tqdm(self.data_loader['train'], mininterval=10):
+                # 兼容处理：batch可能是(x, y)或(x, y, epoch_ids)
+                if len(batch) == 3:
+                    x, y, _ = batch  # 忽略epoch_ids，训练时不需要
+                else:
+                    x, y = batch
                 self.optimizer.zero_grad()
                 x = x.cuda()
                 y = y.cuda()

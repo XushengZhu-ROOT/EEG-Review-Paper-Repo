@@ -3,7 +3,7 @@
 dataset=SEED-ST
 # dataset_path=寫在run_multiclass_supervised.py裡
 gpu_id=0
-sample_length=5
+sample_length=4
 epochs=50
 classifier_type=STTransformer
 dataset_channels=62
@@ -39,7 +39,7 @@ for bs in "${BS_LIST[@]}"; do
             CUDA_VISIBLE_DEVICES=${gpu_id} python run_multiclass_supervised.py \
             --exp_name ${exp_name} \
             --dataset ${dataset} \
-            --n_classes 7 \
+            --n_classes 6 \
             --in_channels ${dataset_channels} \
             --sampling_rate 250 \
             --sample_length ${sample_length} \

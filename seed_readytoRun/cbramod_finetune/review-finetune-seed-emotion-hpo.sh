@@ -8,7 +8,7 @@ dataset=SEED-Emotion
 dataset_path=./seed_data
 gpu_id=0
 chan_size=62
-window_size=5
+window_size=4
 epochs=50
 classifier=all_patch_reps 
 seed=62
@@ -36,7 +36,7 @@ for bs in "${BS_LIST[@]}"; do
             --downstream_dataset ${dataset} \
             --datasets_dir ${dataset_path} \
             --optimizer  AdamW \
-            --num_of_classes 7 \
+            --num_of_classes 6 \
             --channel_size ${chan_size} \
             --window_size ${window_size} \
             ${FREEZE_ARG} \
