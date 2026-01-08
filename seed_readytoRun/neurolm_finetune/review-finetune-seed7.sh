@@ -19,8 +19,8 @@ adamw_b2=0.95
 # bs=[(7, 28), (14, 42)]
 # lr=[ , 5e-4, ]
 # wd=[0.1, 0.001]
-# text_batch_size=14 # 20*5=100
-# instruction_batch_size=42 #90*5=450
+# text_batch_size=14 # 20*4=80
+# instruction_batch_size=42 #90*4=360
 # learning_rate=5e-4
 # weight_decay=0.1
 
