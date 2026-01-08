@@ -20,7 +20,7 @@ from model.model_neurolm import NeuroLM
 from model.model import GPTConfig
 from pathlib import Path
 import tiktoken
-from utils import prepare_KaggleERN_dataset, prepare_STRESS_dataset, prepare_TUAB_dataset, prepare_TUEV_dataset, prepare_TUSL_dataset, prepare_HMC_dataset, prepare_Workload_dataset, prepare_SEED7_dataset, prepare_motor_dataset, cosine_scheduler, get_metrics #, prepare_KaggleERN_dataset
+from utils import prepare_KaggleERN_dataset, prepare_STRESS_dataset, prepare_TUAB_dataset, prepare_TUEV_dataset, prepare_TUSL_dataset, prepare_HMC_dataset, prepare_Workload_dataset, prepare_SEED7_dataset, prepare_motor_dataset, prepare_sleep_dataset, cosine_scheduler, get_metrics #, prepare_KaggleERN_dataset
 from downstream_dataset import SEEDDataset
 from torch.utils.data.dataset import ConcatDataset
 
@@ -237,6 +237,18 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             # Answer "(X)" is at word index 25 (after splitting by space, "Answer:" is at 24, label is at 25)
             dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4, '(F)': 5}
             dataset_info['label_names'] = ['Label0', 'Walk', '8', 'Horizontal', 'Vertical', 'Pick']
+        elif downstream_dataset == 'SLEEP':
+            dataset_train, dataset_test, dataset_val = prepare_sleep_dataset(Path(args.dataset_dir), is_instruct=True, 
+                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+
+            dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
+            dataset_info['is_binary'] = False
+            dataset_info['num_classes'] = 5
+            dataset_info['result_idx'] = 27  # Answer: (A) or (B) etc. position in the generated text (0-indexed)
+            # Generated text format: "Question: ... Options: (A) ... (E) ... Answer: (X) <|endoftext|>)"
+            # Answer "(X)" is at word index 22 (after splitting by space, "Answer:" is at 21, label is at 22)
+            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4}
+            dataset_info['label_names'] = ['Stage 0', 'Stage 1', 'Stage 2', 'Stage 3', 'Stage 4']
 
         dataset_info['dataset_train'] = dataset_train
         dataset_info['dataset_val'] = dataset_val
@@ -349,10 +361,12 @@ def main(args):
         name = 'SEED7'
     elif 'motor' in dataset_dir_lower or 'motor_data' in dataset_dir_lower:
         name = 'MOTOR'
+    elif 'sleep' in dataset_dir_lower or 'sleep_data' in dataset_dir_lower:
+        name = 'SLEEP'
     else:
         raise ValueError(
             f"Unsupported dataset: {args.dataset_dir}\n"
-            f"Path must contain: ['stress', 'kaggleern', 'seed', 'motor']"
+            f"Path must contain: ['stress', 'kaggleern', 'seed', 'motor', 'sleep']"
         )
     all_datasets.append(get_instruct_datasets(args, name, eeg_max_len=248, text_max_len=80))
         
@@ -1080,6 +1094,45 @@ def evaluate(model, dataset_info, dataloader, decode):
                 #     
                 #     print(f"{'='*80}\n")
                 #     debug_sample_count += 1
+                
+                # 简单的调试输出：验证 SLEEP 数据集的 result_idx
+                # Commented out for production use - uncomment for debugging
+                # if dataset_info['name'] == 'SLEEP' and len(preds_raw) < 3 and master_process:
+                #     words = pred_string.split(' ')
+                #     result_idx = dataset_info.get('result_idx', None)
+                #     if result_idx is not None and len(words) > result_idx:
+                #         # 使用 debug 模式获取提取信息
+                #         _, debug_info = get_pred(pred_string, dataset_info, debug=True)
+                #         
+                #         print(f"\n{'='*60}")
+                #         print(f"SLEEP Debug Sample #{len(preds_raw) + 1} - Result Index Verification")
+                #         print(f"{'='*60}")
+                #         print(f"Generated text: {pred_string[:150]}...")  # 只显示前150个字符
+                #         print(f"\nToken positions around result_idx={result_idx}:")
+                #         start_idx = max(0, result_idx - 3)
+                #         end_idx = min(len(words), result_idx + 4)
+                #         for idx in range(start_idx, end_idx):
+                #             marker = " ← result_idx" if idx == result_idx else ""
+                #             print(f"  [{idx:2d}] '{words[idx]}'{marker}")
+                #         
+                #         # 显示提取到的 label 信息
+                #         print(f"\n--- Label Extraction Info ---")
+                #         print(f"Extraction method: {debug_info.get('method', 'unknown')}")
+                #         if debug_info.get('original_word'):
+                #             print(f"Original word at result_idx: '{debug_info['original_word']}'")
+                #         if debug_info.get('found_label'):
+                #             print(f"Extracted label: '{debug_info['found_label']}'")
+                #             # 检查是否有鲁棒性问题（原始单词与提取的标签不同）
+                #             if debug_info.get('original_word') and debug_info['original_word'] != debug_info['found_label']:
+                #                 print(f"⚠️  ROBUSTNESS ISSUE DETECTED!")
+                #                 print(f"   Original word: '{debug_info['original_word']}'")
+                #                 print(f"   Extracted label: '{debug_info['found_label']}'")
+                #                 print(f"   (Model generated something like '(A))' instead of '(A)', but extraction worked)")
+                #             elif debug_info.get('original_word') and debug_info['original_word'] == debug_info['found_label']:
+                #                 print(f"✓ Clean extraction (no robustness issue)")
+                #         else:
+                #             print(f"⚠️  WARNING: No valid label extracted!")
+                #         print(f"{'='*60}\n")
                 
                 # 获取预测结果
                 pred = get_pred(pred_string, dataset_info, debug=False)

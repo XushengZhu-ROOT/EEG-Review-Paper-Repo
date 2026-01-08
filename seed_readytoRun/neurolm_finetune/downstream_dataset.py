@@ -637,105 +637,7 @@ class TUEVLoader(Dataset):
         Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
         return X_eeg, text, Y_text, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
 
-
-class MotorLoader(Dataset):
-    """Motor imagery 6-class classification loader (Label0, Walk, 8, Horizontal, Vertical, Pick)"""
-    def __init__(self, root, files, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False):
-        self.root = root
-        self.files = files
-        self.default_rate = 200
-        self.sampling_rate = sampling_rate
-        self.is_instruct = is_instruct
-        self.is_val = is_val
-        self.eeg_max_len = eeg_max_len
-        self.text_max_len = text_max_len
-
-        # 20 channels for Motor dataset
-        self.ch_names = ['F7','FP1','FP2','F8','F3','FZ','F4','C3','CZ','P8','P7','PZ','P4','T3','P3','O1','O2','C4','T4','A2']
-
-        if is_instruct:
-            enc = tiktoken.get_encoding("gpt2")
-            encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-            # 50257 for [SEP]
-            # 6 motor classes: Label0(0), Walk(1), 8(2), Horizontal(3), Vertical(4), Pick(5)
-            self.text = {
-                0: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (A) <|endoftext|>')),
-                1: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (B) <|endoftext|>')),
-                2: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (C) <|endoftext|>')),
-                3: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (D) <|endoftext|>')),
-                4: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (E) <|endoftext|>')),
-                5: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (F) <|endoftext|>'))
-            }
-            self.prompt = torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: ('))
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, index):
-        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
-        X = sample["signal"]
-        Y = sample["label"]
-
-        data = torch.FloatTensor(X / 100)
-        time = data.size(1) // 200
-        input_time = [i  for i in range(time) for _ in range(data.size(0))]
-        data = rearrange(data, 'N (A T) -> (A N) T', T=200)
-
-        ch_names = self.ch_names
-        input_chans = list(ch_names) * time
-
-        if not self.is_instruct:
-            input_chans = torch.IntTensor(get_chans(input_chans))
-            input_time = torch.IntTensor(input_time)
-
-            gpt_mask = torch.tril(torch.ones(data.size(0), data.size(0))).view(1, data.size(0), data.size(0))
-            num_chans = len(ch_names)
-            for i in range(time):
-                gpt_mask[:, i * num_chans:(i + 1) * num_chans,  i * num_chans:(i + 1) * num_chans] = 1
-            return data, Y, input_chans, input_time, gpt_mask.bool()
-        
-        if self.is_val:
-            text = self.prompt
-        else:
-            text = self.text[int(Y)]
-            # pad text to text_max_len
-            valid_text_len = text.size(0)
-            if self.text_max_len > valid_text_len:
-                text_pad = torch.full((self.text_max_len,), fill_value=50256)
-                text_pad[:valid_text_len] = text
-                text = text_pad
-
-        # pad eeg to eeg_max_len
-        valid_eeg_len = data.size(0)
-        if self.eeg_max_len > data.size(0):
-            X_eeg = torch.zeros((self.eeg_max_len, 200))
-            X_eeg[:data.size(0)] = data
-            eeg_mask = torch.ones(self.eeg_max_len)
-            eeg_mask[valid_eeg_len:] = 0
-
-            input_chans.extend(['pad'] * (self.eeg_max_len - data.size(0)))
-            input_time.extend([0] * (self.eeg_max_len - data.size(0)))
-        else:
-            X_eeg = data
-            eeg_mask = torch.ones(data.size(0))
-
-        input_chans = torch.IntTensor(get_chans(input_chans))
-        input_time = torch.IntTensor(input_time)
-
-        num_tokens = X_eeg.size(0) + text.size(0)
-        gpt_mask = torch.tril(torch.ones(num_tokens, num_tokens)).view(1, num_tokens, num_tokens)
-        num_chans = len(ch_names)
-        for i in range(time):
-            gpt_mask[:, i * num_chans:(i + 1) * num_chans,  i * num_chans:(i + 1) * num_chans] = 1
-        gpt_mask[:, :, valid_eeg_len:X_eeg.size(0)] = 0
-        
-        if self.is_val:
-            return X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
-        
-        Y_text = torch.full_like(text, fill_value=-1)
-        prompt_len = self.prompt.size(0) - 1
-        Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
-        return X_eeg, text, Y_text, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
+ 
     
 
 class TUSLLoader(Dataset):
@@ -927,105 +829,7 @@ class HMCLoader(Dataset):
         Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
         return X_eeg, text, Y_text, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
 
-
-class MotorLoader(Dataset):
-    """Motor imagery 6-class classification loader (Label0, Walk, 8, Horizontal, Vertical, Pick)"""
-    def __init__(self, root, files, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False):
-        self.root = root
-        self.files = files
-        self.default_rate = 200
-        self.sampling_rate = sampling_rate
-        self.is_instruct = is_instruct
-        self.is_val = is_val
-        self.eeg_max_len = eeg_max_len
-        self.text_max_len = text_max_len
-
-        # 20 channels for Motor dataset
-        self.ch_names = ['F7','FP1','FP2','F8','F3','FZ','F4','C3','CZ','P8','P7','PZ','P4','T3','P3','O1','O2','C4','T4','A2']
-
-        if is_instruct:
-            enc = tiktoken.get_encoding("gpt2")
-            encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-            # 50257 for [SEP]
-            # 6 motor classes: Label0(0), Walk(1), 8(2), Horizontal(3), Vertical(4), Pick(5)
-            self.text = {
-                0: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (A) <|endoftext|>')),
-                1: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (B) <|endoftext|>')),
-                2: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (C) <|endoftext|>')),
-                3: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (D) <|endoftext|>')),
-                4: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (E) <|endoftext|>')),
-                5: torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: (F) <|endoftext|>'))
-            }
-            self.prompt = torch.IntTensor([50257] + encode('Question: Which motor imagery type does this EEG segment belong to? Options: (A) Label0. (B) Walk. (C) 8. (D) Horizontal. (E) Vertical. (F) Pick. Answer: ('))
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, index):
-        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
-        X = sample["signal"]
-        Y = sample["label"]
-
-        data = torch.FloatTensor(X / 100)
-        time = data.size(1) // 200
-        input_time = [i  for i in range(time) for _ in range(data.size(0))]
-        data = rearrange(data, 'N (A T) -> (A N) T', T=200)
-
-        ch_names = self.ch_names
-        input_chans = list(ch_names) * time
-
-        if not self.is_instruct:
-            input_chans = torch.IntTensor(get_chans(input_chans))
-            input_time = torch.IntTensor(input_time)
-
-            gpt_mask = torch.tril(torch.ones(data.size(0), data.size(0))).view(1, data.size(0), data.size(0))
-            num_chans = len(ch_names)
-            for i in range(time):
-                gpt_mask[:, i * num_chans:(i + 1) * num_chans,  i * num_chans:(i + 1) * num_chans] = 1
-            return data, Y, input_chans, input_time, gpt_mask.bool()
-        
-        if self.is_val:
-            text = self.prompt
-        else:
-            text = self.text[int(Y)]
-            # pad text to text_max_len
-            valid_text_len = text.size(0)
-            if self.text_max_len > valid_text_len:
-                text_pad = torch.full((self.text_max_len,), fill_value=50256)
-                text_pad[:valid_text_len] = text
-                text = text_pad
-
-        # pad eeg to eeg_max_len
-        valid_eeg_len = data.size(0)
-        if self.eeg_max_len > data.size(0):
-            X_eeg = torch.zeros((self.eeg_max_len, 200))
-            X_eeg[:data.size(0)] = data
-            eeg_mask = torch.ones(self.eeg_max_len)
-            eeg_mask[valid_eeg_len:] = 0
-
-            input_chans.extend(['pad'] * (self.eeg_max_len - data.size(0)))
-            input_time.extend([0] * (self.eeg_max_len - data.size(0)))
-        else:
-            X_eeg = data
-            eeg_mask = torch.ones(data.size(0))
-
-        input_chans = torch.IntTensor(get_chans(input_chans))
-        input_time = torch.IntTensor(input_time)
-
-        num_tokens = X_eeg.size(0) + text.size(0)
-        gpt_mask = torch.tril(torch.ones(num_tokens, num_tokens)).view(1, num_tokens, num_tokens)
-        num_chans = len(ch_names)
-        for i in range(time):
-            gpt_mask[:, i * num_chans:(i + 1) * num_chans,  i * num_chans:(i + 1) * num_chans] = 1
-        gpt_mask[:, :, valid_eeg_len:X_eeg.size(0)] = 0
-        
-        if self.is_val:
-            return X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
-        
-        Y_text = torch.full_like(text, fill_value=-1)
-        prompt_len = self.prompt.size(0) - 1
-        Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
-        return X_eeg, text, Y_text, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
+ 
 
 
 class WorkloadLoader(Dataset):
@@ -1241,6 +1045,7 @@ class SEED7Loader(Dataset):
         Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
         return X_eeg, text, Y_text, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
 
+ 
 
 class MotorLoader(Dataset):
     """Motor imagery 6-class classification loader (Label0, Walk, 8, Horizontal, Vertical, Pick)"""
@@ -1340,3 +1145,103 @@ class MotorLoader(Dataset):
         prompt_len = self.prompt.size(0) - 1
         Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
         return X_eeg, text, Y_text, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
+        
+
+class SleepLoader(Dataset):
+    """Sleep stage 5-class classification loader (0, 1, 2, 3, 4)"""
+    def __init__(self, root, files, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False):
+        self.root = root
+        self.files = files
+        self.default_rate = 200
+        self.sampling_rate = sampling_rate
+        self.is_instruct = is_instruct
+        self.is_val = is_val
+        self.eeg_max_len = eeg_max_len
+        self.text_max_len = text_max_len
+
+        # 6 channels for Sleep dataset: ['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
+        self.ch_names = ['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
+
+        if is_instruct:
+            enc = tiktoken.get_encoding("gpt2")
+            encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+            # 50257 for [SEP]
+            # 5 sleep stage classes: 0, 1, 2, 3, 4
+            self.text = {
+                0: torch.IntTensor([50257] + encode('Question: Which sleep stage does this EEG segment belong to? Options: (A) Stage 0. (B) Stage 1. (C) Stage 2. (D) Stage 3. (E) Stage 4. Answer: (A) <|endoftext|>')),
+                1: torch.IntTensor([50257] + encode('Question: Which sleep stage does this EEG segment belong to? Options: (A) Stage 0. (B) Stage 1. (C) Stage 2. (D) Stage 3. (E) Stage 4. Answer: (B) <|endoftext|>')),
+                2: torch.IntTensor([50257] + encode('Question: Which sleep stage does this EEG segment belong to? Options: (A) Stage 0. (B) Stage 1. (C) Stage 2. (D) Stage 3. (E) Stage 4. Answer: (C) <|endoftext|>')),
+                3: torch.IntTensor([50257] + encode('Question: Which sleep stage does this EEG segment belong to? Options: (A) Stage 0. (B) Stage 1. (C) Stage 2. (D) Stage 3. (E) Stage 4. Answer: (D) <|endoftext|>')),
+                4: torch.IntTensor([50257] + encode('Question: Which sleep stage does this EEG segment belong to? Options: (A) Stage 0. (B) Stage 1. (C) Stage 2. (D) Stage 3. (E) Stage 4. Answer: (E) <|endoftext|>'))
+            }
+            self.prompt = torch.IntTensor([50257] + encode('Question: Which sleep stage does this EEG segment belong to? Options: (A) Stage 0. (B) Stage 1. (C) Stage 2. (D) Stage 3. (E) Stage 4. Answer: ('))
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["signal"]
+        Y = int(sample["label"])
+
+        data = torch.FloatTensor(X / 100)
+        time = data.size(1) // 200
+        input_time = [i  for i in range(time) for _ in range(data.size(0))]
+        data = rearrange(data, 'N (A T) -> (A N) T', T=200)
+
+        ch_names = self.ch_names
+        input_chans = list(ch_names) * time
+
+        if not self.is_instruct:
+            input_chans = torch.IntTensor(get_chans(input_chans))
+            input_time = torch.IntTensor(input_time)
+
+            gpt_mask = torch.tril(torch.ones(data.size(0), data.size(0))).view(1, data.size(0), data.size(0))
+            num_chans = len(ch_names)
+            for i in range(time):
+                gpt_mask[:, i * num_chans:(i + 1) * num_chans,  i * num_chans:(i + 1) * num_chans] = 1
+            return data, Y, input_chans, input_time, gpt_mask.bool()
+        
+        if self.is_val:
+            text = self.prompt
+        else:
+            text = self.text[int(Y)]
+            # pad text to text_max_len
+            valid_text_len = text.size(0)
+            if self.text_max_len > valid_text_len:
+                text_pad = torch.full((self.text_max_len,), fill_value=50256)
+                text_pad[:valid_text_len] = text
+                text = text_pad
+
+        # pad eeg to eeg_max_len
+        valid_eeg_len = data.size(0)
+        if self.eeg_max_len > data.size(0):
+            X_eeg = torch.zeros((self.eeg_max_len, 200))
+            X_eeg[:data.size(0)] = data
+            eeg_mask = torch.ones(self.eeg_max_len)
+            eeg_mask[valid_eeg_len:] = 0
+
+            input_chans.extend(['pad'] * (self.eeg_max_len - data.size(0)))
+            input_time.extend([0] * (self.eeg_max_len - data.size(0)))
+        else:
+            X_eeg = data
+            eeg_mask = torch.ones(data.size(0))
+
+        input_chans = torch.IntTensor(get_chans(input_chans))
+        input_time = torch.IntTensor(input_time)
+
+        num_tokens = X_eeg.size(0) + text.size(0)
+        gpt_mask = torch.tril(torch.ones(num_tokens, num_tokens)).view(1, num_tokens, num_tokens)
+        num_chans = len(ch_names)
+        for i in range(time):
+            gpt_mask[:, i * num_chans:(i + 1) * num_chans,  i * num_chans:(i + 1) * num_chans] = 1
+        gpt_mask[:, :, valid_eeg_len:X_eeg.size(0)] = 0
+        
+        if self.is_val:
+            return X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
+        
+        Y_text = torch.full_like(text, fill_value=-1)
+        prompt_len = self.prompt.size(0) - 1
+        Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
+        return X_eeg, text, Y_text, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
+        
