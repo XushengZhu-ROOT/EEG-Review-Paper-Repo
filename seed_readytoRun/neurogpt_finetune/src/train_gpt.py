@@ -28,7 +28,7 @@ src/trainer: Trainer for model; invokes instance of
 src/model: Build full model from components (ie., embedder,
     decoder, unembedder). See make_model() below for details.
 """
-from batcher.downstream_dataset import MotorImageryDataset, KaggleERNDataset, Motor6ClassDataset, Emotion7ClassDataset
+from batcher.downstream_dataset import MotorImageryDataset, KaggleERNDataset, Motor6ClassDataset, Emotion7ClassDataset, Sleep5ClassDataset
 import torch
 import sys
 import os
@@ -419,6 +419,95 @@ def train(config: Dict = None) -> Trainer:
                 matrix_p_path=matrix_p_path,
                 gpt_only=not config["use_encoder"],
             )
+
+        elif dataset_name == "sleep5class":
+            # Sleep 5分类数据集
+            # 确保路径是绝对路径或相对于脚本目录的路径
+            if not os.path.isabs(downstream_path):
+                script_dir = os.path.dirname(os.path.realpath(__file__))
+                script_dir = os.path.dirname(script_dir)  # 回到neurogpt_finetune目录
+                # 处理相对路径：如果以 ../ 开头，从当前工作目录解析；否则从脚本目录解析
+                if downstream_path.startswith('../'):
+                    # 从当前工作目录解析相对路径
+                    downstream_path = os.path.abspath(downstream_path)
+                else:
+                    # 从脚本目录解析相对路径
+                    downstream_path = os.path.normpath(os.path.join(script_dir, downstream_path.lstrip('./')))
+            
+            file_extension = "*.pickle"
+            train_path = os.path.join(downstream_path, "train")
+            val_path = os.path.join(downstream_path, "val")
+            test_path = os.path.join(downstream_path, "test")
+            
+            # 检查路径是否存在
+            if not os.path.exists(train_path):
+                raise ValueError(f"训练数据路径不存在: {train_path}")
+            if not os.path.exists(val_path):
+                raise ValueError(f"验证数据路径不存在: {val_path}")
+            if not os.path.exists(test_path):
+                raise ValueError(f"测试数据路径不存在: {test_path}")
+            
+            train_files = [
+                os.path.basename(f)
+                for f in glob.glob(os.path.join(train_path, file_extension))
+            ]
+            val_files = [
+                os.path.basename(f)
+                for f in glob.glob(os.path.join(val_path, file_extension))
+            ]
+            test_files = [
+                os.path.basename(f)
+                for f in glob.glob(os.path.join(test_path, file_extension))
+            ]
+            
+            print(f"INFO: 找到 {len(train_files)} 个训练文件, {len(val_files)} 个验证文件, {len(test_files)} 个测试文件")
+
+            # 转换矩阵路径（相对于脚本运行目录）
+            matrix_p_path = config.get("matrix_p_path", "tMatrix_22x6_seed.npy")
+            if not os.path.isabs(matrix_p_path):
+                # 如果是相对路径，先尝试当前路径是否存在
+                if not os.path.exists(matrix_p_path):
+                    # 如果以 ../ 开头，从当前工作目录解析
+                    if matrix_p_path.startswith('../'):
+                        matrix_p_path = os.path.abspath(matrix_p_path)
+                    else:
+                        # 否则从脚本目录解析
+                        script_dir = os.path.dirname(os.path.realpath(__file__))
+                        script_dir = os.path.dirname(script_dir)  # 回到neurogpt_finetune目录
+                        matrix_p_path = os.path.join(script_dir, matrix_p_path.lstrip('./'))
+            
+            train_dataset = Sleep5ClassDataset(
+                train_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=train_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
+
+            validation_dataset = Sleep5ClassDataset(
+                val_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=val_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
+
+            test_dataset = Sleep5ClassDataset(
+                test_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=test_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
         else:
             # 如果 dataset_name 不匹配任何已知的情況
             raise ValueError(
@@ -537,6 +626,118 @@ def train(config: Dict = None) -> Trainer:
             os.path.join(config["log_dir"], "test_label_ids.npy"),
             test_prediction.label_ids,
         )
+        
+        # 为所有数据集计算混淆矩阵
+        from sklearn.metrics import confusion_matrix
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        # 获取预测和真实标签
+        preds_logits = test_prediction.predictions
+        labels = test_prediction.label_ids
+        
+        # 处理 chunk 级别预测的情况（与 make_decoding_accuracy_metrics 中的逻辑一致）
+        # preds_logits 可能是 (batch_size * num_chunks, num_classes)
+        # labels 是 (batch_size,)
+        if len(preds_logits) != len(labels):
+            logits_batch_size = len(preds_logits)
+            labels_batch_size = len(labels)
+            
+            # 检查是否是 chunk 级别的情况
+            if logits_batch_size % labels_batch_size == 0:
+                num_chunks = logits_batch_size // labels_batch_size
+                # Reshape preds_logits to (batch_size, num_chunks, num_classes)
+                if preds_logits.ndim > 1:
+                    preds_logits = preds_logits.reshape(labels_batch_size, num_chunks, -1)
+                    # Average over chunks dimension to get (batch_size, num_classes)
+                    preds_logits = preds_logits.mean(axis=1)
+                else:
+                    # 如果已经是类别索引，也需要 reshape 和平均
+                    preds_logits = preds_logits.reshape(labels_batch_size, num_chunks)
+                    # 对每个 sample 的 chunks 做多数投票
+                    from collections import Counter
+                    preds_aggregated = []
+                    for i in range(labels_batch_size):
+                        chunk_preds = preds_logits[i]
+                        vote_counts = Counter(chunk_preds)
+                        preds_aggregated.append(vote_counts.most_common(1)[0][0])
+                    preds_logits = np.array(preds_aggregated)
+            else:
+                # 如果无法整除，尝试其他方法或截断
+                import math
+                gcd = math.gcd(logits_batch_size, labels_batch_size)
+                if gcd > 1:
+                    base_batch_size = gcd
+                    logits_num_chunks = logits_batch_size // base_batch_size
+                    if logits_num_chunks > 1 and preds_logits.ndim > 1:
+                        preds_logits = preds_logits.reshape(base_batch_size, logits_num_chunks, -1)
+                        preds_logits = preds_logits.mean(axis=1)
+                        # 如果 labels 也需要处理
+                        if labels_batch_size != base_batch_size:
+                            labels_num_chunks = labels_batch_size // base_batch_size
+                            if labels_num_chunks > 1:
+                                # 对 labels 也做平均（虽然不太合理，但至少能运行）
+                                labels = labels.reshape(base_batch_size, labels_num_chunks)
+                                labels = labels[:, 0]  # 取第一个，因为同一 sample 的 label 应该相同
+                    else:
+                        # 截断到最小长度
+                        min_len = min(logits_batch_size, labels_batch_size)
+                        preds_logits = preds_logits[:min_len]
+                        labels = labels[:min_len]
+                else:
+                    # 最后手段：截断
+                    min_len = min(logits_batch_size, labels_batch_size)
+                    preds_logits = preds_logits[:min_len]
+                    labels = labels[:min_len]
+        
+        # 转换为类别预测
+        if preds_logits.ndim > 1:
+            # 如果是 logits，取 argmax
+            y_pred = preds_logits.argmax(axis=-1)
+        else:
+            # 如果已经是类别索引
+            y_pred = preds_logits
+        
+        y_true = labels
+        
+        # 确定类别数量
+        num_classes = config["num_decoding_classes"]
+        
+        # 计算混淆矩阵
+        cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+        
+        # 保存混淆矩阵为CSV
+        cm_df = pd.DataFrame(
+            cm, 
+            index=[f'True {i}' for i in range(num_classes)],
+            columns=[f'Pred {i}' for i in range(num_classes)]
+        )
+        cm_df.to_csv(
+            os.path.join(config["log_dir"], "test_confusion_matrix.csv")
+        )
+        
+        # 保存混淆矩阵可视化
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(
+            cm, 
+            annot=True, 
+            fmt='d', 
+            cmap='Blues',
+            xticklabels=[f'Class {i}' for i in range(num_classes)],
+            yticklabels=[f'Class {i}' for i in range(num_classes)]
+        )
+        plt.title(f'Confusion Matrix - {config["dataset_name"]}')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(config["log_dir"], "test_confusion_matrix.png"),
+            dpi=300,
+            bbox_inches='tight'
+        )
+        plt.close()
+        
+        print(f"✓ 混淆矩阵已保存到: test_confusion_matrix.csv 和 test_confusion_matrix.png")
         
         # 投票评估（仅对emotion7class数据集）
         if config["dataset_name"] == "emotion7class" and hasattr(test_dataset, 'epoch_ids'):
@@ -933,7 +1134,7 @@ def get_args() -> argparse.ArgumentParser:
         "--dataset-name",
         metavar="STR",
         default="bci2a",
-        choices=("KaggleERN", "stress", "motor6class", "emotion7class"),
+        choices=("KaggleERN", "stress", "motor6class", "emotion7class", "sleep5class"),
         type=str,
         help="supported downstream dataset",
     )

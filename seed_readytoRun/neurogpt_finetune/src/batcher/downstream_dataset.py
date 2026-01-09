@@ -628,3 +628,120 @@ class Emotion7ClassDataset(EEGDataset):
         result['epoch_id'] = epoch_id
         
         return result
+
+
+class Sleep5ClassDataset(EEGDataset):
+    """
+    Sleep 5分类数据集类
+    - 6通道输入（C3, C4, F3, F4, O1, O2），转换为22通道
+    - 5分类任务 (0, 1, 2, 3, 4)
+    - 30秒数据（7500个时间点@250Hz），分成30个chunks（每个250个时间点，1秒）
+    """
+    def __init__(
+        self,
+        filenames,
+        sample_keys,
+        chunk_len=250,  # 1秒数据，用于分成30个chunks
+        num_chunks=30,  # 30秒数据分成30个chunks
+        ovlp=0,  # 不重叠
+        root_path="",
+        matrix_p_path=None,
+        gpt_only=True,
+    ):
+        super().__init__(
+            filenames,
+            sample_keys,
+            chunk_len,
+            num_chunks,
+            ovlp,
+            root_path=root_path,
+            gpt_only=gpt_only,
+        )
+
+        # 加载通道转换矩阵 P (22, 6)
+        try:
+            self.P = np.load(matrix_p_path)
+            print(f"Loaded P matrix for channel mapping with shape: {self.P.shape}")
+            if self.P.shape[0] != 22:
+                raise ValueError(
+                    f"P matrix output channels must be 22, but got {self.P.shape[0]}."
+                )
+            if self.P.shape[1] != 6:
+                raise ValueError(
+                    f"P matrix input channels must be 6, but got {self.P.shape[1]}."
+                )
+        except FileNotFoundError:
+            print(
+                f"ERROR: P matrix not found at {matrix_p_path}. Cannot perform channel mapping."
+            )
+            raise
+
+        # 对于 sleep 数据集，数据量较大，不在初始化时一次性加载到内存
+        # 只保存文件名列表，按需在 __getitem__ 中按索引读取单个样本，避免 OOM
+        self.num_trials_per_file = len(self.filenames)
+        print(f"✓ Sleep5ClassDataset 初始化完成，共 {self.num_trials_per_file} 个样本（按文件计）")
+
+    def __len__(self):
+        return self.num_trials_per_file
+
+    def map2pret(self, data: np.ndarray) -> np.ndarray:
+        """
+        将6通道数据映射到22通道
+        data shape: (6, N_samples) → (22, N_samples)
+        """
+        if self.P is None:
+            raise RuntimeError("P matrix is not loaded. Cannot map channels.")
+
+        if self.P.shape[1] != data.shape[0]:
+            raise ValueError(
+                f"Channel mismatch! P matrix expects {self.P.shape[1]} input channels, "
+                f"but the loaded data has {data.shape[0]} channels."
+            )
+
+        return np.matmul(self.P, data)  # Output shape: (22, N_samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        获取单个样本
+        """
+        filename = self.filenames[idx]
+        file_path = os.path.join(self.root_path, filename)
+
+        try:
+            with open(file_path, "rb") as f:
+                sample = pickle.load(f)
+        except Exception as e:
+            raise RuntimeError(f"加载样本失败: {file_path}, 错误信息: {e}")
+
+        # 提取数据
+        if "signal" not in sample:
+            raise KeyError(f"样本 {file_path} 中缺少 'signal' 键")
+
+        trial_data = sample["signal"]  # shape: (channels, time)
+
+        # 基本检查
+        if trial_data.shape[0] != 6:
+            raise ValueError(f"样本 {file_path} 的通道数不是 6，而是 {trial_data.shape[0]}")
+
+        if trial_data.shape[1] != 7500:
+            raise ValueError(f"样本 {file_path} 的时间长度不是 7500，而是 {trial_data.shape[1]}")
+
+        if "label" not in sample:
+            raise KeyError(f"样本 {file_path} 中缺少 'label' 键")
+
+        label = sample["label"]
+
+        if label not in [0, 1, 2, 3, 4]:
+            raise ValueError(f"样本 {file_path} 的标签 {label} 不在 [0,1,2,3,4] 范围内")
+
+        # 映射到22通道 (22, 7500)
+        mapped_data = self.map2pret(trial_data)
+
+        # 归一化（复用 EEGDataset.normalize）
+        trial_data_normalized = self.normalize(mapped_data[np.newaxis, ...])[0]
+
+        return self.preprocess_sample(
+            sample=trial_data_normalized,
+            seq_len=self.num_chunks,  # 30
+            labels=label,
+        )
