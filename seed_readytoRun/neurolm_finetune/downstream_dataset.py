@@ -1148,7 +1148,13 @@ class MotorLoader(Dataset):
         
 
 class SleepLoader(Dataset):
-    """Sleep stage 5-class classification loader (0, 1, 2, 3, 4)"""
+    """Sleep stage 5-class classification loader (0, 1, 2, 3, 4)
+    
+    Data specifications:
+    - 6 channels: ['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
+    - 5 classes: 0, 1, 2, 3, 4
+    - Data length: 30 seconds (6000 samples at 200Hz sampling rate)
+    """
     def __init__(self, root, files, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False):
         self.root = root
         self.files = files
