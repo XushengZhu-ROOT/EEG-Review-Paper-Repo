@@ -70,7 +70,7 @@ from model import (
     CBraMod_3lyStyle_LayerNorm_BIOT,
     CBraMod_3lyStyle_LayerNorm_Ada_BIOT,
 )
-from utils import TUEVLoader, HARLoader, MotionLoader, SEEDLoader, collate_fn_seed_with_epoch_id
+from utils import TUEVLoader, HARLoader, MotionLoader, SEEDLoader, SleepLoader, collate_fn_seed_with_epoch_id, collate_fn_sleep_with_epoch_id
 
 import json
 import yaml
@@ -1046,6 +1046,97 @@ def prepare_SEED_dataloader(args):
     print("Loader sizes:", len(train_loader), len(val_loader), len(test_loader))
     return train_loader, test_loader, val_loader
 
+def prepare_Sleep_dataloader(args):
+    """
+    准备Sleep数据集的数据加载器
+    
+    数据特性：
+    - 6个通道：['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
+    - 5个类别：0, 1, 2, 3, 4
+    - 30秒数据，采样率250Hz，所以是7500个时间点
+    - 数据已经按照train/val/test划分好了
+    """
+    # === 固定 random seed ===
+    seed = 12345
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    # === 数据集根目录 ===
+    root = "st_sleep_data"
+
+    # === 获取文件列表 ===
+    train_files = []
+    train_dir = os.path.join(root, "train")
+    if os.path.exists(train_dir):
+        train_files = [f for f in os.listdir(train_dir) if f.endswith('.pickle')]
+        train_files = [os.path.join("train", f) for f in train_files]
+    
+    val_files = []
+    val_dir = os.path.join(root, "val")
+    if os.path.exists(val_dir):
+        val_files = [f for f in os.listdir(val_dir) if f.endswith('.pickle')]
+        val_files = [os.path.join("val", f) for f in val_files]
+    
+    test_files = []
+    test_dir = os.path.join(root, "test")
+    if os.path.exists(test_dir):
+        test_files = [f for f in os.listdir(test_dir) if f.endswith('.pickle')]
+        test_files = [os.path.join("test", f) for f in test_files]
+    
+    print(f"Sleep dataset - Train: {len(train_files)}, Val: {len(val_files)}, Test: {len(test_files)}")
+    
+    # 打乱训练集
+    np.random.shuffle(train_files)
+
+    # === DataLoaders ===
+    # 训练时不需要epoch_id，测试和验证时需要epoch_id用于评估
+    train_loader = torch.utils.data.DataLoader(
+        SleepLoader(
+            root,
+            train_files,
+            sampling_rate=args.sampling_rate,
+            return_epoch_id=False  # 训练时不需要
+        ),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True if args.num_workers > 0 else False,
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+        SleepLoader(
+            root,
+            val_files,
+            sampling_rate=args.sampling_rate,
+            return_epoch_id=True  # 验证时需要epoch_id用于评估
+        ),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True if args.num_workers > 0 else False,
+        collate_fn=collate_fn_sleep_with_epoch_id,  # 使用自定义collate函数处理epoch_id
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        SleepLoader(
+            root,
+            test_files,
+            sampling_rate=args.sampling_rate,
+            return_epoch_id=True  # 测试时需要epoch_id用于评估
+        ),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True if args.num_workers > 0 else False,
+        collate_fn=collate_fn_sleep_with_epoch_id,  # 使用自定义collate函数处理epoch_id
+    )
+
+    print("Loader sizes:", len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+
 def supervised(args):
     # get data loaders
     if args.dataset == "TUEV":
@@ -1056,6 +1147,9 @@ def supervised(args):
 
     elif args.dataset in ["SEED", "SEED-ST"]:
         train_loader, test_loader, val_loader = prepare_SEED_dataloader(args)
+
+    elif args.dataset == "Sleep":
+        train_loader, test_loader, val_loader = prepare_Sleep_dataloader(args)
 
     else:
         raise NotImplementedError

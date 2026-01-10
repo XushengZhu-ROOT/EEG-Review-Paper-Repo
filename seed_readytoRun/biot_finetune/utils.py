@@ -168,6 +168,58 @@ class SEEDLoader(torch.utils.data.Dataset):
             return X, Y, epoch_id
         
         return X, Y
+
+class SleepLoader(torch.utils.data.Dataset):
+    """
+    Sleep数据集加载器
+    数据格式: pickle文件，包含 'signal' (6, 7500), 'label' (int 0-4), 'epoch_id' (str)
+    
+    数据特性：
+    - 6个通道：['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
+    - 5个类别：0, 1, 2, 3, 4
+    - 30秒数据，采样率250Hz，所以是7500个时间点
+    - 数据已经预处理过，只需要95%分位数归一化
+    """
+    def __init__(self, root, files, sampling_rate=250, return_epoch_id=False):
+        self.root = root
+        self.files = files
+        self.sampling_rate = sampling_rate  # 用于验证，数据已经是250Hz
+        self.return_epoch_id = return_epoch_id  # 是否返回epoch_id（用于评估）
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        # 处理文件路径：files可能包含子目录路径
+        file_path = self.files[index]
+        if os.path.isabs(file_path) or (self.root and file_path.startswith(self.root)):
+            full_path = file_path
+        else:
+            full_path = os.path.join(self.root, file_path) if self.root else file_path
+        
+        sample = pickle.load(open(full_path, "rb"))
+        X = sample["signal"]  # shape: (6, 7500) - 已经是250Hz处理后的数据
+        
+        # 数据已经预处理过，不需要重采样
+        # 只需要95%分位数归一化
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        
+        # 转换数据类型
+        X = torch.FloatTensor(X)
+        
+        # 标签已经是0-4，直接使用
+        Y = int(sample["label"])
+        Y = torch.tensor(Y, dtype=torch.long)
+        
+        # 如果需要返回epoch_id（用于评估），则返回三元组
+        if self.return_epoch_id:
+            epoch_id = sample.get("epoch_id", "")
+            return X, Y, epoch_id
+        
+        return X, Y
         
 class CHBMITLoader(torch.utils.data.Dataset):
     def __init__(self, root, files, sampling_rate=200):
@@ -367,6 +419,22 @@ def collate_fn_unsupervised_pretrain(batch):
 def collate_fn_seed_with_epoch_id(batch):
     """
     自定义collate函数，用于处理SEED数据集返回(X, Y, epoch_id)的情况
+    """
+    # batch是list of tuples: [(X1, Y1, epoch_id1), (X2, Y2, epoch_id2), ...]
+    X_list, Y_list, epoch_id_list = zip(*batch)
+    
+    # 堆叠X和Y
+    X_batch = torch.stack(X_list, dim=0)
+    Y_batch = torch.stack(Y_list, dim=0)
+    
+    # epoch_id保持为list
+    epoch_id_batch = list(epoch_id_list)
+    
+    return X_batch, Y_batch, epoch_id_batch
+
+def collate_fn_sleep_with_epoch_id(batch):
+    """
+    自定义collate函数，用于处理Sleep数据集返回(X, Y, epoch_id)的情况
     """
     # batch是list of tuples: [(X1, Y1, epoch_id1), (X2, Y2, epoch_id2), ...]
     X_list, Y_list, epoch_id_list = zip(*batch)
