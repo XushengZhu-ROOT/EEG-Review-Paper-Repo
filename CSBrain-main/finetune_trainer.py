@@ -14,6 +14,8 @@ import umap
 from sklearn.decomposition import PCA
 import copy
 import os
+import json
+import time
 
 
 class Trainer(object):
@@ -77,8 +79,12 @@ class Trainer(object):
         f1_best = 0
         kappa_best = 0
         acc_best = 0
+        bacc_best = 0
         cm_best = None
         self.best_val_voting_results = None
+        self.best_test_voting_results = None
+        self.training_logs = []
+        self.training_start_time = time.time()
         for epoch in range(self.params.epochs):
             self.model.train()
             start_time = timer()
@@ -109,7 +115,7 @@ class Trainer(object):
             optim_state = self.optimizer.state_dict()
 
             with torch.no_grad():
-                acc, kappa, f1, cm = self.val_eval.get_metrics_for_multiclass(self.model)
+                acc, bacc, kappa, f1, cm = self.val_eval.get_metrics_for_multiclass(self.model)
                 
                 # 如果是SEED-Emotion数据集，额外进行投票评估
                 val_voting_results = None
@@ -118,10 +124,11 @@ class Trainer(object):
                     val_voting_results = self.val_eval.get_metrics_with_voting(self.model)
                 
                 print(
-                    "Epoch {} : Training Loss: {:.5f}, acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}, LR: {:.5f}, Time elapsed {:.2f} mins | model: {}, seed: {}, lr: {}, weight_decay: {}, dropout: {}, foundation_dir: {}".format(
+                    "Epoch {} : Training Loss: {:.5f}, acc: {:.5f}, bacc: {:.5f}, kappa: {:.5f}, f1: {:.5f}, LR: {:.5f}, Time elapsed {:.2f} mins | model: {}, seed: {}, lr: {}, weight_decay: {}, dropout: {}, foundation_dir: {}".format(
                         epoch + 1,
                         np.mean(losses),
                         acc,
+                        bacc,
                         kappa,
                         f1,
                         optim_state['param_groups'][0]['lr'],
@@ -140,15 +147,39 @@ class Trainer(object):
                     print("Val Voting CM (video level):")
                     print(val_voting_results['video_cm'])
                 
-                if acc > acc_best: # zhouyc
-                    print("kappa increasing....saving weights !! ")
-                    print("Val Evaluation: acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(
+                # 保存 epoch 训练日志
+                epoch_log = {
+                    'epoch': epoch + 1,
+                    'train_loss': float(np.mean(losses)),
+                    'val_acc': float(acc),
+                    'val_bacc': float(bacc),
+                    'val_kappa': float(kappa),
+                    'val_f1': float(f1),
+                    'learning_rate': float(optim_state['param_groups'][0]['lr']),
+                    'epoch_time_seconds': float((timer() - start_time)),
+                    'epoch_time_minutes': float((timer() - start_time) / 60),
+                }
+                
+                # 如果是SEED-Emotion，添加投票评估结果
+                if val_voting_results is not None:
+                    epoch_log.update({
+                        'val_voting_video_acc': float(val_voting_results['video_acc']),
+                        'val_voting_subject_acc': float(val_voting_results['overall_subject_acc']),
+                    })
+                
+                self.training_logs.append(epoch_log)
+                
+                if bacc > bacc_best: # 使用 bacc 作为最佳模型选择标准
+                    print("BACC increasing....saving weights !! ")
+                    print("Val Evaluation: acc: {:.5f}, bacc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(
                         acc,
+                        bacc,
                         kappa,
                         f1,
                     ))
                     best_f1_epoch = epoch + 1
                     acc_best = acc
+                    bacc_best = bacc
                     kappa_best = kappa
                     f1_best = f1
                     cm_best = cm
@@ -158,23 +189,25 @@ class Trainer(object):
         self.model.load_state_dict(self.best_model_states)
         with torch.no_grad():
             print("***************************Test************************")
-            acc, kappa, f1, cm = self.test_eval.get_metrics_for_multiclass(self.model)
+            test_acc, test_bacc, test_kappa, test_f1, test_cm = self.test_eval.get_metrics_for_multiclass(self.model)
             
             # 如果是SEED-Emotion数据集，额外进行投票评估
             test_voting_results = None
             if self.params.downstream_dataset == 'SEED-Emotion':
                 print("\n--- 投票评估 (Test) ---")
                 test_voting_results = self.test_eval.get_metrics_with_voting(self.model)
+                self.best_test_voting_results = test_voting_results
             
             print("***************************Test results************************")
             print(
-                "Test Evaluation: acc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(
-                    acc,
-                    kappa,
-                    f1,
+                "Test Evaluation: acc: {:.5f}, bacc: {:.5f}, kappa: {:.5f}, f1: {:.5f}".format(
+                    test_acc,
+                    test_bacc,
+                    test_kappa,
+                    test_f1,
                 )
             )
-            print(cm)
+            print(test_cm)
             if test_voting_results is not None:
                 print(f"\nTest Voting  - video_acc: {test_voting_results['video_acc']:.5f}, subject_acc: {test_voting_results['overall_subject_acc']:.5f}")
                 print("Test Voting CM (video level):")
@@ -182,9 +215,90 @@ class Trainer(object):
             
             if not os.path.exists(self.params.model_dir):
                 os.makedirs(self.params.model_dir)
-            model_path = self.params.model_dir + "/epoch{}_acc_{:.5f}_kappa_{:.5f}_f1_{:.5f}.pth".format(best_f1_epoch, acc, kappa, f1)
+            
+            # 保存最终结果
+            final_results = {
+                'best_epoch': best_f1_epoch,
+                'val_acc': float(acc_best),
+                'val_bacc': float(bacc_best),
+                'val_kappa': float(kappa_best),
+                'val_f1': float(f1_best),
+                'val_cm': cm_best.tolist() if cm_best is not None else None,
+                'test_acc': float(test_acc),
+                'test_bacc': float(test_bacc),
+                'test_kappa': float(test_kappa),
+                'test_f1': float(test_f1),
+                'test_cm': test_cm.tolist(),
+            }
+            
+            # 如果是SEED-Emotion，添加投票评估结果
+            if self.best_val_voting_results is not None and self.best_test_voting_results is not None:
+                final_results.update({
+                    'val_voting_video_acc': float(self.best_val_voting_results['video_acc']),
+                    'val_voting_subject_acc': float(self.best_val_voting_results['overall_subject_acc']),
+                    'val_voting_subject_accs': {k: float(v) for k, v in self.best_val_voting_results['subject_accs'].items()},
+                    'val_voting_video_cm': self.best_val_voting_results['video_cm'].tolist(),
+                    'test_voting_video_acc': float(self.best_test_voting_results['video_acc']),
+                    'test_voting_subject_acc': float(self.best_test_voting_results['overall_subject_acc']),
+                    'test_voting_subject_accs': {k: float(v) for k, v in self.best_test_voting_results['subject_accs'].items()},
+                    'test_voting_video_cm': self.best_test_voting_results['video_cm'].tolist(),
+                })
+            
+            # 保存模型
+            model_path = self.params.model_dir + "/epoch{}_valBacc_{:.5f}_testBacc_{:.5f}.pth".format(best_f1_epoch, bacc_best, test_bacc)
             torch.save(self.model.state_dict(), model_path)
             print("model save in " + model_path)
+            
+            # 保存训练日志
+            self.save_training_logs(final_results)
+    
+    def save_training_logs(self, final_results=None):
+        """儲存訓練日誌"""
+        if not os.path.isdir(self.params.model_dir):
+            os.makedirs(self.params.model_dir)
+        
+        # 儲存每個epoch的訓練日誌
+        log_path = os.path.join(self.params.model_dir, 'training_logs.json')
+        with open(log_path, 'w', encoding='utf-8') as f:
+            json.dump(self.training_logs, f, indent=4)
+        print(f"Training logs saved to {log_path}")
+        
+        # 儲存最終結果摘要
+        if final_results is not None:
+            summary_path = os.path.join(self.params.model_dir, 'final_results.json')
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(final_results, f, indent=4)
+            print(f"Final results saved to {summary_path}")
+            
+            # 打印最終結果摘要
+            print("\n" + "="*70)
+            print("FINAL RESULTS SUMMARY")
+            print("="*70)
+            print(f"Best Epoch: {final_results['best_epoch']}")
+            print(f"\nValidation Set:")
+            print(f"  Accuracy:  {final_results['val_acc']:.5f}")
+            print(f"  BACC:      {final_results['val_bacc']:.5f}")
+            print(f"  Kappa:     {final_results['val_kappa']:.5f}")
+            print(f"  F1-Score:  {final_results['val_f1']:.5f}")
+            print(f"\nTest Set:")
+            print(f"  Accuracy:  {final_results['test_acc']:.5f}")
+            print(f"  BACC:      {final_results['test_bacc']:.5f}")
+            print(f"  Kappa:     {final_results['test_kappa']:.5f}")
+            print(f"  F1-Score:  {final_results['test_f1']:.5f}")
+            
+            # 如果是SEED-Emotion，打印投票结果
+            if 'val_voting_video_acc' in final_results:
+                print(f"\nVoting Results (Val):")
+                print(f"  Video Acc:    {final_results['val_voting_video_acc']:.5f}")
+                print(f"  Subject Acc:  {final_results['val_voting_subject_acc']:.5f}")
+                print(f"\nVoting Results (Test):")
+                print(f"  Video Acc:    {final_results['test_voting_video_acc']:.5f}")
+                print(f"  Subject Acc:  {final_results['test_voting_subject_acc']:.5f}")
+                if 'test_voting_subject_accs' in final_results:
+                    print(f"\n  Per-Subject Accuracies:")
+                    for subject_id, acc in sorted(final_results['test_voting_subject_accs'].items()):
+                        print(f"    Subject {subject_id}: {acc:.5f}")
+            print("="*70 + "\n")
 
 
     def train_for_binaryclass(self):
