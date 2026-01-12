@@ -1,5 +1,5 @@
 """
-对已有的pickle文件应用NeuroGPT预处理
+对已有的pickle文件应用预处理
 从numpy数组加载数据，应用预处理，然后保存回pickle文件
 """
 
