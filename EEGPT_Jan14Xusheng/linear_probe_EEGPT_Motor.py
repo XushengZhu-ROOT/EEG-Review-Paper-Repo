@@ -37,6 +37,9 @@ from Modules.models.EEGPT_mcae import EEGTransformer
 from Modules.Network.utils import Conv1dWithConstraint, LinearWithConstraint
 from sklearn import metrics
 from utils_eval import get_metrics
+from einops.layers.torch import Rearrange
+import glob
+import pickle
 
 
 
@@ -59,28 +62,13 @@ def temporal_interpolation(x, desired_sequence_length, mode='nearest', use_avg=T
 # Motor 任务：
 # - 六分类（0,1,2,3,4,5）
 # - 1 秒，采样率 256 Hz -> 时间长度 256
-# - 原始 20 通道，只使用其中 17 个通道：
-#   ch_names = ['F7','FP1','FP2','F8','F3','FZ','F4','C3','CZ','P8',
-#               'P7','PZ','P4','T3','P3','O1','O2','C4','T4','A2']
-#   did not use channels: ['T3', 'T4', 'A2']，index: [13, 18, 19]
+# - 原始 20 通道，只使用前 19 个通道（丢弃最后一个A2）
 
 use_channels_names = [
-    'F7', 'FP1', 'FP2', 'F8', 'F3',
-    'FZ', 'F4', 'C3', 'CZ', 'P8',
-    'P7', 'PZ', 'P4', 'P3', 'O1',
-    'O2', 'C4',
+    'F7','FP1','FP2','F8','F3','FZ','F4','C3','CZ','P8',
+    'P7','PZ','P4','T7','P3','O1','O2','C4','T8'  # 19个通道
 ]
-
-# 原始通道顺序（数据里存的 20 个通道）
-raw_ch_names = [
-    'F7','FP1','FP2','F8','F3',
-    'FZ','F4','C3','CZ','P8',
-    'P7','PZ','P4','T3','P3',
-    'O1','O2','C4','T4','A2',
-]
-
-# 计算需要保留的通道下标（按 use_channels_names 顺序）
-use_channel_indices = [raw_ch_names.index(ch) for ch in use_channels_names]
+# 注意：使用前19个通道，丢弃最后一个A2通道
 
 # ==================== 用户可配置参数 ====================
 # 建议你只改这一段就能完成大部分自定义
@@ -124,27 +112,49 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
     """
     从 motor_data/{split}/*.pickle 读取数据。
     每个 pickle 是一个 dict:
-        - 'signal': ndarray, shape (56, 768)
-        - 'label' : int, 0/1
+        - 'signal': ndarray, shape (20, 256)
+        - 'label' : int, 0~5
         - 'epoch_id': str
     """
-    def __init__(self, root_dir: str, split: str = "train"):
+    def __init__(self, root_dir: str, split: str = "train", expected_channels: int = 20, target_channels: int = 19):
         super().__init__()
         self.root_dir = root_dir
         self.split = split
         self.split_dir = os.path.join(root_dir, split)
         assert os.path.isdir(self.split_dir), f"{self.split_dir} 不存在"
+        
+        self.expected_channels = expected_channels
+        self.target_channels = target_channels
 
-        self.files = [
+        # 过滤：只保留expected_channels通道的文件
+        all_files = [
             os.path.join(self.split_dir, f)
             for f in os.listdir(self.split_dir)
             if f.endswith(".pickle")
         ]
+        
+        self.files = []
+        skipped = 0
+        for f in all_files:
+            try:
+                with open(f, "rb") as f_obj:
+                    obj = pickle.load(f_obj)
+                X = np.asarray(obj["signal"], dtype=np.float32)
+                if X.shape[0] == expected_channels:
+                    self.files.append(f)
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+                continue
+        
         self.files.sort()
-
+        
         if len(self.files) == 0:
-            raise RuntimeError(f"{self.split_dir} 下没有找到任何 .pickle 文件")
-
+            raise RuntimeError(f"{self.split_dir} 下没有找到任何 {expected_channels} 通道的 .pickle 文件")
+        
+        if skipped > 0:
+            print(f"[KaggleEEGDataset] split={split}, 跳过 {skipped} 个通道数不匹配的文件")
         print(f"[KaggleEEGDataset] split={split}, 样本数={len(self.files)}")
 
     def __len__(self):
@@ -152,16 +162,23 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         path = self.files[idx]
-        import pickle
         with open(path, "rb") as f:
             obj = pickle.load(f)
 
         x = obj["signal"]   # (20, 256) 原始 20 通道
         y = obj["label"]    # int 0~5
 
+        # 检查通道数
+        if x.shape[0] != self.expected_channels:
+            raise ValueError(f"Expected {self.expected_channels} channels, got {x.shape[0]}")
+        
+        # 丢弃最后一个通道(A2)，保留前19个通道
+        x = x[:self.target_channels, :]  # (19, 256)
+        
+        # 数据清理：NaN/Inf处理
+        x = np.nan_to_num(x, posinf=0.0, neginf=0.0)
+        
         x = torch.tensor(x, dtype=torch.float32)  # (C, T)
-        # 只保留 17 个可用通道，并按 use_channels_names 的顺序重排
-        x = x[use_channel_indices, :]            # (17, 256)
         y = torch.tensor(y, dtype=torch.long)
 
         return x, y
@@ -182,7 +199,7 @@ class LitEEGPTCausal(pl.LightningModule):
         super().__init__()
         # Debug 开关：需要时可以改成 False 关闭打印
         self.debug = True
-        self.chans_num = len(use_channels_names)
+        self.chans_num = len(use_channels_names)  # 19
         self.num_class = num_classes
         self.freeze_encoder = freeze_encoder
         self.encoder_lr_ratio = encoder_lr_ratio  # encoder 学习率相对于 head 的比例
@@ -191,8 +208,8 @@ class LitEEGPTCausal(pl.LightningModule):
 
         # init model
         target_encoder = EEGTransformer(
-            img_size=[self.chans_num, 1 * 256],  # 17 通道, 1s@256Hz = 256
-            patch_size=32*2,
+            img_size=[self.chans_num, 1 * 256],  # 19 通道, 1s@256Hz = 256
+            patch_size=32*2,  # 64
             embed_num=4,
             embed_dim=512,
             depth=8,
@@ -228,31 +245,55 @@ class LitEEGPTCausal(pl.LightningModule):
                 p.requires_grad = False
 
         # 输入为 17 通道（与你的数据一致，如不同需修改这里）
-        self.chan_conv       = Conv1dWithConstraint(17, self.chans_num, 1, max_norm=1)
+        self.chan_conv       = Conv1dWithConstraint(19, self.chans_num, 1, max_norm=1)
         
-        # 新的分类头结构（参考数据集信息和实验笔记，但做了参数量裁剪）
-        # z 的 shape: (B, N, embed_num, embed_dim)
-        # 这里只在 N 维（patch 维）上做平均池化，保留 embed_num 这一维：
-        #   (B, N, 4, 512) --mean over N--> (B, 4, 512)
-        # 然后展平成 (B, 4*512=2048)，再做 2048 -> 512 -> 512 -> num_classes
+        # 分类头结构（按之前的实现：直接展平，不先池化）
+        # z 的 shape: (B, N, embed_num, embed_dim) = (B, N, 4, 512)
+        # 计算patch数量N
+        # patch_size=64, patch_stride=None (默认等于patch_size), seq_len=256
+        # 如果patch_stride=None，N = seq_len // patch_size = 256 // 64 = 4
+        # 从target_encoder获取num_patches，它是一个tuple (C, N)
+        if hasattr(target_encoder, 'num_patches') and isinstance(target_encoder.num_patches, tuple):
+            # num_patches是(C, N)格式，C是通道维度的patch数，N是时间维度的patch数
+            self.N = target_encoder.num_patches[1]  # N是时间维度的patch数
+            if self.debug:
+                print(f"[Debug] 从target_encoder获取N={self.N}, num_patches={target_encoder.num_patches}")
+        else:
+            # 默认计算：假设patch_stride=None，seq_len=256, patch_size=64
+            seq_len = 256
+            patch_size = 64
+            self.N = seq_len // patch_size  # 256 // 64 = 4
+            if self.debug:
+                print(f"[Debug] 使用默认计算N={self.N} (seq_len={seq_len}, patch_size={patch_size})")
+        
         embed_num = 4
         embed_dim = 512
-        in_dim = embed_num * embed_dim      # 2048
-        hidden_dim = embed_dim             # 512
-
+        
+        # 分类头：直接展平所有维度，然后通过Linear层
+        # Layer 1: (N * embed_num * embed_dim) -> (N * embed_dim)
+        # Layer 2: (N * embed_dim) -> embed_dim
+        # Layer 3: embed_dim -> num_classes
         self.classifier = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+            # Reshape: (B, N, embed_num, embed_dim) -> (B, N * embed_num * embed_dim)
+            Rearrange('b n e d -> b (n e d)'),
+            # Layer 1: (N * embed_num * embed_dim) -> (N * embed_dim)
+            nn.Linear(self.N * embed_num * embed_dim, self.N * embed_dim),
             nn.ELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
+            # Layer 2: (N * embed_dim) -> embed_dim
+            nn.Linear(self.N * embed_dim, embed_dim),
             nn.ELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, self.num_class),
+            # Layer 3: embed_dim -> num_classes
+            nn.Linear(embed_dim, self.num_class),
         )
        
         self.drop           = torch.nn.Dropout(p=0.50)
         
-        self.loss_fn        = torch.nn.CrossEntropyLoss()
+        # 损失函数（类别权重将在训练时设置）
+        self.loss_fn        = None  # 将在训练时根据类别权重创建
+        self.class_weights  = None  # 类别权重
+        
         self.running_scores = {"train":[], "valid":[]}
         self.is_sanity=True
         
@@ -272,23 +313,8 @@ class LitEEGPTCausal(pl.LightningModule):
             self.target_encoder.eval()
         z = self.target_encoder(x, self.chans_id.to(x))
         
-        # z 的 shape: (B, N, embed_num, embed_dim)
-        # 先在 N 维（patch 维）做平均池化，保留 embed_num 维：
-        # (B, N, 4, 512) -> (B, 4, 512)
-        if z.dim() == 4:
-            z = z.mean(dim=1)
-        elif z.dim() > 4:
-            # 兼容性：如果维度更多，先把多余维度平均掉，再按 (B, N, E, D) 理解
-            while z.dim() > 4:
-                z = z.mean(dim=2)
-            z = z.mean(dim=1)
-        else:
-            # 理论上不会走到这里，只是防御
-            z = z.mean(dim=1)
-
-        # (B, 4, 512) -> (B, 4*512)
-        z = z.flatten(start_dim=1)
-
+        # z 的 shape: (B, N, embed_num, embed_dim) = (B, N, 4, 512)
+        # 直接传入classifier，内部会使用Rearrange展平
         h = self.classifier(z)
         
         return x, h
@@ -300,6 +326,9 @@ class LitEEGPTCausal(pl.LightningModule):
         label = y.long()
         
         x, logit = self.forward(x)
+        # 如果loss_fn是None，创建默认的CrossEntropyLoss
+        if self.loss_fn is None:
+            self.loss_fn = torch.nn.CrossEntropyLoss()
         loss = self.loss_fn(logit, label)
         preds = torch.argmax(logit, dim=-1)
         accuracy = ((preds==label)*1.0).mean()
@@ -428,6 +457,9 @@ class LitEEGPTCausal(pl.LightningModule):
         label = y.long()
         
         x, logit = self.forward(x)
+        # 如果loss_fn是None，创建默认的CrossEntropyLoss
+        if self.loss_fn is None:
+            self.loss_fn = torch.nn.CrossEntropyLoss()
         loss = self.loss_fn(logit, label)
         preds = torch.argmax(logit, dim=-1)
         accuracy = ((preds==label)*1.0).mean()
@@ -540,6 +572,28 @@ class LitEEGPTCausal(pl.LightningModule):
             {'optimizer': optimizer, 'lr_scheduler': lr_dict},
         )
         
+def class_stats(folder: str, num_classes: int = 6, expected_channels: int = 20):
+    """计算类别分布，用于计算类别权重（只统计expected_channels通道的文件）"""
+    paths = [p for ext in ("*.pickle", "*.pkl", "*.pql")
+             for p in glob.glob(os.path.join(folder, ext))]
+    class_counts = [0] * num_classes
+    n_tot = 0
+    for p in paths:
+        try:
+            with open(p, "rb") as f:
+                obj = pickle.load(f)
+            X = np.asarray(obj["signal"], dtype=np.float32)
+            # 只统计expected_channels通道的文件
+            if X.shape[0] == expected_channels:
+                y = int(obj["label"])
+                if 0 <= y < num_classes:
+                    class_counts[y] += 1
+                    n_tot += 1
+        except Exception:
+            continue
+    return class_counts, n_tot
+
+
 def check_experiment_complete(batch_size, max_lr, weight_decay, freeze_encoder, 
                                required_epochs=40):
     """
@@ -602,6 +656,20 @@ def main():
         json.dump(config, f, indent=2)
 
     # ==================== 数据加载 ====================
+    # 计算类别权重（处理类别不平衡）
+    train_dir = os.path.join(data_root, "train")
+    class_counts, n_tot = class_stats(train_dir, num_classes=num_classes, expected_channels=20)
+    # 计算类别权重：逆频率加权
+    class_weights = []
+    for count in class_counts:
+        if count > 0:
+            class_weights.append(n_tot / (num_classes * count))
+        else:
+            class_weights.append(1.0)
+    class_weights = torch.tensor(class_weights, dtype=torch.float32)
+    print(f"[data] train samples={n_tot}, class_counts={class_counts}")
+    print(f"[data] class_weights={class_weights.tolist()}")
+    
     train_dataset = KaggleEEGDataset(data_root, split="train")
     valid_dataset = KaggleEEGDataset(data_root, split="val")
 
@@ -626,6 +694,12 @@ def main():
         encoder_lr_ratio=encoder_lr_ratio,
     )
     model.output_dir = output_dir  # 设置输出目录
+    
+    # 设置类别权重和损失函数
+    device = next(model.parameters()).device
+    class_weights_device = class_weights.to(device)
+    model.class_weights = class_weights_device
+    model.loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights_device)
 
     # 如果有 test 集，提前构建 test_loader，供每个 epoch 使用
     test_dir = Path(data_root) / "test"
