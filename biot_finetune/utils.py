@@ -104,6 +104,174 @@ class MotionLoader(torch.utils.data.Dataset):
         raise RuntimeError(
             f"No valid sample with in_channels={self.in_channels} found."
         )
+
+
+class SEEDLoader(torch.utils.data.Dataset):
+    """
+    SEED数据集加载器
+    数据格式: pickle文件，包含 'signal' (62, time_points), 'label' (int 0-6), 'epoch_id' (str)
+    
+    根据process_seed.ipynb的预处理流程：
+    - BIOT: 数据已resample到200Hz，4秒数据=800个时间点，label已经是0-6
+    - STTransformer: 数据已resample到250Hz，4秒数据=1000个时间点，label已经是0-6
+    - 数据已经过预处理，不需要重采样和label转换
+    - 只需要95%分位数归一化（BIOT预处理中注释掉了，但通常训练时需要）
+    
+    标签映射（移除neutral，从7分类变为6分类）：
+    - 原始: happy=0, sad=1, neutral=2, disgust=3, fear=4, surprise=5, anger=6
+    - 新的: happy=0, sad=1, disgust=2, fear=3, surprise=4, anger=5 (跳过neutral=2)
+    """
+    def __init__(self, root, files, sampling_rate=200, return_epoch_id=False):
+        self.root = root
+        self.files = files
+        self.sampling_rate = sampling_rate  # 用于验证，数据已经是200Hz或250Hz
+        self.return_epoch_id = return_epoch_id  # 是否返回epoch_id（用于评估）
+        
+        # 标签重新映射：跳过neutral (2)，将其他标签映射到0-5
+        # 0->0, 1->1, 2->跳过, 3->2, 4->3, 5->4, 6->5
+        self.label_map = {0: 0, 1: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        # 处理文件路径：files可能包含子目录路径
+        file_path = self.files[index]
+        if os.path.isabs(file_path) or (self.root and file_path.startswith(self.root)):
+            full_path = file_path
+        else:
+            full_path = os.path.join(self.root, file_path) if self.root else file_path
+        
+        sample = pickle.load(open(full_path, "rb"))
+        X = sample["signal"]  # shape: (62, time_points) - 已经是200Hz或250Hz处理后的数据
+        
+        # 数据已经预处理过，不需要重采样
+        # 只需要95%分位数归一化（BIOT预处理中注释掉了，但训练时通常需要）
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        
+        # 转换数据类型
+        X = torch.FloatTensor(X)
+        
+        # 重新映射标签：跳过neutral (2)，将其他标签映射到0-5
+        original_label = int(sample["label"])
+        if original_label == 2:  # neutral，不应该出现（已在prepare_SEED_dataloader中过滤）
+            raise ValueError(f"Unexpected neutral label (2) found in file: {full_path}")
+        Y = self.label_map[original_label]
+        Y = torch.tensor(Y, dtype=torch.long)
+        
+        # 如果需要返回epoch_id（用于评估），则返回三元组
+        if self.return_epoch_id:
+            epoch_id = sample.get("epoch_id", "")
+            return X, Y, epoch_id
+        
+        return X, Y
+
+class SleepLoader(torch.utils.data.Dataset):
+    """
+    Sleep数据集加载器
+    数据格式: pickle文件，包含 'signal' (6, 7500), 'label' (int 0-4), 'epoch_id' (str)
+    
+    数据特性：
+    - 6个通道：['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
+    - 5个类别：0, 1, 2, 3, 4
+    - 30秒数据，采样率250Hz，所以是7500个时间点
+    - 数据已经预处理过，只需要95%分位数归一化
+    """
+    def __init__(self, root, files, sampling_rate=250, return_epoch_id=False):
+        self.root = root
+        self.files = files
+        self.sampling_rate = sampling_rate  # 用于验证，数据已经是250Hz
+        self.return_epoch_id = return_epoch_id  # 是否返回epoch_id（用于评估）
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        # 处理文件路径：files可能包含子目录路径
+        file_path = self.files[index]
+        if os.path.isabs(file_path) or (self.root and file_path.startswith(self.root)):
+            full_path = file_path
+        else:
+            full_path = os.path.join(self.root, file_path) if self.root else file_path
+        
+        sample = pickle.load(open(full_path, "rb"))
+        X = sample["signal"]  # shape: (6, 7500) - 已经是250Hz处理后的数据
+        
+        # 数据已经预处理过，不需要重采样
+        # 只需要95%分位数归一化
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        
+        # 转换数据类型
+        X = torch.FloatTensor(X)
+        
+        # 标签已经是0-4，直接使用
+        Y = int(sample["label"])
+        Y = torch.tensor(Y, dtype=torch.long)
+        
+        # 如果需要返回epoch_id（用于评估），则返回三元组
+        if self.return_epoch_id:
+            epoch_id = sample.get("epoch_id", "")
+            return X, Y, epoch_id
+        
+        return X, Y
+
+class BiotSleepLoader(torch.utils.data.Dataset):
+    """
+    BIOT Sleep数据集加载器（用于200Hz采样率）
+    数据格式: pickle文件，包含 'signal' (6, 6000), 'label' (int 0-4), 'epoch_id' (str)
+    
+    数据特性：
+    - 6个通道：['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
+    - 5个类别：0, 1, 2, 3, 4
+    - 30秒数据，采样率200Hz，所以是6000个时间点
+    - 数据已经预处理过，只需要95%分位数归一化
+    """
+    def __init__(self, root, files, sampling_rate=200, return_epoch_id=False):
+        self.root = root
+        self.files = files
+        self.sampling_rate = sampling_rate  # 用于验证，数据已经是200Hz
+        self.return_epoch_id = return_epoch_id  # 是否返回epoch_id（用于评估）
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        # 处理文件路径：files可能包含子目录路径
+        file_path = self.files[index]
+        if os.path.isabs(file_path) or (self.root and file_path.startswith(self.root)):
+            full_path = file_path
+        else:
+            full_path = os.path.join(self.root, file_path) if self.root else file_path
+        
+        sample = pickle.load(open(full_path, "rb"))
+        X = sample["signal"]  # shape: (6, 6000) - 已经是200Hz处理后的数据
+        
+        # 数据已经预处理过，不需要重采样
+        # 只需要95%分位数归一化
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        
+        # 转换数据类型
+        X = torch.FloatTensor(X)
+        
+        # 标签已经是0-4，直接使用
+        Y = int(sample["label"])
+        Y = torch.tensor(Y, dtype=torch.long)
+        
+        # 如果需要返回epoch_id（用于评估），则返回三元组
+        if self.return_epoch_id:
+            epoch_id = sample.get("epoch_id", "")
+            return X, Y, epoch_id
+        
+        return X, Y
         
 class CHBMITLoader(torch.utils.data.Dataset):
     def __init__(self, root, files, sampling_rate=200):
@@ -299,6 +467,54 @@ def collate_fn_unsupervised_pretrain(batch):
         return prest_samples, shhs_samples
     return 0, shhs_samples
 
+
+def collate_fn_seed_with_epoch_id(batch):
+    """
+    自定义collate函数，用于处理SEED数据集返回(X, Y, epoch_id)的情况
+    """
+    # batch是list of tuples: [(X1, Y1, epoch_id1), (X2, Y2, epoch_id2), ...]
+    X_list, Y_list, epoch_id_list = zip(*batch)
+    
+    # 堆叠X和Y
+    X_batch = torch.stack(X_list, dim=0)
+    Y_batch = torch.stack(Y_list, dim=0)
+    
+    # epoch_id保持为list
+    epoch_id_batch = list(epoch_id_list)
+    
+    return X_batch, Y_batch, epoch_id_batch
+
+def collate_fn_sleep_with_epoch_id(batch):
+    """
+    自定义collate函数，用于处理Sleep数据集返回(X, Y, epoch_id)的情况
+    """
+    # batch是list of tuples: [(X1, Y1, epoch_id1), (X2, Y2, epoch_id2), ...]
+    X_list, Y_list, epoch_id_list = zip(*batch)
+    
+    # 堆叠X和Y
+    X_batch = torch.stack(X_list, dim=0)
+    Y_batch = torch.stack(Y_list, dim=0)
+    
+    # epoch_id保持为list
+    epoch_id_batch = list(epoch_id_list)
+    
+    return X_batch, Y_batch, epoch_id_batch
+
+def collate_fn_biot_sleep_with_epoch_id(batch):
+    """
+    自定义collate函数，用于处理BiotSleep数据集返回(X, Y, epoch_id)的情况
+    """
+    # batch是list of tuples: [(X1, Y1, epoch_id1), (X2, Y2, epoch_id2), ...]
+    X_list, Y_list, epoch_id_list = zip(*batch)
+    
+    # 堆叠X和Y
+    X_batch = torch.stack(X_list, dim=0)
+    Y_batch = torch.stack(Y_list, dim=0)
+    
+    # epoch_id保持为list
+    epoch_id_batch = list(epoch_id_list)
+    
+    return X_batch, Y_batch, epoch_id_batch
 
 class EEGSupervisedPretrainLoader(torch.utils.data.Dataset):
     def __init__(self, tuev_data, chb_mit_data, iiic_data, tuab_data):
