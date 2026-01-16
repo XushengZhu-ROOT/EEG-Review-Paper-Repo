@@ -15,7 +15,13 @@ import os
 import tqdm
 from pytorch_lightning import loggers as pl_loggers
 import torch.nn.functional as F
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import (
+    confusion_matrix,
+    accuracy_score,
+    balanced_accuracy_score,
+    cohen_kappa_score,
+    f1_score,
+)
 def seed_torch(seed=1029):
 	random.seed(seed)
 	os.environ['PYTHONHASHSEED'] = str(seed) # 为了禁止hash随机化，使得实验可复现
@@ -31,6 +37,9 @@ from Modules.models.EEGPT_mcae import EEGTransformer
 from Modules.Network.utils import Conv1dWithConstraint, LinearWithConstraint
 from sklearn import metrics
 from utils_eval import get_metrics
+from einops.layers.torch import Rearrange
+import glob
+import pickle
 
 
 
@@ -116,23 +125,44 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
         - 'label' : int, 0/1
         - 'epoch_id': str
     """
-    def __init__(self, root_dir: str, split: str = "train"):
+    def __init__(self, root_dir: str, split: str = "train", expected_channels: int = 56):
         super().__init__()
         self.root_dir = root_dir
         self.split = split
         self.split_dir = os.path.join(root_dir, split)
         assert os.path.isdir(self.split_dir), f"{self.split_dir} 不存在"
+        
+        self.expected_channels = expected_channels
 
-        self.files = [
+        # 过滤：只保留expected_channels通道的文件
+        all_files = [
             os.path.join(self.split_dir, f)
             for f in os.listdir(self.split_dir)
             if f.endswith(".pickle")
         ]
+        
+        self.files = []
+        skipped = 0
+        for f in all_files:
+            try:
+                with open(f, "rb") as f_obj:
+                    obj = pickle.load(f_obj)
+                X = np.asarray(obj["signal"], dtype=np.float32)
+                if X.shape[0] == expected_channels:
+                    self.files.append(f)
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+                continue
+        
         self.files.sort()
-
+        
         if len(self.files) == 0:
-            raise RuntimeError(f"{self.split_dir} 下没有找到任何 .pickle 文件")
-
+            raise RuntimeError(f"{self.split_dir} 下没有找到任何 {expected_channels} 通道的 .pickle 文件")
+        
+        if skipped > 0:
+            print(f"[KaggleEEGDataset] split={split}, 跳过 {skipped} 个通道数不匹配的文件")
         print(f"[KaggleEEGDataset] split={split}, 样本数={len(self.files)}")
 
     def __len__(self):
@@ -140,12 +170,18 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         path = self.files[idx]
-        import pickle
         with open(path, "rb") as f:
             obj = pickle.load(f)
 
         x = obj["signal"]   # (56, 768)
         y = obj["label"]    # int 0/1
+
+        # 检查通道数
+        if x.shape[0] != self.expected_channels:
+            raise ValueError(f"Expected {self.expected_channels} channels, got {x.shape[0]}")
+        
+        # 数据清理：NaN/Inf处理
+        x = np.nan_to_num(x, posinf=0.0, neginf=0.0)
 
         x = torch.tensor(x, dtype=torch.float32)  # (C, T)
         y = torch.tensor(y, dtype=torch.long)
@@ -216,29 +252,50 @@ class LitEEGPTCausal(pl.LightningModule):
         # 输入为 56 通道（与你的数据一致，如不同需修改这里）
         self.chan_conv       = Conv1dWithConstraint(56, self.chans_num, 1, max_norm=1)
         
-        # 新的分类头结构（参考数据集信息和实验笔记，但做了参数量裁剪）
-        # z 的 shape: (B, N, embed_num, embed_dim)
-        # 这里只在 N 维（patch 维）上做平均池化，保留 embed_num 这一维：
-        #   (B, N, 4, 512) --mean over N--> (B, 4, 512)
-        # 然后展平成 (B, 4*512=2048)，再做 2048 -> 512 -> 512 -> num_classes
+        # 分类头结构（按Motor.py的实现：直接展平，不先池化）
+        # z 的 shape: (B, N, embed_num, embed_dim) = (B, N, 4, 512)
+        # 计算patch数量N
+        if hasattr(target_encoder, 'num_patches') and isinstance(target_encoder.num_patches, tuple):
+            # num_patches是(C, N)格式，C是通道维度的patch数，N是时间维度的patch数
+            self.N = target_encoder.num_patches[1]  # N是时间维度的patch数
+            if self.debug:
+                print(f"[Debug] 从target_encoder获取N={self.N}, num_patches={target_encoder.num_patches}")
+        else:
+            # 默认计算：假设patch_stride=None，seq_len=768, patch_size=64
+            seq_len = 768
+            patch_size = 64
+            self.N = seq_len // patch_size  # 768 // 64 = 12
+            if self.debug:
+                print(f"[Debug] 使用默认计算N={self.N} (seq_len={seq_len}, patch_size={patch_size})")
+        
         embed_num = 4
         embed_dim = 512
-        in_dim = embed_num * embed_dim      # 2048
-        hidden_dim = embed_dim             # 512
-
+        
+        # 分类头：直接展平所有维度，然后通过Linear层
+        # Layer 1: (N * embed_num * embed_dim) -> (N * embed_dim)
+        # Layer 2: (N * embed_dim) -> embed_dim
+        # Layer 3: embed_dim -> num_classes
         self.classifier = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+            # Reshape: (B, N, embed_num, embed_dim) -> (B, N * embed_num * embed_dim)
+            Rearrange('b n e d -> b (n e d)'),
+            # Layer 1: (N * embed_num * embed_dim) -> (N * embed_dim)
+            nn.Linear(self.N * embed_num * embed_dim, self.N * embed_dim),
             nn.ELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
+            # Layer 2: (N * embed_dim) -> embed_dim
+            nn.Linear(self.N * embed_dim, embed_dim),
             nn.ELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, self.num_class),
+            # Layer 3: embed_dim -> num_classes
+            nn.Linear(embed_dim, self.num_class),
         )
        
         self.drop           = torch.nn.Dropout(p=0.50)
         
-        self.loss_fn        = torch.nn.CrossEntropyLoss()
+        # 损失函数（类别权重将在训练时设置）
+        self.loss_fn        = None  # 将在训练时根据类别权重创建
+        self.class_weights  = None  # 类别权重
+        
         self.running_scores = {"train":[], "valid":[]}
         self.is_sanity=True
         
@@ -258,23 +315,8 @@ class LitEEGPTCausal(pl.LightningModule):
             self.target_encoder.eval()
         z = self.target_encoder(x, self.chans_id.to(x))
         
-        # z 的 shape: (B, N, embed_num, embed_dim)
-        # 先在 N 维（patch 维）做平均池化，保留 embed_num 维：
-        # (B, N, 4, 512) -> (B, 4, 512)
-        if z.dim() == 4:
-            z = z.mean(dim=1)
-        elif z.dim() > 4:
-            # 兼容性：如果维度更多，先把多余维度平均掉，再按 (B, N, E, D) 理解
-            while z.dim() > 4:
-                z = z.mean(dim=2)
-            z = z.mean(dim=1)
-        else:
-            # 理论上不会走到这里，只是防御
-            z = z.mean(dim=1)
-
-        # (B, 4, 512) -> (B, 4*512)
-        z = z.flatten(start_dim=1)
-
+        # z 的 shape: (B, N, embed_num, embed_dim) = (B, N, 4, 512)
+        # 直接传入classifier，内部会使用Rearrange展平
         h = self.classifier(z)
         
         return x, h
@@ -286,12 +328,17 @@ class LitEEGPTCausal(pl.LightningModule):
         label = y.long()
         
         x, logit = self.forward(x)
+        # 如果loss_fn是None，创建默认的CrossEntropyLoss
+        if self.loss_fn is None:
+            self.loss_fn = torch.nn.CrossEntropyLoss()
         loss = self.loss_fn(logit, label)
         preds = torch.argmax(logit, dim=-1)
         accuracy = ((preds==label)*1.0).mean()
-        y_score =  logit.clone().detach().cpu()
-        y_score =  torch.softmax(y_score, dim=-1)[:,1]
-        self.running_scores["train"].append((label.clone().detach().cpu(), y_score.clone().detach().cpu()))
+
+        # 二分类：保存正类概率用于 epoch 结束时计算指标
+        probs = torch.softmax(logit.detach().cpu(), dim=-1)  # (B, num_classes)
+        y_score = probs[:, 1]  # 二分类：正类概率
+        self.running_scores["train"].append((label.clone().detach().cpu(), y_score))
         # rocauc = metrics.roc_auc_score(label.clone().detach().cpu(), y_score)
         # Logging to TensorBoard by default
         self.log('train_loss', loss, on_epoch=True, on_step=False)
@@ -322,9 +369,9 @@ class LitEEGPTCausal(pl.LightningModule):
         y_pred = (y_score > 0.5).long().numpy()
         label_np = label.numpy()
         
-        # 计算指标
+        # 计算二分类指标
         metric_list = ["accuracy", "balanced_accuracy", "precision", "recall", "cohen_kappa", "f1", "roc_auc"]
-        results = get_metrics(y_score.numpy(), label_np, metric_list, True)
+        results = get_metrics(y_score.numpy(), label_np, metric_list, is_binary=True)
         
         # 计算混淆矩阵
         from sklearn.metrics import confusion_matrix
@@ -371,8 +418,13 @@ class LitEEGPTCausal(pl.LightningModule):
             scores_t = torch.cat(all_scores, dim=0).numpy()
             preds_t = (scores_t > 0.5).astype(int)
 
+            # Debug 打印，确认形状和类型，便于排查问题
+            print(f"[Debug][Test] labels_t shape: {labels_t.shape}, dtype: {labels_t.dtype}")
+            print(f"[Debug][Test] scores_t shape: {scores_t.shape}, dtype: {scores_t.dtype}")
+            print(f"[Debug][Test] preds_t type: {type(preds_t)}, shape: {np.shape(preds_t)}")
+
             metric_list_t = ["accuracy", "balanced_accuracy", "precision", "recall", "cohen_kappa", "f1", "roc_auc"]
-            test_metrics = get_metrics(scores_t, labels_t, metric_list_t, True)
+            test_metrics = get_metrics(scores_t, labels_t, metric_list_t, is_binary=True)
             cm_t = confusion_matrix(labels_t, preds_t)
 
             print(f"[Epoch {epoch}] Test  - Acc: {test_metrics.get('accuracy',0):.4f}, "
@@ -395,13 +447,18 @@ class LitEEGPTCausal(pl.LightningModule):
         label = y.long()
         
         x, logit = self.forward(x)
+        # 如果loss_fn是None，创建默认的CrossEntropyLoss
+        if self.loss_fn is None:
+            self.loss_fn = torch.nn.CrossEntropyLoss()
         loss = self.loss_fn(logit, label)
         preds = torch.argmax(logit, dim=-1)
         accuracy = ((preds==label)*1.0).mean()
         
-        # 保存logits用于epoch结束时的评估
-        y_score = torch.softmax(logit, dim=-1)[:,1]
-        self.running_scores["valid"].append((label.clone().detach().cpu(), y_score.clone().detach().cpu()))
+        # 二分类：保存正类概率用于 epoch 结束时的评估
+        y_score = torch.softmax(logit, dim=-1)[:, 1]  # 正类概率
+        self.running_scores["valid"].append(
+            (label.clone().detach().cpu(), y_score.clone().detach().cpu())
+        )
 
         self.log('valid_loss', loss, on_epoch=True, on_step=False)
         self.log('valid_acc', accuracy, on_epoch=True, on_step=False)
@@ -415,24 +472,45 @@ class LitEEGPTCausal(pl.LightningModule):
         for x,y in self.running_scores["train"]:
             label.append(x)
             y_score.append(y)
-        label = torch.cat(label, dim=0)
-        y_score = torch.cat(y_score, dim=0)
+        label = torch.cat(label, dim=0)        # (N,)
+        y_score = torch.cat(y_score, dim=0)    # (N,) 二分类：正类概率
         
-        # 计算训练集指标
+        # 计算训练集二分类指标
         y_pred = (y_score > 0.5).long().numpy()
         label_np = label.numpy()
         
-        metric_list = ["accuracy", "balanced_accuracy"]
-        results = get_metrics(y_score.numpy(), label_np, metric_list, True)
+        metric_list = [
+            "accuracy",
+            "balanced_accuracy",
+            "precision",
+            "recall",
+            "cohen_kappa",
+            "f1",
+            "roc_auc",
+        ]
+        results = get_metrics(y_score.numpy(), label_np, metric_list, is_binary=True)
         
-        rocauc = metrics.roc_auc_score(label_np, y_score.numpy())
-        self.log('train_rocauc', rocauc, on_epoch=True, on_step=False)
+        # 计算混淆矩阵
+        from sklearn.metrics import confusion_matrix
+        cm = confusion_matrix(label_np, y_pred)
         
         # 打印训练指标
         epoch = self.current_epoch
         acc = results.get('accuracy', 0)
         bacc = results.get('balanced_accuracy', 0)
+        rocauc = results.get('roc_auc', 0)
         print(f"[Epoch {epoch}] Train - Acc: {acc:.4f}, BAcc: {bacc:.4f}, ROC-AUC: {rocauc:.4f}")
+        
+        # 保存训练集结果到文件（与valid/test保持一致）
+        if self.output_dir is not None:
+            epoch_file = self.output_dir / f"epoch_{epoch}_train.json"
+            epoch_data = {
+                "epoch": epoch,
+                "metrics": results,
+                "confusion_matrix": cm.tolist(),
+            }
+            with open(epoch_file, 'w') as f:
+                json.dump(epoch_data, f, indent=2)
         
         return super().on_train_epoch_end()
     
@@ -486,14 +564,68 @@ class LitEEGPTCausal(pl.LightningModule):
             {'optimizer': optimizer, 'lr_scheduler': lr_dict},
         )
         
+def class_stats(folder: str, num_classes: int = 2, expected_channels: int = 56):
+    """计算类别分布，用于计算类别权重（只统计expected_channels通道的文件）"""
+    paths = [p for ext in ("*.pickle", "*.pkl", "*.pql")
+             for p in glob.glob(os.path.join(folder, ext))]
+    class_counts = [0] * num_classes
+    n_tot = 0
+    for p in paths:
+        try:
+            with open(p, "rb") as f:
+                obj = pickle.load(f)
+            X = np.asarray(obj["signal"], dtype=np.float32)
+            # 只统计expected_channels通道的文件
+            if X.shape[0] == expected_channels:
+                y = int(obj["label"])
+                if 0 <= y < num_classes:
+                    class_counts[y] += 1
+                    n_tot += 1
+        except Exception:
+            continue
+    return class_counts, n_tot
+
+
+def check_experiment_complete(batch_size, max_lr, weight_decay, freeze_encoder, 
+                               required_epochs=50):
+    """
+    检查实验是否已经完整训练（0到required_epochs的epoch都有valid结果）
+    
+    Args:
+        batch_size: 批次大小
+        max_lr: 学习率
+        weight_decay: 权重衰减
+        freeze_encoder: 是否冻结encoder
+        required_epochs: 需要检查的epoch数量（默认50，即0-50共51个epoch）
+    
+    Returns:
+        (is_complete, output_dir): 是否完整，输出目录路径
+    """
+    run_name = (
+        f"{TASK_NAME}_bs{batch_size}_lr{max_lr}_wd{weight_decay}"
+        f"_freeze{int(freeze_encoder)}"
+    )
+    output_dir = Path("output") / run_name
+    
+    if not output_dir.exists():
+        return False, output_dir
+    
+    # 检查0到required_epochs的所有epoch的valid文件是否存在
+    for epoch in range(required_epochs + 1):
+        valid_file = output_dir / f"epoch_{epoch}_valid.json"
+        if not valid_file.exists():
+            return False, output_dir
+    
+    return True, output_dir
+
+
 def main():
     # 重新设定种子（实验级别）
     seed_torch(9)
-    # 创建输出文件夹（每次运行一个实验，一个文件夹）
-    run_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # 创建输出文件夹（每次运行一个实验，一个文件夹，不包含时间戳）
     run_name = (
         f"{TASK_NAME}_bs{batch_size}_lr{max_lr}_wd{weight_decay}"
-        f"_freeze{int(freeze_encoder)}_{run_tag}"
+        f"_freeze{int(freeze_encoder)}"
     )
     output_dir = Path("output") / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -509,15 +641,29 @@ def main():
         "freeze_encoder": freeze_encoder,
         "encoder_lr_ratio": encoder_lr_ratio,
         "channels": len(use_channels_names),
-        "num_classes": 2,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "num_classes": num_classes,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # 保留在config中，但不在目录名中
     }
     with open(output_dir / "config.json", 'w') as f:
         json.dump(config, f, indent=2)
 
     # ==================== 数据加载 ====================
-    train_dataset = KaggleEEGDataset(data_root, split="train")
-    valid_dataset = KaggleEEGDataset(data_root, split="val")
+    # 计算类别权重（处理类别不平衡）
+    train_dir = os.path.join(data_root, "train")
+    class_counts, n_tot = class_stats(train_dir, num_classes=num_classes, expected_channels=56)
+    # 计算类别权重：逆频率加权
+    class_weights = []
+    for count in class_counts:
+        if count > 0:
+            class_weights.append(n_tot / (num_classes * count))
+        else:
+            class_weights.append(1.0)
+    class_weights = torch.tensor(class_weights, dtype=torch.float32)
+    print(f"[data] train samples={n_tot}, class_counts={class_counts}")
+    print(f"[data] class_weights={class_weights.tolist()}")
+    
+    train_dataset = KaggleEEGDataset(data_root, split="train", expected_channels=56)
+    valid_dataset = KaggleEEGDataset(data_root, split="val", expected_channels=56)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -540,12 +686,18 @@ def main():
         encoder_lr_ratio=encoder_lr_ratio,
     )
     model.output_dir = output_dir  # 设置输出目录
+    
+    # 设置类别权重和损失函数
+    device = next(model.parameters()).device
+    class_weights_device = class_weights.to(device)
+    model.class_weights = class_weights_device
+    model.loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights_device)
 
     # 如果有 test 集，提前构建 test_loader，供每个 epoch 使用
     test_dir = Path(data_root) / "test"
     if test_dir.is_dir():
         print("检测到 test 集，将在每个 epoch 结束后同时评估 test。")
-        test_dataset = KaggleEEGDataset(data_root, split="test")
+        test_dataset = KaggleEEGDataset(data_root, split="test", expected_channels=56)
         test_loader = torch.utils.data.DataLoader(
             test_dataset,
             batch_size=batch_size,
@@ -594,7 +746,35 @@ if __name__ == "__main__":
         for lr in LR_LIST:
             for wd in WD_LIST:
                 print("\n" + "=" * 80)
-                print(f"开始新实验: bs={bs}, lr={lr}, wd={wd}, freeze_encoder={freeze_encoder}")
+                print(f"检查实验: bs={bs}, lr={lr}, wd={wd}, freeze_encoder={freeze_encoder}")
+                print("=" * 80)
+                
+                # 检查实验是否已经完整训练（0-50 epoch）
+                is_complete, output_dir = check_experiment_complete(
+                    bs, lr, wd, freeze_encoder, required_epochs=50
+                )
+                
+                if is_complete:
+                    print(f"✓ 实验已完成（0-50 epoch），跳过: {output_dir.name}")
+                    print("=" * 80)
+                    continue
+                
+                # 检查是否有部分结果
+                if output_dir.exists():
+                    existing_epochs = []
+                    for epoch_file in sorted(output_dir.glob("epoch_*_valid.json")):
+                        try:
+                            epoch_num = int(epoch_file.stem.split("_")[1])
+                            existing_epochs.append(epoch_num)
+                        except:
+                            pass
+                    if existing_epochs:
+                        max_epoch = max(existing_epochs)
+                        print(f"⚠ 检测到已有部分结果（最高到 epoch {max_epoch}），将重新训练并覆盖")
+                    else:
+                        print(f"→ 实验目录存在但无结果文件，开始训练...")
+                else:
+                    print(f"→ 实验不存在，开始新训练...")
                 print("=" * 80)
 
                 # 更新全局超参数
@@ -602,6 +782,6 @@ if __name__ == "__main__":
                 max_lr = lr
                 weight_decay = wd
 
-                # 运行一次完整实验（会自动创建带超参信息的输出文件夹）
+                # 运行一次完整实验（会自动创建带超参信息的输出文件夹，如果已存在会覆盖）
                 main()
 
