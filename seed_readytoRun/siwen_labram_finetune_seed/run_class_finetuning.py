@@ -310,6 +310,15 @@ def get_dataset(args):
         args.nb_classes = 6  # 6分类任务（排除neutral类别）
         # Seed是6情绪分类任务（happy, sad, disgust, fear, surprise, anger），使用多分类指标
         metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
+
+    elif args.dataset == 'Sleep':
+        train_dataset, test_dataset, val_dataset = utils.prepare_Sleep_dataset(args.dataset_path)
+        # 6通道：C3, C4, F3, F4, O1, O2
+        ch_names = ['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
+        ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
+        args.nb_classes = 5  # 5分类任务（0,1,2,3,4）
+        # Sleep是5分类任务，使用多分类指标
+        metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
     
     elif args.dataset == 'Stress':
         train_dataset, test_dataset, val_dataset = utils.prepare_TUAB_dataset(args.dataset_path)
@@ -549,6 +558,22 @@ def main(args, ds_init):
             if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
                 print(f"Removing key {k} from pretrained checkpoint")
                 del checkpoint_model[k]
+
+        # Handle time_embed extension: if pretrained has 16 time windows and model has 32, 
+        # load first 16 and initialize the rest (copy from last time window or zero init)
+        if 'time_embed' in checkpoint_model and 'time_embed' in state_dict:
+            pretrained_time_embed = checkpoint_model['time_embed']
+            model_time_embed = state_dict['time_embed']
+            if pretrained_time_embed.shape[1] == 16 and model_time_embed.shape[1] == 32:
+                print(f"Extending time_embed from 16 to 32 time windows")
+                # Create extended time_embed: first 16 from pretrained, rest initialized
+                extended_time_embed = torch.zeros_like(model_time_embed)
+                extended_time_embed[:, :16, :] = pretrained_time_embed
+                # Initialize remaining time windows by copying the last pretrained time window
+                # This provides a reasonable starting point for the new time windows
+                extended_time_embed[:, 16:, :] = pretrained_time_embed[:, -1:, :].expand(-1, 16, -1)
+                checkpoint_model['time_embed'] = extended_time_embed
+                print(f"Extended time_embed: loaded first 16 from pretrained, initialized rest from last time window")
 
         all_keys = list(checkpoint_model.keys())
         for key in all_keys:

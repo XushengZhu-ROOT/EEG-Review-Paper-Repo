@@ -70,12 +70,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples = samples.float().to(device, non_blocking=True) / 100
         # Reshape data for model input
         # If data is [B, N, T] with T=800, reshape to [B, N, 4, 200] (4 patches of 200 time points each)
+        # If data is [B, N, T] with T=6000, reshape to [B, N, 30, 200] (30 patches of 200 time points each for Sleep dataset)
         # Otherwise, reshape to [B, N, 1, T] for Motor dataset format
         if len(samples.shape) == 3:  # [B, N, T]
             B, N, T = samples.shape
             if T == 800:  # Seed dataset: 4 seconds @ 200Hz = 800 time points
                 # Reshape to [B, N, 4, 200] - 4 patches of 200 time points each
                 samples = samples.view(B, N, 4, 200)
+            elif T == 6000:  # Sleep dataset: 30 seconds @ 200Hz = 6000 time points
+                # Reshape to [B, N, 30, 200] - 30 patches of 200 time points each
+                samples = samples.view(B, N, 30, 200)
             else:
                 # Motor dataset format: [B, N, 1, T]
                 samples = samples.unsqueeze(2)
@@ -219,12 +223,16 @@ def evaluate(data_loader, model, device, header='Test:', ch_names=None, metrics=
         EEG = EEG.float().to(device, non_blocking=True) / 100
         # Reshape data for model input
         # If data is [B, N, T] with T=800, reshape to [B, N, 4, 200] (4 patches of 200 time points each)
+        # If data is [B, N, T] with T=6000, reshape to [B, N, 30, 200] (30 patches of 200 time points each for Sleep dataset)
         # Otherwise, reshape to [B, N, 1, T] for Motor dataset format
         if len(EEG.shape) == 3:  # [B, N, T]
             B, N, T = EEG.shape
             if T == 800:  # Seed dataset: 4 seconds @ 200Hz = 800 time points
                 # Reshape to [B, N, 4, 200] - 4 patches of 200 time points each
                 EEG = EEG.view(B, N, 4, 200)
+            elif T == 6000:  # Sleep dataset: 30 seconds @ 200Hz = 6000 time points
+                # Reshape to [B, N, 30, 200] - 30 patches of 200 time points each
+                EEG = EEG.view(B, N, 30, 200)
             else:
                 # Motor dataset format: [B, N, 1, T]
                 EEG = EEG.unsqueeze(2)

@@ -874,6 +874,46 @@ class MotorLoader(torch.utils.data.Dataset):
 
         return torch.FloatTensor(X), Y
 
+class SleepLoader(torch.utils.data.Dataset):
+    def __init__(self, root, files, sampling_rate=200, data_key='signal', label_key='label', expected_channels=6):
+        self.root = root
+        self.files = files
+        self.default_rate = 200
+        self.sampling_rate = sampling_rate
+        self.data_key = data_key
+        self.label_key = label_key
+        self.expected_channels = expected_channels
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample_path = os.path.join(self.root, self.files[index])
+        sample = pickle.load(open(sample_path, "rb"))
+
+        X = sample[self.data_key]
+        Y = sample[self.label_key]
+
+        if X.shape[0] != self.expected_channels:
+            return None
+
+        # Sleep数据集的标签已经是0-4（5分类），不需要转换
+        if isinstance(Y, (list, np.ndarray)) and len(Y) > 0:
+            Y = int(Y[0])
+        elif isinstance(Y, (list, np.ndarray)) and len(Y) == 0:
+            raise ValueError(f"Empty label in {sample_path}")
+        else:
+            Y = int(Y)
+
+        # 确保标签在0-4范围内（5分类：0,1,2,3,4）
+        if Y < 0 or Y > 4:
+            raise ValueError(f"Invalid label {Y} in {sample_path}, expected 0-4")
+
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, 10 * self.sampling_rate, axis=-1)
+
+        return torch.FloatTensor(X), Y
+
 class SeedLoader(torch.utils.data.Dataset):
     def __init__(self, root, files, sampling_rate=200, data_key='signal', label_key='label', expected_channels=62):
         self.root = root
@@ -1190,6 +1230,25 @@ def prepare_Seed_dataset(root, data_key='signal', label_key='label'):
     val_dataset = SeedLoader(val_dir, val_files, data_key=data_key, label_key=label_key, expected_channels=62)
     
     print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    return train_dataset, test_dataset, val_dataset
+
+def prepare_Sleep_dataset(root, data_key='signal', label_key='label'):
+    # set random seed
+    seed = 12345
+    np.random.seed(seed)
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    np.random.shuffle(train_files)
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    # prepare training and test data loader
+    train_dataset = SleepLoader(os.path.join(root, "train"), train_files, data_key=data_key, label_key=label_key, expected_channels=6)
+    test_dataset = SleepLoader(os.path.join(root, "test"), test_files, data_key=data_key, label_key=label_key, expected_channels=6)
+    val_dataset = SleepLoader(os.path.join(root, "val"), val_files, data_key=data_key, label_key=label_key, expected_channels=6)
+    print(len(train_files), len(val_files), len(test_files))
     return train_dataset, test_dataset, val_dataset
 
 

@@ -284,7 +284,8 @@ class NeuralTransformer(nn.Module):
             self.pos_embed = nn.Parameter(torch.zeros(1, 128 + 1, embed_dim), requires_grad=True)
         else:
             self.pos_embed = None
-        self.time_embed = nn.Parameter(torch.zeros(1, 16, embed_dim), requires_grad=True)
+        # Extended time_embed from 16 to 32 to support longer sequences (e.g., Sleep dataset with 30 time windows)
+        self.time_embed = nn.Parameter(torch.zeros(1, 32, embed_dim), requires_grad=True)
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         self.rel_pos_bias = None
@@ -552,7 +553,8 @@ class NeuralTransformer_Cbramod3lyClassifier_BCE(nn.Module):
             self.pos_embed = nn.Parameter(torch.zeros(1, 128 + 1, embed_dim), requires_grad=True)
         else:
             self.pos_embed = None
-        self.time_embed = nn.Parameter(torch.zeros(1, 16, embed_dim), requires_grad=True)
+        # Extended time_embed from 16 to 32 to support longer sequences (e.g., Sleep dataset with 30 time windows)
+        self.time_embed = nn.Parameter(torch.zeros(1, 32, embed_dim), requires_grad=True)
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         self.rel_pos_bias = None
