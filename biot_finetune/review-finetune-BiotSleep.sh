@@ -15,7 +15,7 @@ layers=3ly
 
 lr=0.001
 wd=0.00001
-bs=64
+bs=512
 
 freeze_type=all
 
