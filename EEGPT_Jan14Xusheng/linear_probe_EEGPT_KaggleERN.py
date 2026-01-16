@@ -112,7 +112,7 @@ accelerator = "cuda"
 devices = [0]   # 根据你机器的 GPU id 修改
 
 # ====== 超参数搜索范围（可选）======
-BS_LIST = [6]#[128, 64, 32]
+BS_LIST = [128, 64, 32]
 LR_LIST = [1e-3, 4e-4, 1e-4]
 WD_LIST = [1e-2, 1e-3]
 
