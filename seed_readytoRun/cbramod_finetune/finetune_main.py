@@ -6,9 +6,9 @@ import os
 import numpy as np
 import torch
 
-from datasets import motortask_dataset, seed_emotion_dataset
+from datasets import motortask_dataset, seed_emotion_dataset, sleep_dataset
 from finetune_trainer import Trainer
-from models import model_for_motortask, model_for_seed_emotion
+from models import model_for_motortask, model_for_seed_emotion, model_for_sleep
 
 def save_config(params):
     """Saves the configuration parameters to a YAML file."""
@@ -55,7 +55,7 @@ def main():
     """############ Downstream dataset settings ############"""
     parser.add_argument('--downstream_dataset', type=str, default='FACED',
                         help='[FACED, SEED-V, PhysioNet-MI, SHU-MI, ISRUC, CHB-MIT, BCIC2020-3, Mumtaz2016, '
-                             'SEED-VIG, MentalArithmetic, TUEV, TUAB, BCIC-IV-2a, CustomStress, KaggleERN, MotorTask, SEED-Emotion]')
+                             'SEED-VIG, MentalArithmetic, TUEV, TUAB, BCIC-IV-2a, CustomStress, KaggleERN, MotorTask, SEED-Emotion, Sleep]')
     parser.add_argument('--datasets_dir', type=str,
                         default='/data/datasets/BigDownstream/Faced/processed',
                         help='datasets_dir')
@@ -203,6 +203,13 @@ def main():
         load_dataset = seed_emotion_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_seed_emotion.Model(params)
+        save_architecture(model, params.model_dir)
+        t = Trainer(params, data_loader, model)
+        t.train_for_multiclass()
+    elif params.downstream_dataset == 'Sleep':
+        load_dataset = sleep_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_sleep.Model(params)
         save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_multiclass()
