@@ -4,7 +4,7 @@ set -e
 # cd /work/HHRI-AI/YW/Yirong/LaBramFinetune/
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 dataset=Sleep
-dataset_path=/home/dung/Documents/EEG-Review-Paper-Repo/isruc_labram
+dataset_path=/home/dung/Documents/EEG-Review-Paper-Repo/data/isruc_labram
 chan_size=6
 gpu_id=0
 seed=0
@@ -14,7 +14,7 @@ num_classes=5
 #---------           - 1 層 Classifier -------------#
 # 1. 只訓練頭, 1層
 
-model_type=3ly
+model_type=1ly
 
 # epochs=50
 # lr=1e-3 # 5e-4
@@ -148,7 +148,7 @@ model_type=3ly
 #      echo "BatchSize: ${bs}, LearningRate: ${lr}, WeightDecay: ${wd}"
 #      echo "Exp Name: ${exp_name}"
 #      echo "-------------------------------"
-#      CUDA_VISIBLE_DEVICES=${gpu_id} python run_class_finetuning.py \
+#      CUDA_VISIBLE_DEVICES=${gpu_id} /home/dung/Documents/EEG-Review-Paper-Repo/siwen_labram_finetune/.labram/bin/python3 run_class_finetuning.py \
 #             --output_dir ./checkpoints/${dataset}_search-noPosWeight/${exp_name}-${model_type}-${freeze_type} \
 #             --log_dir ./log/${dataset}_search-noPosWeight/${exp_name}-${model_type}-${freeze_type} \
 #             --dataset_path ${dataset_path} \
@@ -212,7 +212,7 @@ for bs in "${BS_LIST[@]}"; do
      echo "BatchSize: ${bs}, LearningRate: ${lr}, WeightDecay: ${wd}"
      echo "Exp Name: ${exp_name}"
      echo "-------------------------------"
-     CUDA_VISIBLE_DEVICES=${gpu_id} python run_class_finetuning.py \
+     CUDA_VISIBLE_DEVICES=${gpu_id} /home/dung/Documents/EEG-Review-Paper-Repo/siwen_labram_finetune/.labram/bin/python3 run_class_finetuning.py \
           --output_dir ./checkpoints/${dataset}_search-noPosWeight/${exp_name}-${model_type}-${freeze_type} \
           --log_dir ./log/${dataset}_search-noPosWeight/${exp_name}-${model_type}-${freeze_type} \
           --dataset_path ${dataset_path} \
@@ -220,7 +220,7 @@ for bs in "${BS_LIST[@]}"; do
           ${FREEZE_ARG} \
           --finetune ./checkpoints/labram-base.pth \
           --model ${MODEL_ARG} \
-          --classifier_window_size 5 \
+          --classifier_window_size 30 \
           --batch_size ${bs} \
           --lr ${lr} \
           --weight_decay ${wd} \

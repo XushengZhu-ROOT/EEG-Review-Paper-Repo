@@ -62,9 +62,10 @@ class LitModel_finetune(pl.LightningModule):
 
         result = np.concatenate(result, axis=0)
         result = multiclass_metrics_fn(
-            gt, result, metrics=["accuracy", "cohen_kappa", "f1_weighted"]
+            gt, result, metrics=["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
         )
         self.log("val_acc", result["accuracy"], sync_dist=True)
+        self.log("val_balanced_acc", result["balanced_accuracy"], sync_dist=True)
         self.log("val_cohen", result["cohen_kappa"], sync_dist=True)
         self.log("val_f1", result["f1_weighted"], sync_dist=True)
         print(result)
@@ -86,9 +87,10 @@ class LitModel_finetune(pl.LightningModule):
 
         result = np.concatenate(result, axis=0)
         result = multiclass_metrics_fn(
-            gt, result, metrics=["accuracy", "cohen_kappa", "f1_weighted"]
+            gt, result, metrics=["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
         )
         self.log("test_acc", result["accuracy"], sync_dist=True)
+        self.log("test_balanced_acc", result["balanced_accuracy"], sync_dist=True)
         self.log("test_cohen", result["cohen_kappa"], sync_dist=True)
         self.log("test_f1", result["f1_weighted"], sync_dist=True)
 
@@ -112,7 +114,7 @@ def prepare_ISRUC_dataloader(args):
     np.random.seed(seed)
 
     dataset_paths = {
-        "ISRUC": "/home/dung/Documents/EEG-Review-Paper-Repo/data/isruc_biot"
+        "ISRUC": "/home/dung/Documents/EEG-Review-Paper-Repo/preprocessing/data/isruc_biot"
     }
     if args.dataset not in dataset_paths:
         raise ValueError(f"Undefined dataset: {args.dataset}")
@@ -376,6 +378,13 @@ def supervised(args):
             print(f"load pretrain model from {args.pretrain_model_path}")
     else:
         raise NotImplementedError
+    
+    if args.freeze_backbone:
+        print("Freezing parameters for model.biot...")
+        for param in model.biot.parameters():
+            param.requires_grad = False
+        print("Parameters frozen.")
+
     lightning_model = LitModel_finetune(args, model)
 
     # logger and callbacks
@@ -476,6 +485,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--output_dir", type=str, default="./", help="saved model path"
+    )
+    parser.add_argument(
+        "--freeze_backbone",
+        action="store_true",
+        help="Freeze the backbone during training (default: False)."
     )
     args = parser.parse_args()
     if args.dataset_channels is None:

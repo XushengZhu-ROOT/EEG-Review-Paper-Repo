@@ -14,13 +14,14 @@ output_dir=${dataset}-posWeight${pos_weight}-rerun
 
 gpu_id=0
 dataset_channels=6
-sample_length=5
+sample_length=30
 epochs=50
 pretrain_model_channels=16
 pretrain_path=pretrained-models/EEG-PREST-${pretrain_model_channels}-channels.ckpt
-classifier_type=CBraMod_3lyStyle_LayerNorm-BIOT # 3層
-layers=3ly
+classifier_type=LabramClassifier-BIOT # CBraMod_3lyStyle_LayerNorm-BIOT # 3層
+layers=3ly # 3ly
 n_classes=5
+freeze_type=all # linear_probe
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
 # lr=0.001
@@ -28,13 +29,12 @@ export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 # bs=512
 # pos_weight=0.413
 
-# freeze_type=all
 
-# if [ "${freeze_type}" = "linear_probe" ]; then
-#     FREEZE_ARG="--freeze_backbone"
-# else
-#     FREEZE_ARG=""
-# fi
+if [ "${freeze_type}" = "linear_probe" ]; then
+    FREEZE_ARG="--freeze_backbone"
+else
+    FREEZE_ARG=""
+fi
 
 # exp_name=exp_author_config-${classifier_type}_${layers}-${freeze_type}
 

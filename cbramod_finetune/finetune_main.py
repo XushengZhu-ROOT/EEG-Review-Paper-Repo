@@ -50,7 +50,7 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
     parser.add_argument('--classifier', type=str, default='all_patch_reps',
                         help='[all_patch_reps, all_patch_reps_twolayer, '
-                             'all_patch_reps_onelayer, avgpooling_patch_reps]')
+                             'all_patch_reps_onelayer, avgpooling_patch_reps, Labram_style_classifier]')
     # all_patch_reps: use all patch features with a three-layer classifier;
     # all_patch_reps_twolayer: use all patch features with a two-layer classifier;
     # all_patch_reps_onelayer: use all patch features with a one-layer classifier;

@@ -7,12 +7,12 @@ dataset_path=/home/dung/Documents/EEG-Review-Paper-Repo/data/isruc_cbramod
 exp_name=exp_author_config
 gpu_id=0
 chan_size=6
-window_size=5
+window_size=30
 epochs=50
 num_classes=5
-classifier=all_patch_reps #Labram_style_classifier # 1層
+classifier=all_patch_reps # 3 Labram_style_classifier # 1層 
 seed=0
-freeze_type=linear_probe
+freeze_type=all # linear_probe
 
 #--------- STRESS - Linear Probe (只訓練頭) ---------#
 #---------           - author config (一組) -------------#

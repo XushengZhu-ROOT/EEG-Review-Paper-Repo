@@ -266,7 +266,7 @@ class NeuralTransformer(nn.Module):
                  num_heads=10, mlp_ratio=4., qkv_bias=False, qk_norm=None, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None,
                  use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False,
-                 use_mean_pooling=True, init_scale=0.001, **kwargs):
+                 use_mean_pooling=True, init_scale=0.001, time_window=None, **kwargs):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
@@ -275,7 +275,7 @@ class NeuralTransformer(nn.Module):
         # For the neural decoder, use linear projection (PatchEmbed) to project codebook dimension to hidden dimension.
         # Otherwise, use TemporalConv to extract temporal features from EEG signals.
         self.patch_embed = TemporalConv(out_chans=out_chans) if in_chans == 1 else PatchEmbed(EEG_size=EEG_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
-        self.time_window = EEG_size // patch_size
+        self.time_window = time_window if time_window is not None else EEG_size // patch_size
         self.patch_size = patch_size
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -284,7 +284,7 @@ class NeuralTransformer(nn.Module):
             self.pos_embed = nn.Parameter(torch.zeros(1, 128 + 1, embed_dim), requires_grad=True)
         else:
             self.pos_embed = None
-        self.time_embed = nn.Parameter(torch.zeros(1, 16, embed_dim), requires_grad=True)
+        self.time_embed = nn.Parameter(torch.zeros(1, self.time_window, embed_dim), requires_grad=True)
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         self.rel_pos_bias = None
@@ -516,7 +516,7 @@ class NeuralTransformer_Cbramod3lyClassifier_BCE(nn.Module):
             self.pos_embed = nn.Parameter(torch.zeros(1, 128 + 1, embed_dim), requires_grad=True)
         else:
             self.pos_embed = None
-        self.time_embed = nn.Parameter(torch.zeros(1, 16, embed_dim), requires_grad=True)
+        self.time_embed = nn.Parameter(torch.zeros(1, window_size, embed_dim), requires_grad=True)
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         self.rel_pos_bias = None

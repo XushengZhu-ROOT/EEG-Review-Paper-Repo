@@ -261,6 +261,7 @@ def get_models(args):
             use_abs_pos_emb=args.abs_pos_emb,
             init_values=args.layer_scale_init_value,
             qkv_bias=args.qkv_bias,
+            time_window=args.classifier_window_size,
         )
 
     return model
