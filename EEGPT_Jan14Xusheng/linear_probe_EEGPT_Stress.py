@@ -42,10 +42,25 @@ import glob
 import pickle
 
 
+def temporal_interpolation(x, desired_sequence_length, mode='nearest', use_avg=True):
+    # print(x.shape)
+    # squeeze and unsqueeze because these are done before batching
+    if use_avg:
+        x = x - torch.mean(x, dim=-2, keepdim=True)
+    if len(x.shape) == 2:
+        return torch.nn.functional.interpolate(x.unsqueeze(0), desired_sequence_length, mode=mode).squeeze(0)
+    # Supports batch dimension
+    elif len(x.shape) == 3:
+        return torch.nn.functional.interpolate(x, desired_sequence_length, mode=mode)
+    else:
+        raise ValueError("TemporalInterpolation only support sequence of single dim channels with optional batch")
+
+
 # ==================== 数据相关配置 ====================
 # Stress 任务：
 # - 二分类（0, 1）
-# - 5 秒，采样率 256 Hz -> 时间长度 1280
+# - 原始数据：5 秒，采样率 200 Hz -> 时间长度 1000
+# - 插值后：5 秒，采样率 256 Hz -> 时间长度 1280
 # - 30 通道
 
 use_channels_names = [
@@ -99,7 +114,7 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
     """
     从 Stress_data/{split}/*.pickle 读取数据。
     每个 pickle 是一个 dict:
-        - 'X': ndarray, shape (30, 1280)
+        - 'X': ndarray, shape (30, 1000) - 原始数据 5秒@200Hz
         - 'y' : int, 0 或 1
     """
     def __init__(self, root_dir: str, split: str = "train", expected_channels: int = 30, target_channels: int = 30):
@@ -151,7 +166,7 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
         with open(path, "rb") as f:
             obj = pickle.load(f)
 
-        x = obj["X"]   # (30, 1280) 30通道，5秒@256Hz
+        x = obj["X"]   # (30, 1000) 30通道，5秒@200Hz
         y = obj["y"]    # int 0 或 1
 
         # 检查通道数
@@ -159,7 +174,7 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
             raise ValueError(f"Expected {self.expected_channels} channels, got {x.shape[0]}")
         
         # Stress数据使用全部30个通道，不需要丢弃
-        x = x[:self.target_channels, :]  # (30, 1280)
+        x = x[:self.target_channels, :]  # (30, 1000)
         
         # 数据清理：NaN/Inf处理
         x = np.nan_to_num(x, posinf=0.0, neginf=0.0)
@@ -291,7 +306,8 @@ class LitEEGPTCausal(pl.LightningModule):
         B, C, T = x.shape
         x = x/100
         x = x - x.mean(dim=-2, keepdim=True)
-        # Stress 数据为 5s(1280)，不需要插值，直接使用原始长度
+        # Stress 数据原始为 (30, 1000) @200Hz，需要插值到 (30, 1280) @256Hz
+        x = temporal_interpolation(x, 5*256)
         x = self.chan_conv(x)
         # 线性 probe 时保持 encoder 在 eval 模式；全微调时交给 Lightning 控制
         if self.freeze_encoder:
