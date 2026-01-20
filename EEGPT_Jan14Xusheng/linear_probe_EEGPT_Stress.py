@@ -486,19 +486,19 @@ class LitEEGPTCausal(pl.LightningModule):
         label = torch.cat(label, dim=0)        # (N,)
         y_score = torch.cat(y_score, dim=0)    # (N, num_classes)
         
-        # 计算训练集多分类指标
+        # 二分类预测类别（用于混淆矩阵）
         y_pred = torch.argmax(y_score, dim=-1).numpy()
         label_np = label.numpy()
         
-        metric_list = [
-            "accuracy",
-            "balanced_accuracy",
-            "cohen_kappa",
-            "f1_macro",
-            "f1_weighted",
-            "f1_micro",
-        ]
-        results = get_metrics(y_score.numpy(), label_np, metric_list, is_binary=True)
+        # 计算二分类指标（使用 sklearn，与 validation/test 保持一致）
+        results = {
+            "accuracy": float(accuracy_score(label_np, y_pred)),
+            "balanced_accuracy": float(balanced_accuracy_score(label_np, y_pred)),
+            "cohen_kappa": float(cohen_kappa_score(label_np, y_pred)),
+            "f1_macro": float(f1_score(label_np, y_pred, average="macro")),
+            "f1_weighted": float(f1_score(label_np, y_pred, average="weighted")),
+            "f1_micro": float(f1_score(label_np, y_pred, average="micro")),
+        }
         
         # 计算混淆矩阵
         from sklearn.metrics import confusion_matrix
