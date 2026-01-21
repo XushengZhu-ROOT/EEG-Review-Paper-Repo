@@ -303,19 +303,24 @@ class LitEEGPTCausal(pl.LightningModule):
         embed_num = 4
         embed_dim = 512
         
+        # 为了减少参数量，在输入分类器之前会对时间维度做平均池化
+        # 将N从120降到1，这样可以大幅减少参数量
+        # 分类器设计时使用N_pooled=1（pooling后的N值）
+        self.N_pooled = 1  # pooling后的N值
+        
         # 分类头：直接展平所有维度，然后通过Linear层
-        # Layer 1: (N * embed_num * embed_dim) -> (N * embed_dim)
-        # Layer 2: (N * embed_dim) -> embed_dim
+        # Layer 1: (N_pooled * embed_num * embed_dim) -> (N_pooled * embed_dim)
+        # Layer 2: (N_pooled * embed_dim) -> embed_dim
         # Layer 3: embed_dim -> num_classes
         self.classifier = nn.Sequential(
-            # Reshape: (B, N, embed_num, embed_dim) -> (B, N * embed_num * embed_dim)
+            # Reshape: (B, N_pooled, embed_num, embed_dim) -> (B, N_pooled * embed_num * embed_dim)
             Rearrange('b n e d -> b (n e d)'),
-            # Layer 1: (N * embed_num * embed_dim) -> (N * embed_dim)
-            nn.Linear(self.N * embed_num * embed_dim, self.N * embed_dim),
+            # Layer 1: (N_pooled * embed_num * embed_dim) -> (N_pooled * embed_dim)
+            nn.Linear(self.N_pooled * embed_num * embed_dim, self.N_pooled * embed_dim),
             nn.ELU(),
             nn.Dropout(0.1),
-            # Layer 2: (N * embed_dim) -> embed_dim
-            nn.Linear(self.N * embed_dim, embed_dim),
+            # Layer 2: (N_pooled * embed_dim) -> embed_dim
+            nn.Linear(self.N_pooled * embed_dim, embed_dim),
             nn.ELU(),
             nn.Dropout(0.1),
             # Layer 3: embed_dim -> num_classes
@@ -347,9 +352,13 @@ class LitEEGPTCausal(pl.LightningModule):
             self.target_encoder.eval()
         z = self.target_encoder(x, self.chans_id.to(x))
         
-        # z 的 shape: (B, N, embed_num, embed_dim) = (B, N, 4, 512)
-        # 直接传入classifier，内部会使用Rearrange展平
-        h = self.classifier(z)
+        # z 的 shape: (B, N, embed_num, embed_dim) = (B, 120, 4, 512)
+        # 为了减少参数量，对时间维度N做全局平均池化
+        # (B, 120, 4, 512) -> (B, 4, 512) -> (B, 1, 4, 512)
+        z_pooled = z.mean(dim=1, keepdim=True)  # (B, 120, 4, 512) -> (B, 1, 4, 512)
+        
+        # 传入classifier，分类器的N_pooled=1，所以输入是(B, 1, 4, 512)
+        h = self.classifier(z_pooled)
         
         return x, h
 
