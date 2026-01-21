@@ -210,7 +210,7 @@ class LitEEGPTCausal(pl.LightningModule):
             patch_size=32*2,  # 64
             embed_num=4,
             embed_dim=512,
-            depth=8,
+            depth=7,  # 从8改为7，因为显存不够
             num_heads=8,
             mlp_ratio=4.0,
             drop_rate=0.0,
@@ -235,7 +235,43 @@ class LitEEGPTCausal(pl.LightningModule):
             if k.startswith("target_encoder."):
                 target_encoder_stat[k[15:]]=v
         
-        self.target_encoder.load_state_dict(target_encoder_stat)
+        # 如果模型depth小于预训练模型，需要过滤掉多余的层
+        # 例如：depth=7时，需要过滤掉blocks.7的权重（因为blocks索引是0-6，共7层）
+        model_depth = len(target_encoder.blocks) if hasattr(target_encoder, 'blocks') else 7
+        filtered_stat = {}
+        skipped_keys = []
+        for k, v in target_encoder_stat.items():
+            # 检查是否超出当前模型depth的权重
+            # 如果当前模型depth=7（blocks.0到blocks.6），需要跳过blocks.7及以上的权重
+            # 解析block索引：blocks.7.xxx -> 7
+            if 'blocks.' in k:
+                try:
+                    # 提取block编号，例如 "blocks.7.norm1.weight" -> 7
+                    block_idx = int(k.split('blocks.')[1].split('.')[0])
+                    if block_idx >= model_depth:
+                        skipped_keys.append(k)
+                        continue
+                except (ValueError, IndexError):
+                    # 如果解析失败，保留该键（可能是其他相关的键）
+                    pass
+            filtered_stat[k] = v
+        
+        if skipped_keys and self.debug:
+            print(f"[Debug] 跳过 {len(skipped_keys)} 个不匹配的权重键（depth不匹配）")
+            if len(skipped_keys) <= 10:
+                print(f"[Debug] 跳过的键: {skipped_keys[:10]}")
+        
+        # 使用strict=False允许部分权重不匹配（用于depth不匹配的情况）
+        missing_keys, unexpected_keys = self.target_encoder.load_state_dict(filtered_stat, strict=False)
+        if self.debug:
+            if missing_keys:
+                print(f"[Debug] 缺失的权重键数量: {len(missing_keys)}")
+                if len(missing_keys) <= 5:
+                    print(f"[Debug] 缺失的键: {missing_keys[:5]}")
+            if unexpected_keys:
+                print(f"[Debug] 意外的权重键数量: {len(unexpected_keys)}")
+                if len(unexpected_keys) <= 5:
+                    print(f"[Debug] 意外的键: {unexpected_keys[:5]}")
 
         # 线性 probe 时冻结 encoder 参数
         if self.freeze_encoder:
