@@ -40,9 +40,16 @@ class Evaluator:
         f1_weighted = f1_score(truths, preds, average='weighted')
         # ===== [R1] Macro F1 + Per-class Recall（审稿要求的扩展指标）=====
         f1_macro = f1_score(truths, preds, average='macro')
-        per_class_recall = recall_score(truths, preds, average=None, zero_division=0)
+        # labels 显式固定为 0..num_of_classes-1：某些受试者某个类别的样本数
+        # 为 0（如 MotorTask 的 Sub05 完全没有 Horizontal 这一类），若不传
+        # labels，sklearn 会按 truths/preds 里实际出现的类别数推断形状，
+        # 使 per_class_recall 少一维、cm 变成非 num_of_classes x num_of_classes——
+        # 前者会让下游按位置 zip(class_names, per_class_recall) 错位，
+        # 后者会让下游按固定 class_names 画热力图时形状对不上。
+        labels = list(range(self.params.num_of_classes))
+        per_class_recall = recall_score(truths, preds, labels=labels, average=None, zero_division=0)
         kappa = cohen_kappa_score(truths, preds)
-        cm = confusion_matrix(truths, preds)
+        cm = confusion_matrix(truths, preds, labels=labels)
 
         # 默认仍返回 weighted F1，保持旧 random_epoch 实验日志可对比；
         # subject_independent 时额外打印审稿指标，并返回 macro F1。

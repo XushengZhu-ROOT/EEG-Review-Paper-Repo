@@ -357,7 +357,11 @@ class LitModel_finetune(pl.LightningModule):
                 metrics=["accuracy", "f1_macro", "f1_weighted", "cohen_kappa"],
             )
             val_result["balanced_accuracy"] = balanced_accuracy_score(targets, pred_classes)
-            cm = confusion_matrix(targets, pred_classes)
+            # labels 显式固定为 0..n_classes-1：某折的 val/test 受试者可能完全
+            # 没有某一类样本（如 Motion 的 Sub05 没有 Horizontal），不传 labels
+            # 会让 sklearn 按这批数据里实际出现的类别数推断形状，cm 可能不是
+            # n_classes x n_classes。
+            cm = confusion_matrix(targets, pred_classes, labels=list(range(self.args.n_classes)))
             val_result["confusion_matrix"] = cm.tolist()
             
             if len(self.val_epoch_ids) > 0:
@@ -505,7 +509,9 @@ class LitModel_finetune(pl.LightningModule):
                 metrics=["accuracy", "f1_macro", "f1_weighted", "cohen_kappa"],
             )
             test_result["balanced_accuracy"] = balanced_accuracy_score(targets, pred_classes)
-            cm = confusion_matrix(targets, pred_classes)
+            # 见 on_validation_epoch_end 里同样的说明：labels 显式固定为
+            # 0..n_classes-1，避免某折 val/test 受试者缺某一类时 cm 形状变小。
+            cm = confusion_matrix(targets, pred_classes, labels=list(range(self.args.n_classes)))
             test_result["confusion_matrix"] = cm.tolist()
 
         # 根据是否有视频级别指标来决定log哪个
@@ -656,9 +662,11 @@ class LitModel_finetune(pl.LightningModule):
                 metrics=["accuracy", "f1_macro", "f1_weighted", "cohen_kappa"],
             )
             test_result["balanced_accuracy"] = balanced_accuracy_score(targets, pred_classes)
-            cm = confusion_matrix(targets, pred_classes)
+            # 见 on_validation_epoch_end 里同样的说明：labels 显式固定为
+            # 0..n_classes-1，避免某折 val/test 受试者缺某一类时 cm 形状变小。
+            cm = confusion_matrix(targets, pred_classes, labels=list(range(self.args.n_classes)))
             test_result["confusion_matrix"] = cm.tolist()
-            
+
             # 计算分类报告
             try:
                 class_report = classification_report(

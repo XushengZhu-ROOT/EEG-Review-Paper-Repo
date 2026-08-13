@@ -23,7 +23,7 @@ from sklearn.metrics import (
 )
 
 
-def compute_metrics(npz_path):
+def compute_metrics(npz_path, n_classes):
     data = np.load(npz_path, allow_pickle=False)
     for key in ("sample_id", "y_true", "y_pred", "y_prob", "subject_id"):
         if key not in data:
@@ -49,6 +49,12 @@ def compute_metrics(npz_path):
         n_mismatch = int((prob_argmax != y_pred).sum())
         raise ValueError(f"{npz_path}: y_prob.argmax() != y_pred for {n_mismatch}/{n} samples")
 
+    # labels 显式固定为 0..n_classes-1：某个 fold 的 test/val 受试者可能完全没有
+    # 某一类的样本（如 MotorTask 的 Sub05 没有 Horizontal），不传 labels 的话
+    # sklearn 会按这个文件里实际出现的类别数推断形状，per_class_recall/
+    # confusion_matrix 就可能比 n_classes 小一维，跨文件比较或求和时对不上。
+    labels = list(range(n_classes))
+
     metrics = {
         "n_samples": n,
         "n_subjects": int(len(np.unique(subject_id))),
@@ -56,8 +62,8 @@ def compute_metrics(npz_path):
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "kappa": float(cohen_kappa_score(y_true, y_pred)),
         "macro_f1": float(f1_score(y_true, y_pred, average="macro")),
-        "per_class_recall": recall_score(y_true, y_pred, average=None, zero_division=0).tolist(),
-        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
+        "per_class_recall": recall_score(y_true, y_pred, labels=labels, average=None, zero_division=0).tolist(),
+        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=labels).tolist(),
     }
     return metrics
 
@@ -69,6 +75,7 @@ def main():
     group.add_argument("--npz_dir", type=str, help="Directory containing {task}_{model}_fold*.npz files")
     parser.add_argument("--task", type=str, default=None, help="Filter by task name (used with --npz_dir)")
     parser.add_argument("--model", type=str, default=None, help="Filter by model name (used with --npz_dir)")
+    parser.add_argument("--n_classes", type=int, default=6, help="Fixed number of classes (0..n_classes-1)")
     args = parser.parse_args()
 
     if args.npz:
@@ -82,7 +89,7 @@ def main():
     all_bacc = []
     for npz_path in npz_paths:
         print(f"\n=== {npz_path} ===")
-        m = compute_metrics(npz_path)
+        m = compute_metrics(npz_path, args.n_classes)
         print(f"  n_samples={m['n_samples']}  n_subjects={m['n_subjects']}")
         print(f"  accuracy={m['accuracy']:.4f}  balanced_accuracy={m['balanced_accuracy']:.4f}  "
               f"kappa={m['kappa']:.4f}  macro_f1={m['macro_f1']:.4f}")
