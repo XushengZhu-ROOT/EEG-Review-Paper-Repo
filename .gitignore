@@ -208,6 +208,9 @@ __marimo__/
 .DS_Store
 biot_finetune/log/
 biot_finetune/pretrained-models/
+biot_finetune/AllSubjects_Epochs/
+biot_finetune/fold_results_biot/
+biot_finetune/fold_results_biot_smoke/
 labram_finetune/checkpoints/
 
 # cbramod_finetune: raw data / pretrained weights / experiment outputs — regenerate or

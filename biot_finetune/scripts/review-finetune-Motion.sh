@@ -1,7 +1,10 @@
 #!/bin/bash
 set -e
 
-cd /home/xuz056/LEM/motor/test_pipeline/biot_st/
+# Repo root is one level up from this script (scripts/../), resolved from
+# the script's own location so this works regardless of who clones it or
+# where to.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 dataset=Motion
 gpu_id=0
