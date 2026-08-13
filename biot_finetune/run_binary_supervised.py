@@ -14,7 +14,57 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pyhealth.metrics import binary_metrics_fn
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    roc_auc_score,
+    average_precision_score
+)
+
+
+def binary_metrics_fn(y_true, y_pred_proba, metrics=None, threshold=0.5):
+    """
+    使用 sklearn 实现二分类指标计算
+    替换 pyhealth.metrics.binary_metrics_fn
+    
+    Args:
+        y_true: 真实标签 (1D array)
+        y_pred_proba: 预测概率 (1D array)
+        metrics: 要计算的指标列表
+        threshold: 二分类阈值
+    
+    Returns:
+        dict: 包含各项指标的字典
+    """
+    if metrics is None:
+        metrics = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
+    
+    # 使用阈值转换为二分类预测
+    y_pred = (y_pred_proba >= threshold).astype(int)
+    
+    result = {}
+    
+    if "accuracy" in metrics:
+        result["accuracy"] = accuracy_score(y_true, y_pred)
+    
+    if "balanced_accuracy" in metrics:
+        result["balanced_accuracy"] = balanced_accuracy_score(y_true, y_pred)
+    
+    if "roc_auc" in metrics:
+        try:
+            result["roc_auc"] = roc_auc_score(y_true, y_pred_proba)
+        except ValueError:
+            # 如果只有一个类别，返回 0.0
+            result["roc_auc"] = 0.0
+    
+    if "pr_auc" in metrics:
+        try:
+            result["pr_auc"] = average_precision_score(y_true, y_pred_proba)
+        except ValueError:
+            # 如果只有一个类别，返回 0.0
+            result["pr_auc"] = 0.0
+    
+    return result
 
 from model import (
     SPaRCNet,

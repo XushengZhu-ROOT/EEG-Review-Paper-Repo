@@ -1,23 +1,23 @@
 #!/bin/bash
 set -e
 
-dataset=BiotSleep
+dataset=SEED
 gpu_id=0
 
-dataset_channels=6
-sample_length=30
+dataset_channels=62
+sample_length=4
 epochs=50
 pretrain_model_channels=16
 pretrain_path=pretrained-models/EEG-PREST-${pretrain_model_channels}-channels.ckpt
 
 classifier_type=CBraMod_3lyStyle_LayerNorm-BIOT
-layers=3ly
+layers="3ly"
 
 lr=0.001
 wd=0.00001
-bs=64
+bs=256
 
-freeze_type=all
+freeze_type=linear_probe
 
 if [ "${freeze_type}" = "linear_probe" ]; then
     FREEZE_ARG="--freeze_backbone"
@@ -29,17 +29,16 @@ output_dir=${dataset}-${classifier_type}
 exp_name=exp_author_config-${classifier_type}_${layers}-${freeze_type}
 
 echo "===================================================="
-echo "Running BiotSleep Author Config: ${exp_name}"
+echo "Running SEED Author Config: ${exp_name}"
 echo "Dataset: ${dataset}"
 echo "Channels: ${dataset_channels}"
-echo "Classes: 5"
-echo "Sample Length: ${sample_length}s (30s @ 200Hz = 6000 points)"
+echo "Classes: 6"
 echo "===================================================="
 
 CUDA_VISIBLE_DEVICES=${gpu_id} python run_multiclass_supervised.py \
     --exp_name ${exp_name} \
     --dataset ${dataset} \
-    --n_classes 5 \
+    --n_classes 6 \
     --dataset_channels ${dataset_channels} \
     --in_channels ${pretrain_model_channels} \
     --sampling_rate 200 \
@@ -56,36 +55,33 @@ CUDA_VISIBLE_DEVICES=${gpu_id} python run_multiclass_supervised.py \
     ${FREEZE_ARG}
 
 
-# HPO (Hyperparameter Optimization) section - commented out by default
-# Uncomment to run hyperparameter search
-
-# BS_LIST=(256 512 1024)
+# BS_LIST=(256 512)
 # LR_LIST=(0.005 0.001 0.0005)
 # WD_LIST=(0.001 0.00001)
-# 
+
 # count=0
-# 
+
 # echo "===================================================="
-# echo "Starting BiotSleep HPO sweep..."
+# echo "Starting SEED HPO sweep..."
 # echo "===================================================="
-# 
+
 # for bs in "${BS_LIST[@]}"; do
 #   for lr in "${LR_LIST[@]}"; do
 #     for wd in "${WD_LIST[@]}"; do
 #         count=$((count + 1))
 #         exp_name=exp_hpo${count}-${classifier_type}_${layers}-${freeze_type}
-# 
+
 #         echo "================================================================"
 #         echo "Running HPO experiment: ${exp_name}"
 #         echo "Batch Size (bs): ${bs}"
 #         echo "Learning Rate (lr): ${lr}"
 #         echo "Weight Decay (wd): ${wd}"
 #         echo "================================================================"
-# 
+
 #         CUDA_VISIBLE_DEVICES=${gpu_id} python run_multiclass_supervised.py \
 #             --exp_name ${exp_name} \
 #             --dataset ${dataset} \
-#             --n_classes 5 \
+#             --n_classes 6 \
 #             --dataset_channels ${dataset_channels} \
 #             --in_channels ${pretrain_model_channels} \
 #             --sampling_rate 200 \
@@ -100,9 +96,10 @@ CUDA_VISIBLE_DEVICES=${gpu_id} python run_multiclass_supervised.py \
 #             --pretrain_model_path ${pretrain_path} \
 #             --output_dir ${dataset}-HPO \
 #             ${FREEZE_ARG}
-# 
+
 #         echo "--- Finished HPO experiment: ${exp_name} ---"
 #         echo ""
 #     done
 #   done
 # done
+

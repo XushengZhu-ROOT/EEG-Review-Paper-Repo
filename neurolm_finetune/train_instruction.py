@@ -20,14 +20,58 @@ from model.model_neurolm import NeuroLM
 from model.model import GPTConfig
 from pathlib import Path
 import tiktoken
-from utils import prepare_KaggleERN_dataset, prepare_STRESS_dataset, prepare_TUAB_dataset, prepare_TUEV_dataset, prepare_TUSL_dataset, prepare_HMC_dataset, prepare_Workload_dataset, prepare_SEED7_dataset, prepare_motor_dataset, cosine_scheduler, get_metrics #, prepare_KaggleERN_dataset
-from downstream_dataset import SEEDDataset
+from utils import prepare_KaggleERN_dataset, prepare_STRESS_dataset, prepare_SEED7_dataset, prepare_motor_dataset, prepare_sleep_dataset, cosine_scheduler, get_metrics
 from torch.utils.data.dataset import ConcatDataset
 
 
 master_process = None; device = None; dtype = None
 ctx = None; ddp_rank = None; device_type = None
 ddp = None; ddp_world_size = None; ddp_local_rank = None
+
+def make_json_serializable(obj):
+    """递归把 numpy 标量/数组等转成可 json.dumps 的 Python 原生类型。"""
+    try:
+        import numpy as _np
+    except Exception:
+        _np = None
+
+    if _np is not None:
+        if isinstance(obj, (_np.integer,)):
+            return int(obj)
+        if isinstance(obj, (_np.floating,)):
+            return float(obj)
+        if isinstance(obj, _np.ndarray):
+            return obj.tolist()
+
+    if isinstance(obj, dict):
+        return {str(k): make_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_json_serializable(v) for v in obj]
+    return obj
+
+def _print_confusion_matrices(results, dataset_info, split_name):
+    """把任意 *confusion_matrix* 字段按行打印，避免一行挤爆。"""
+    label_names = dataset_info.get('label_names', None)
+    matrix_keys = [k for k in results.keys() if 'confusion_matrix' in k and not k.endswith('_labels')]
+    for mk in sorted(matrix_keys):
+        labels_key = mk + "_labels" if (mk + "_labels") in results else (mk.replace("confusion_matrix", "confusion_matrix_labels"))
+        cm = results.get(mk, None)
+        if cm is None:
+            continue
+        labels = results.get(labels_key, None)
+        print(f"Confusion Matrix ({split_name}) - {mk}:")
+        if labels is not None:
+            if label_names is not None:
+                # label_names 是按 class id 顺序的
+                try:
+                    names = [label_names[i] for i in labels]
+                except Exception:
+                    names = label_names
+                print(f"Labels: {names}")
+            else:
+                print(f"Labels: {labels}")
+        for row in cm:
+            print(row)
 
 
 def init(args):
@@ -65,31 +109,10 @@ def init(args):
 
 def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_max_len=-1):
         dataset_info = {'name': downstream_dataset}
-        if downstream_dataset == 'SEED':
-            dataset_train = SEEDDataset(Path(args.dataset_dir, 'h5data/seed-3.hdf5'), window_size=800, stride_size=800, trial_start_percentage=0, 
-                                        trial_end_percentage=0.6, is_instruct=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-            dataset_val = SEEDDataset(Path(args.dataset_dir, 'h5data/seed-3.hdf5'), window_size=800, stride_size=800, trial_start_percentage=0.6, 
-                                    trial_end_percentage=0.8, is_instruct=True, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-            dataset_test = SEEDDataset(Path(args.dataset_dir, 'h5data/seed-3.hdf5'), window_size=800, stride_size=800, trial_start_percentage=0.8, 
-                                    trial_end_percentage=1, is_instruct=True, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-            
-            dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
-            dataset_info['is_binary'] = False
-            dataset_info['num_classes'] = 3
-            dataset_info['result_idx'] = 11
-            dataset_info['label_dic'] = {'Positive': 0, 'Neutral': 1, 'Negative': 2}
-        elif downstream_dataset == 'KaggleERN':
+        if downstream_dataset == 'KaggleERN':
             dataset_train, dataset_test, dataset_val = prepare_KaggleERN_dataset(Path(args.dataset_dir), chan_size=args.chan_size, is_instruct=True, 
                                                                             eeg_max_len=eeg_max_len, text_max_len=text_max_len)
             #TODO: 待修改
-            dataset_info['metrics'] = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
-            dataset_info['is_binary'] = True
-            dataset_info['result_idx'] = 9
-            dataset_info['label_dic'] = {'Yes': 1, 'No': 0}
-        elif downstream_dataset == 'KaggleERN':
-            dataset_train, dataset_test, dataset_val = prepare_KaggleERN_dataset(Path(args.dataset_dir), chan_size=args.chan_size, is_instruct=True, 
-                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-
             dataset_info['metrics'] = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
             dataset_info['is_binary'] = True
             dataset_info['result_idx'] = 9
@@ -102,61 +125,41 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             dataset_info['is_binary'] = True
             dataset_info['result_idx'] = 9
             dataset_info['label_dic'] = {'Yes': 1, 'No': 0}
-        elif downstream_dataset == 'TUAB':
-            dataset_train, dataset_test, dataset_val = prepare_TUAB_dataset(Path(args.dataset_dir, 'TUAB/processed'), is_instruct=True, 
-                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-
-            dataset_info['metrics'] = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
-            dataset_info['is_binary'] = True
-            dataset_info['result_idx'] = 7
-            dataset_info['label_dic'] = {'Yes': 1, 'No': 0}
-        elif downstream_dataset == 'TUEV':
-            dataset_train, dataset_test, dataset_val = prepare_TUEV_dataset(Path(args.dataset_dir, 'TUEV'), is_instruct=True, 
-                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-
-            dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
-            dataset_info['is_binary'] = False
-            dataset_info['num_classes'] = 6
-            dataset_info['result_idx'] = 34
-            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4, '(F)': 5}
-        elif downstream_dataset == 'TUSL':
-            dataset_train, dataset_test, dataset_val = prepare_TUSL_dataset(Path(args.dataset_dir, 'TUSL'), is_instruct=True, 
-                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-
-            dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
-            dataset_info['is_binary'] = False
-            dataset_info['num_classes'] = 3
-            dataset_info['result_idx'] = 17
-            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2}
-        elif downstream_dataset == 'HMC':
-            dataset_train, dataset_test, dataset_val = prepare_HMC_dataset(Path(args.dataset_dir, 'HMC'), is_instruct=True, 
-                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-
-            dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
-            dataset_info['is_binary'] = False
-            dataset_info['num_classes'] = 5
-            dataset_info['result_idx'] = 22
-            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4}
-        elif downstream_dataset == 'Workload':
-            dataset_train, dataset_test, dataset_val = prepare_Workload_dataset(Path(args.dataset_dir, 'EEGWorkload'), is_instruct=True, 
-                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
-
-            dataset_info['metrics'] = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
-            dataset_info['is_binary'] = True
-            dataset_info['result_idx'] = 9
-            dataset_info['label_dic'] = {'Yes': 1, 'No': 0}
         elif downstream_dataset == 'SEED7':
             dataset_train, dataset_test, dataset_val = prepare_SEED7_dataset(Path(args.dataset_dir), chan_size=args.chan_size, is_instruct=True, 
                                                                             eeg_max_len=eeg_max_len, text_max_len=text_max_len)
 
             dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
             dataset_info['is_binary'] = False
-            dataset_info['num_classes'] = 7
-            dataset_info['result_idx'] = 24  # Answer: (A) or (B) etc. position in the generated text (0-indexed)
-            # Generated text format: "Question: ... Options: (A) ... (G) ... Answer: (X) <|endoftext|>)"
-            # Answer "(X)" is at word index 24 (after splitting by space)
-            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4, '(F)': 5, '(G)': 6}
-            dataset_info['label_names'] = ['happy', 'sad', 'neutral', 'disgust', 'fear', 'surprise', 'anger']
+            dataset_info['num_classes'] = 6
+            dataset_info['result_idx'] = 22  # Answer: (X) is at word index 22 (0-indexed) after "Answer:"
+            # Generated text format: "Question: ... Options: (A) ... (F) ... Answer: (X) <|endoftext|>)"
+            # Answer "(X)" is at word index 22 (0-indexed, after splitting by space)
+            # Verified from debug output: "Answer:" is at index 21, answer label is at index 22
+            # Note: neutral class is excluded
+            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4, '(F)': 5}
+            dataset_info['label_names'] = ['happy', 'sad', 'disgust', 'fear', 'surprise', 'anger']
+            
+            # Debug: Print prompt format to verify result_idx calculation
+            # Commented out for production use - uncomment for debugging
+            # if master_process:
+            #     # Calculate result_idx based on prompt format
+            #     prompt_text = 'Question: Which emotion does this EEG segment express? Options: (A) happy. (B) sad. (C) disgust. (D) fear. (E) surprise. (F) anger. Answer: ('
+            #     words = prompt_text.split(' ')
+            #     # The answer format is "Answer: (X)" where X is the label
+            #     # In the generated text: "Answer: (C) <|endoftext|>", the answer (C) is at index 23 (0-indexed)
+            #     # Prompt has 23 words, so answer will be at index 23 in generated text
+            #     expected_result_idx = 23
+            #     
+            #     print(f"\n{'='*80}")
+            #     print("DEBUG: SEED7 Dataset Configuration - Prompt Format Analysis")
+            #     print(f"{'='*80}")
+            #     print(f"Prompt text: {prompt_text}")
+            #     print(f"Prompt words count: {len(words)}")
+            #     print(f"Configured result_idx: {dataset_info['result_idx']} (will be set dynamically during evaluation)")
+            #     print(f"Expected answer position in generated text: index {expected_result_idx} (Answer: (X))")
+            #     print(f"Note: result_idx will be automatically determined from first successful prediction during evaluation.")
+            #     print(f"{'='*80}\n")
         elif downstream_dataset == 'MOTOR':
             dataset_train, dataset_test, dataset_val = prepare_motor_dataset(Path(args.dataset_dir), is_instruct=True, 
                                                                             eeg_max_len=eeg_max_len, text_max_len=text_max_len)
@@ -169,6 +172,18 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             # Answer "(X)" is at word index 25 (after splitting by space, "Answer:" is at 24, label is at 25)
             dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4, '(F)': 5}
             dataset_info['label_names'] = ['Label0', 'Walk', '8', 'Horizontal', 'Vertical', 'Pick']
+        elif downstream_dataset == 'SLEEP':
+            dataset_train, dataset_test, dataset_val = prepare_sleep_dataset(Path(args.dataset_dir), is_instruct=True, 
+                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+
+            dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
+            dataset_info['is_binary'] = False
+            dataset_info['num_classes'] = 5
+            dataset_info['result_idx'] = 27  # Answer: (A) or (B) etc. position in the generated text (0-indexed)
+            # Generated text format: "Question: ... Options: (A) ... (E) ... Answer: (X) <|endoftext|>)"
+            # Answer "(X)" is at word index 22 (after splitting by space, "Answer:" is at 21, label is at 22)
+            dataset_info['label_dic'] = {'(A)': 0, '(B)': 1, '(C)': 2, '(D)': 3, '(E)': 4}
+            dataset_info['label_names'] = ['Stage 0', 'Stage 1', 'Stage 2', 'Stage 3', 'Stage 4']
 
         dataset_info['dataset_train'] = dataset_train
         dataset_info['dataset_val'] = dataset_val
@@ -281,12 +296,14 @@ def main(args):
         name = 'SEED7'
     elif 'motor' in dataset_dir_lower or 'motor_data' in dataset_dir_lower:
         name = 'MOTOR'
+    elif 'sleep' in dataset_dir_lower or 'sleep_data' in dataset_dir_lower:
+        name = 'SLEEP'
     else:
         raise ValueError(
             f"Unsupported dataset: {args.dataset_dir}\n"
-            f"Path must contain: ['stress', 'kaggleern', 'seed', 'motor']"
+            f"Path must contain: ['stress', 'kaggleern', 'seed', 'motor', 'sleep']"
         )
-    all_datasets.append(get_instruct_datasets(args, name, eeg_max_len=276, text_max_len=80))
+    all_datasets.append(get_instruct_datasets(args, name, eeg_max_len=248, text_max_len=80))
         
     if concat_datasets:
         merge_datasets = ConcatDataset([dataset_info['dataset_train'] for dataset_info in all_datasets])
@@ -417,10 +434,18 @@ def main(args):
 
 
     num_training_steps_per_epoch = sum([len(dataset['dataset_train']) for dataset in all_datasets]) // args.eeg_batch_size // ddp_world_size
+    # Ensure at least 1 step per epoch to avoid division issues
+    num_training_steps_per_epoch = max(1, num_training_steps_per_epoch)
     lr_schedule_values = cosine_scheduler(
         args.learning_rate, args.min_lr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs, warmup_steps=int(args.warmup_ratio * num_training_steps_per_epoch * args.epochs)
     )
+    
+    # Log schedule info for debugging - commented out for production use
+    # if master_process:
+    #     print(f"Learning rate schedule: {len(lr_schedule_values)} steps total (epochs={args.epochs}, steps_per_epoch={num_training_steps_per_epoch})")
+    #     print(f"  Expected total iterations: {args.epochs * num_training_steps_per_epoch}")
+    #     print(f"  LR schedule array size: {len(lr_schedule_values)}")
 
     enc = tiktoken.get_encoding("gpt2")
     decode = lambda l: enc.decode(l)
@@ -439,7 +464,18 @@ def main(args):
                 break
             for step, (batch) in enumerate(dataset_info['data_loader_train']):
                 # determine and set the learning rate for this iteration
-                lr = lr_schedule_values[iter_num] if args.decay_lr else args.learning_rate
+                # Add boundary check to handle cases where iter_num might exceed schedule length
+                # (e.g., due to drop_last=False or data loader behavior differences)
+                if args.decay_lr:
+                    if iter_num < len(lr_schedule_values):
+                        lr = lr_schedule_values[iter_num]
+                    else:
+                        # Use the last learning rate value if we exceed the schedule
+                        lr = lr_schedule_values[-1]
+                        if master_process and iter_num == len(lr_schedule_values):
+                            print(f"Warning: iter_num ({iter_num}) exceeded LR schedule length ({len(lr_schedule_values)}). Using final LR: {lr}")
+                else:
+                    lr = args.learning_rate
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr
 
@@ -520,19 +556,20 @@ def main(args):
                 iter_num += 1
                 local_iter_num += 1
         
-        if master_process and (not args.eval_only):
-            checkpoint = {
-                'model': raw_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_args': model_args,
-                'iter_num': iter_num,
-                'epoch': epoch
-            }
-            print(f"saving checkpoint to {checkpoint_out_dir}")
-            torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt.pt'))
-            if (epoch + 1) % args.save_ckpt_freq == 0:
-                print(f"saving checkpoint to {checkpoint_out_dir}")
-                torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt-{epoch}.pt'))
+        # Checkpoint saving disabled - no longer saving checkpoints
+        # if master_process and (not args.eval_only):
+        #     checkpoint = {
+        #         'model': raw_model.state_dict(),
+        #         'optimizer': optimizer.state_dict(),
+        #         'model_args': model_args,
+        #         'iter_num': iter_num,
+        #         'epoch': epoch
+        #     }
+        #     print(f"saving checkpoint to {checkpoint_out_dir}")
+        #     torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt.pt'))
+        #     if (epoch + 1) % args.save_ckpt_freq == 0:
+        #         print(f"saving checkpoint to {checkpoint_out_dir}")
+        #         torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt-{epoch}.pt'))
         
         # validation and test
         for dataset_info in all_datasets:
@@ -541,38 +578,17 @@ def main(args):
             print('=' * 10)
             print('Eval:')
             for metric in results_val.keys():
-                if metric not in ['confusion_matrix', 'confusion_matrix_labels']:
+                # 混淆矩阵相关字段单独换行打印
+                if 'confusion_matrix' not in metric:
                     print(metric + ':', results_val[metric])
-            # 打印混淆矩阵（如果是多分类任务）
-            if results_val.get('confusion_matrix') is not None:
-                print('Confusion Matrix (Val):')
-                cm_val = np.array(results_val['confusion_matrix'])
-                labels_val = results_val.get('confusion_matrix_labels', list(range(len(cm_val))))
-                # 获取类别名称（如果有的话）
-                if 'label_names' in dataset_info:
-                    label_names = dataset_info['label_names']
-                else:
-                    label_names = [f'Class {i}' for i in labels_val]
-                print(f'Labels: {label_names}')
-                print(cm_val)
+            _print_confusion_matrices(results_val, dataset_info, "Val")
             results_test = evaluate(raw_model, dataset_info, dataset_info['data_loader_test'], decode)
             print('=' * 10)
             print('Test:')
             for metric in results_test.keys():
-                if metric not in ['confusion_matrix', 'confusion_matrix_labels']:
+                if 'confusion_matrix' not in metric:
                     print(metric + ':', results_test[metric])
-            # 打印混淆矩阵（如果是多分类任务）
-            if results_test.get('confusion_matrix') is not None:
-                print('Confusion Matrix (Test):')
-                cm_test = np.array(results_test['confusion_matrix'])
-                labels_test = results_test.get('confusion_matrix_labels', list(range(len(cm_test))))
-                # 获取类别名称（如果有的话）
-                if 'label_names' in dataset_info:
-                    label_names = dataset_info['label_names']
-                else:
-                    label_names = [f'Class {i}' for i in labels_test]
-                print(f'Labels: {label_names}')
-                print(cm_test)
+            _print_confusion_matrices(results_test, dataset_info, "Test")
             print('=' * 10)
             if master_process:
                 local_log_data = {
@@ -583,16 +599,20 @@ def main(args):
                     "test_results": results_test
                 }
                 with open(log_file_path, 'a') as f:
-                    f.write(json.dumps(local_log_data) + '\n')
+                    f.write(json.dumps(make_json_serializable(local_log_data)) + '\n')
                     
             if args.wandb_log and master_process:
                 wandb_log_data = {}
+                # 分别处理val和test的指标，只记录实际存在的
                 for metric in results_val.keys():
                     # 跳过混淆矩阵和标签（它们已经在日志文件中记录，wandb不支持直接记录二维数组）
-                    if metric not in ['confusion_matrix', 'confusion_matrix_labels']:
+                    if 'confusion_matrix' not in metric:
                         wandb_log_data['val_' + dataset_info['name'] + '/' + metric] = results_val[metric]
+                for metric in results_test.keys():
+                    # 跳过混淆矩阵和标签
+                    if 'confusion_matrix' not in metric:
                         wandb_log_data[f'test_' + dataset_info['name'] + '/' + metric] = results_test[metric]
-                wandb.log(wandb_log_data)
+                wandb.log(make_json_serializable(wandb_log_data))
                 
                 # 如果有混淆矩阵，可以记录预测成功率
                 if results_val.get('pred_success_rate') is not None:
@@ -623,18 +643,42 @@ def get_pred(pred_string, dataset_info, debug=False):
     else:
         pred = -1
         try:
-            # 首先尝试按 result_idx 位置解析
+            # 首先尝试按 result_idx 位置解析（如果已设置）
             words = pred_string.split(' ')
-            if len(words) > dataset_info['result_idx']:
+            if dataset_info.get('result_idx') is not None and len(words) > dataset_info['result_idx']:
                 pred_word = words[dataset_info['result_idx']]
                 debug_info['method'] = 'result_idx'
                 debug_info['label_position'] = dataset_info['result_idx']
-                debug_info['found_label'] = pred_word[:3] if pred_word.startswith('(') else pred_word
+                debug_info['original_word'] = pred_word
                 
-                if pred_word.startswith('('):
-                    pred_word = pred_word[:3]
-                pred = dataset_info['label_dic'][pred_word]
-                debug_info['found_label'] = pred_word
+                # 鲁棒性处理：从可能包含额外字符的字符串中提取有效标签
+                # 例如：从 "(C))" 或 "(F))" 中提取 "(C)" 或 "(F)"
+                extracted_label = None
+                
+                # 方法1: 如果直接匹配，使用它
+                if pred_word in dataset_info['label_dic']:
+                    extracted_label = pred_word
+                # 方法2: 尝试提取前3个字符（标准格式是 "(X)"）
+                elif pred_word.startswith('(') and len(pred_word) >= 3:
+                    candidate = pred_word[:3]
+                    if candidate in dataset_info['label_dic']:
+                        extracted_label = candidate
+                # 方法3: 在字符串中搜索所有可能的标签
+                else:
+                    for label_key in dataset_info['label_dic'].keys():
+                        if label_key in pred_word:
+                            extracted_label = label_key
+                            break
+                
+                if extracted_label and extracted_label in dataset_info['label_dic']:
+                    pred = dataset_info['label_dic'][extracted_label]
+                    debug_info['found_label'] = extracted_label
+                    if extracted_label != pred_word:
+                        debug_info['original_word'] = pred_word
+                        debug_info['extracted_label'] = extracted_label
+                else:
+                    # result_idx位置没有找到有效标签，继续使用fallback方法
+                    raise KeyError(f"Could not extract valid label from '{pred_word}'")
             else:
                 # 如果文本太短，尝试在 "Answer:" 之后搜索标签（避免匹配到 Options 部分的标签）
                 answer_part = pred_string
@@ -685,14 +729,149 @@ def get_pred(pred_string, dataset_info, debug=False):
         return pred, debug_info
     return pred
 
+def extract_video_index(epoch_id):
+    """从 epoch_id 中提取 video_index
+    例如: 'subject_1_video_index_3_chunk001' -> 3
+    """
+    import re
+    match = re.search(r'video_index_(\d+)_chunk', epoch_id)
+    if match:
+        return int(match.group(1))
+    return None
+
+def extract_subject_id(epoch_id):
+    """从 epoch_id 中提取 subject_id
+    例如: 'subject_1_video_index_3_chunk001' -> 1
+    """
+    import re
+    match = re.search(r'subject_(\d+)_', epoch_id)
+    if match:
+        return int(match.group(1))
+    return None
+
+def vote_predictions(chunk_preds, chunk_targets, epoch_ids):
+    """
+    对同一video的所有chunks进行投票，得到video级别的预测和真实标签
+    
+    Args:
+        chunk_preds: list of chunk预测标签 (可能包含-1表示预测失败)
+        chunk_targets: list of chunk真实标签
+        epoch_ids: list of chunk的epoch_id
+        
+    Returns:
+        video_results: dict {
+            'video_index': video_index,
+            'subject_id': subject_id,
+            'video_pred': 投票后的预测标签,
+            'video_target': 真实标签 (应该所有chunks相同),
+            'vote_score': 投票得分 (1.0=正确, 0.5=平票且真实标签在候选中, 0.0=错误),
+            'chunk_preds': 该video的所有chunk预测,
+            'num_chunks': chunk数量
+        }
+    """
+    # 按video_index分组
+    video_groups = {}
+    for pred, target, epoch_id in zip(chunk_preds, chunk_targets, epoch_ids):
+        video_index = extract_video_index(epoch_id)
+        subject_id = extract_subject_id(epoch_id)
+        
+        if video_index is None:
+            continue
+        
+        key = (subject_id, video_index)
+        if key not in video_groups:
+            video_groups[key] = {
+                'preds': [],
+                'targets': [],
+                'epoch_ids': []
+            }
+        
+        video_groups[key]['preds'].append(pred)
+        video_groups[key]['targets'].append(target)
+        video_groups[key]['epoch_ids'].append(epoch_id)
+    
+    # 对每个video进行投票
+    video_results = []
+    for (subject_id, video_index), group in video_groups.items():
+        preds = group['preds']
+        targets = group['targets']
+        
+        # 过滤掉预测失败的chunks (-1)
+        valid_preds = [p for p in preds if p != -1]
+        
+        if len(valid_preds) == 0:
+            # 所有chunks都预测失败
+            video_pred = -1
+            vote_score = 0.0
+        else:
+            # 多数投票
+            from collections import Counter
+            pred_counts = Counter(valid_preds)
+            max_count = max(pred_counts.values())
+            max_labels = [label for label, count in pred_counts.items() if count == max_count]
+            
+            if len(max_labels) == 1:
+                # 没有平票
+                video_pred = max_labels[0]
+            else:
+                # 平票：如果有多个标签得票相同
+                video_pred = max_labels  # 保存所有平票标签
+        
+        # 真实标签（应该所有chunks相同，取第一个）
+        video_target = targets[0] if targets else None
+        
+        # 计算投票得分
+        if video_pred == -1:
+            vote_score = 0.0
+        elif isinstance(video_pred, list):
+            # 平票情况
+            if video_target in video_pred:
+                vote_score = 0.5  # 真实标签在平票候选中
+            else:
+                vote_score = 0.0  # 真实标签不在平票候选中
+        else:
+            # 正常投票结果
+            if video_pred == video_target:
+                vote_score = 1.0
+            else:
+                vote_score = 0.0
+        
+        video_results.append({
+            'video_index': video_index,
+            'subject_id': subject_id,
+            'video_pred': video_pred if not isinstance(video_pred, list) else video_pred[0],  # 平票时取第一个作为代表
+            'video_pred_all': video_pred if isinstance(video_pred, list) else [video_pred],  # 保存所有可能的预测（用于平票情况）
+            'video_target': video_target,
+            'vote_score': vote_score,
+            'chunk_preds': preds,
+            'num_chunks': len(preds),
+            'num_valid_chunks': len(valid_preds)
+        })
+    
+    return video_results
+
 @torch.no_grad()
 def evaluate(model, dataset_info, dataloader, decode):
     model.eval()
     preds = []
     preds_raw = []  # 保存原始预测标签用于混淆矩阵
     targets = []
-    for _, (batch) in enumerate(dataloader):
-        X_eeg, X_text, label, input_chans, input_time, input_mask, gpt_mask = batch
+    epoch_ids = []  # 保存epoch_id用于投票
+    # Debug variables - commented out for production use
+    # debug_sample_count = 0
+    # max_debug_samples = 5  # 只对前5个样本进行debug输出
+    
+    # 检查是否是SEED7数据集，需要投票机制
+    use_voting = dataset_info.get('name') == 'SEED7'
+    
+    for batch_idx, (batch) in enumerate(dataloader):
+        if use_voting:
+            # SEED7: 返回包含epoch_id
+            X_eeg, X_text, label, input_chans, input_time, input_mask, gpt_mask, batch_epoch_ids = batch
+        else:
+            # 其他数据集: 不包含epoch_id
+            X_eeg, X_text, label, input_chans, input_time, input_mask, gpt_mask = batch
+            batch_epoch_ids = None
         X_eeg = X_eeg.float().to(device, non_blocking=True)
         X_text = X_text.to(device, non_blocking=True)
         input_chans = input_chans.to(device, non_blocking=True)
@@ -705,13 +884,201 @@ def evaluate(model, dataset_info, dataloader, decode):
             text = model.generate(X_eeg, X_text, input_chans, input_time, input_mask, eeg_text_mask=gpt_mask, max_new_tokens=5)
             text = text[:, 1:] # remove [SEP] token
             for i, t in enumerate(text):
-                pred_string = decode(t.tolist())
+                # Convert to list for processing
+                token_list = t.tolist()
+                
+                # Find the first endoftext token (ID 50256) and truncate there
+                endoftext_id = 50256
+                if endoftext_id in token_list:
+                    endoftext_idx = token_list.index(endoftext_id)
+                    # Include the endoftext token itself, but nothing after
+                    token_list = token_list[:endoftext_idx + 1]
+                
+                # Decode the cleaned token sequence
+                pred_string = decode(token_list)
+                
+                # Additional text-level cleanup: remove everything after <|endoftext|> (safety check)
+                if '<|endoftext|>' in pred_string:
+                    pred_string = pred_string.split('<|endoftext|>')[0] + '<|endoftext|>'
+                
+                # Debug输出：对前几个样本进行详细分析 - commented out for production use
+                # Uncomment the following block for debugging
+                # if dataset_info['name'] == 'SEED7' and debug_sample_count < max_debug_samples and master_process:
+                #     # 获取原始token序列用于分析
+                #     raw_tokens = t.tolist()
+                #     
+                #     # 分析token级别信息（tiktoken已在文件顶部导入）
+                #     enc = tiktoken.get_encoding("gpt2")
+                #     
+                #     words = pred_string.split(' ')
+                #     print(f"\n{'='*80}")
+                #     print(f"DEBUG Sample #{debug_sample_count + 1} - SEED7 Comprehensive Analysis")
+                #     print(f"{'='*80}")
+                #     print(f"Generated text: {pred_string}")
+                #     print(f"Text length: {len(pred_string)} characters")
+                #     print(f"Total words: {len(words)}")
+                #     print(f"\n--- Word-level Analysis ---")
+                #     for idx, word in enumerate(words):
+                #         marker = " ← ANSWER" if word.startswith('(') and word.endswith(')') and word in dataset_info['label_dic'] else ""
+                #         print(f"  [{idx:2d}] '{word}'{marker}")
+                #     
+                #     print(f"\n--- Token-level Analysis ---")
+                #     print(f"Total tokens: {len(raw_tokens)}")
+                #     # 找到Answer:之后的部分
+                #     answer_start_idx = None
+                #     for idx, word in enumerate(words):
+                #         if word == 'Answer:':
+                #             answer_start_idx = idx
+                #             break
+                #     
+                #     if answer_start_idx is not None:
+                #         print(f"Answer: found at word index {answer_start_idx}")
+                #         print(f"Words after 'Answer:': {words[answer_start_idx+1:]}")
+                #         
+                #         # 尝试找到答案标签的位置
+                #         answer_found = False
+                #         for idx in range(answer_start_idx + 1, len(words)):
+                #             word = words[idx]
+                #             if word.startswith('(') and word.endswith(')') and word in dataset_info['label_dic']:
+                #                 print(f"✓ Answer label '{word}' found at word index {idx}")
+                #                 if dataset_info['result_idx'] is None:
+                #                     dataset_info['result_idx'] = idx
+                #                     print(f"  → Setting result_idx to {idx} (first successful detection)")
+                #                 answer_found = True
+                #                 break
+                #         
+                #         if not answer_found:
+                #             print(f"⚠️  WARNING: No valid answer label found after 'Answer:'!")
+                #             print(f"  This indicates a generation problem, not an index problem.")
+                #             print(f"  Generated answer part: {' '.join(words[answer_start_idx+1:])}")
+                #             
+                #             # 分析为什么没有生成完整的答案
+                #             answer_part_text = ' '.join(words[answer_start_idx+1:])
+                #             if '<|endoftext|>' in answer_part_text:
+                #                 print(f"  → Model generated '<|endoftext|>' before completing the answer")
+                #                 print(f"  → This suggests the model may need more training or the generation stopped early")
+                #     
+                #     # 分析token序列
+                #     print(f"\n--- Token Sequence Analysis (last 10 tokens) ---")
+                #     if len(raw_tokens) >= 10:
+                #         last_tokens = raw_tokens[-10:]
+                #         for idx, token_id in enumerate(last_tokens):
+                #             try:
+                #                 token_text = enc.decode([token_id])
+                #                 print(f"  Token {len(raw_tokens)-10+idx:3d} (ID {token_id:5d}): '{repr(token_text)}'")
+                #             except:
+                #                 print(f"  Token {len(raw_tokens)-10+idx:3d} (ID {token_id:5d}): <decode_error>")
+                #     
+                #     # 检查是否有endoftext token
+                #     endoftext_id = 50256  # GPT-2 endoftext token ID
+                #     if endoftext_id in raw_tokens:
+                #         endoftext_pos = raw_tokens.index(endoftext_id)
+                #         print(f"\n--- Endoftext Token Analysis ---")
+                #         print(f"<|endoftext|> token (ID {endoftext_id}) found at token position {endoftext_pos}")
+                #         print(f"Total tokens before <|endoftext|>: {endoftext_pos}")
+                #         if endoftext_pos < len(raw_tokens) - 1:
+                #             print(f"⚠️  WARNING: Tokens exist after <|endoftext|> token!")
+                #             print(f"  This may cause decoding issues. Tokens after: {raw_tokens[endoftext_pos+1:]}")
+                #     
+                #     # 使用debug模式获取预测结果
+                #     pred, debug_info = get_pred(pred_string, dataset_info, debug=True)
+                #     print(f"\n--- Prediction Analysis ---")
+                #     print(f"Debug info: {debug_info}")
+                #     print(f"Predicted label: {pred} ({dataset_info['label_names'][pred] if pred != -1 and pred < len(dataset_info['label_names']) else 'FAILED'})")
+                #     print(f"Actual label: {label[i].item()} ({dataset_info['label_names'][label[i].item()]})")
+                #     
+                #     # 如果result_idx已设置，验证它
+                #     if dataset_info['result_idx'] is not None:
+                #         if len(words) > dataset_info['result_idx']:
+                #             word_at_idx = words[dataset_info['result_idx']]
+                #             print(f"\n--- Result Index Verification ---")
+                #             print(f"Configured result_idx: {dataset_info['result_idx']}")
+                #             print(f"Word at result_idx {dataset_info['result_idx']}: '{word_at_idx}'")
+                #             
+                #             # 检查是否能从该位置提取有效标签（鲁棒性检查）
+                #             extracted = None
+                #             if word_at_idx in dataset_info['label_dic']:
+                #                 extracted = word_at_idx
+                #             elif word_at_idx.startswith('(') and len(word_at_idx) >= 3:
+                #                 candidate = word_at_idx[:3]
+                #                 if candidate in dataset_info['label_dic']:
+                #                     extracted = candidate
+                #             else:
+                #                 # 尝试在字符串中搜索（处理 "(C))" 这种情况）
+                #                 for label_key in dataset_info['label_dic'].keys():
+                #                     if label_key in word_at_idx:
+                #                         extracted = label_key
+                #                         break
+                #             
+                #             if extracted:
+                #                 if extracted == word_at_idx:
+                #                     print(f"✓ result_idx {dataset_info['result_idx']} is CORRECT (exact match: '{extracted}')")
+                #                 else:
+                #                     print(f"⚠ result_idx {dataset_info['result_idx']} can extract label '{extracted}' from '{word_at_idx}' (robust extraction works)")
+                #             else:
+                #                 print(f"✗ result_idx {dataset_info['result_idx']} is INCORRECT (word is '{word_at_idx}', no valid label found)")
+                #     
+                #     # 如果实际找到的位置与result_idx不同，打印警告
+                #     if debug_info.get('label_position') is not None:
+                #         if dataset_info['result_idx'] is None:
+                #             dataset_info['result_idx'] = debug_info['label_position']
+                #             print(f"\n→ Auto-setting result_idx to {debug_info['label_position']} based on debug_info")
+                #         elif debug_info['label_position'] != dataset_info['result_idx']:
+                #             print(f"\n⚠️  WARNING: Actual answer position ({debug_info['label_position']}) differs from configured result_idx ({dataset_info['result_idx']})!")
+                #             print(f"   Consider updating result_idx to {debug_info['label_position']}")
+                #     
+                #     print(f"{'='*80}\n")
+                #     debug_sample_count += 1
+                
+                # 简单的调试输出：验证 SLEEP 数据集的 result_idx
+                # Commented out for production use - uncomment for debugging
+                # if dataset_info['name'] == 'SLEEP' and len(preds_raw) < 3 and master_process:
+                #     words = pred_string.split(' ')
+                #     result_idx = dataset_info.get('result_idx', None)
+                #     if result_idx is not None and len(words) > result_idx:
+                #         # 使用 debug 模式获取提取信息
+                #         _, debug_info = get_pred(pred_string, dataset_info, debug=True)
+                #         
+                #         print(f"\n{'='*60}")
+                #         print(f"SLEEP Debug Sample #{len(preds_raw) + 1} - Result Index Verification")
+                #         print(f"{'='*60}")
+                #         print(f"Generated text: {pred_string[:150]}...")  # 只显示前150个字符
+                #         print(f"\nToken positions around result_idx={result_idx}:")
+                #         start_idx = max(0, result_idx - 3)
+                #         end_idx = min(len(words), result_idx + 4)
+                #         for idx in range(start_idx, end_idx):
+                #             marker = " ← result_idx" if idx == result_idx else ""
+                #             print(f"  [{idx:2d}] '{words[idx]}'{marker}")
+                #         
+                #         # 显示提取到的 label 信息
+                #         print(f"\n--- Label Extraction Info ---")
+                #         print(f"Extraction method: {debug_info.get('method', 'unknown')}")
+                #         if debug_info.get('original_word'):
+                #             print(f"Original word at result_idx: '{debug_info['original_word']}'")
+                #         if debug_info.get('found_label'):
+                #             print(f"Extracted label: '{debug_info['found_label']}'")
+                #             # 检查是否有鲁棒性问题（原始单词与提取的标签不同）
+                #             if debug_info.get('original_word') and debug_info['original_word'] != debug_info['found_label']:
+                #                 print(f"⚠️  ROBUSTNESS ISSUE DETECTED!")
+                #                 print(f"   Original word: '{debug_info['original_word']}'")
+                #                 print(f"   Extracted label: '{debug_info['found_label']}'")
+                #                 print(f"   (Model generated something like '(A))' instead of '(A)', but extraction worked)")
+                #             elif debug_info.get('original_word') and debug_info['original_word'] == debug_info['found_label']:
+                #                 print(f"✓ Clean extraction (no robustness issue)")
+                #         else:
+                #             print(f"⚠️  WARNING: No valid label extracted!")
+                #         print(f"{'='*60}\n")
                 
                 # 获取预测结果
                 pred = get_pred(pred_string, dataset_info, debug=False)
                 
                 # 保存原始预测标签用于混淆矩阵
                 preds_raw.append(pred)
+                
+                # 保存epoch_id（如果使用投票机制）
+                if use_voting:
+                    epoch_id = batch_epoch_ids[i]
+                    epoch_ids.append(epoch_id)
                 
                 if not dataset_info['is_binary']:
                     # 多分类：转换为 one-hot 编码用于指标计算
@@ -735,31 +1102,112 @@ def evaluate(model, dataset_info, dataloader, decode):
     preds = np.array(preds)
     preds_raw = np.array(preds_raw)
     
-    results = get_metrics(preds, targets, dataset_info['metrics'], dataset_info['is_binary'])
-    
-    # 对于多分类任务，计算混淆矩阵
-    if not dataset_info['is_binary']:
-        # 过滤掉预测失败的样本（pred == -1）
-        valid_mask = preds_raw != -1
-        num_valid = valid_mask.sum()
-        num_total = len(preds_raw)
+    # 如果使用投票机制（SEED7），进行视频级别投票
+    if use_voting and len(epoch_ids) > 0:
+        # 进行投票，得到视频级别的预测
+        video_results = vote_predictions(preds_raw.tolist(), targets.tolist(), epoch_ids)
         
-        if num_valid > 0:
-            targets_valid = targets[valid_mask]
-            preds_raw_valid = preds_raw[valid_mask]
+        # 提取视频级别的预测和真实标签
+        video_preds = [r['video_pred'] for r in video_results]
+        video_targets = [r['video_target'] for r in video_results]
+        vote_scores = [r['vote_score'] for r in video_results]
+        
+        # 过滤掉预测失败的视频
+        valid_video_mask = np.array([p != -1 for p in video_preds])
+        if valid_video_mask.sum() > 0:
+            video_preds_valid = np.array([video_preds[i] for i in range(len(video_preds)) if valid_video_mask[i]])
+            video_targets_valid = np.array([video_targets[i] for i in range(len(video_targets)) if valid_video_mask[i]])
             
-            # 计算混淆矩阵
-            # 获取所有类别标签（包括预测和真实标签）
+            # 转换预测为one-hot（作为概率），目标保持整数格式
+            # get_metrics 期望：preds 是 one-hot (n_samples, n_classes)，targets 是整数 (n_samples,)
+            video_preds_onehot = np.array([np.eye(dataset_info['num_classes'])[p] for p in video_preds_valid])
+            
+            # 计算视频级别的指标（使用投票后的预测）
+            results = get_metrics(video_preds_onehot, video_targets_valid, dataset_info['metrics'], dataset_info['is_binary'])
+            
+            # 计算视频级别的混淆矩阵
             all_labels = np.arange(dataset_info['num_classes'])
-            cm = confusion_matrix(targets_valid, preds_raw_valid, labels=all_labels)
-            results['confusion_matrix'] = cm.tolist()
-            results['confusion_matrix_labels'] = all_labels.tolist()
-            results['pred_success_rate'] = num_valid / num_total  # 添加预测成功率
+            video_cm = confusion_matrix(video_targets_valid, video_preds_valid, labels=all_labels)
+            results['video_confusion_matrix'] = video_cm.tolist()
+            results['video_confusion_matrix_labels'] = all_labels.tolist()
+            
+            # 计算subject级别的准确率
+            subject_results = {}
+            for video_result in video_results:
+                subject_id = video_result['subject_id']
+                if subject_id not in subject_results:
+                    subject_results[subject_id] = {
+                        'correct': 0.0,
+                        'total': 0
+                    }
+                subject_results[subject_id]['correct'] += video_result['vote_score']
+                subject_results[subject_id]['total'] += 1
+            
+            # 计算每个subject的准确率
+            subject_accuracies = {}
+            for subject_id, stats in subject_results.items():
+                subject_accuracies[subject_id] = stats['correct'] / stats['total']
+                results[f'subject_{subject_id}_accuracy'] = subject_accuracies[subject_id]
+                results[f'subject_{subject_id}_total_videos'] = stats['total']
+            
+            # 计算平均subject准确率
+            if len(subject_accuracies) > 0:
+                results['mean_subject_accuracy'] = np.mean(list(subject_accuracies.values()))
+            
+            # 添加投票统计信息
+            results['voting_stats'] = {
+                'total_videos': len(video_results),
+                'valid_videos': int(valid_video_mask.sum()),
+                'num_subjects': len(subject_results),
+                'mean_vote_score': float(np.mean(vote_scores)) if len(vote_scores) else 0.0,
+                'perfect_votes': sum(1 for s in vote_scores if s == 1.0),
+                'tie_votes': sum(1 for s in vote_scores if s == 0.5),
+                'wrong_votes': sum(1 for s in vote_scores if s == 0.0)
+            }
+            
+            # 仍然保留chunk级别的混淆矩阵（用于对比）
+            valid_mask = preds_raw != -1
+            num_valid = valid_mask.sum()
+            num_total = len(preds_raw)
+            if num_valid > 0:
+                targets_valid = targets[valid_mask]
+                preds_raw_valid = preds_raw[valid_mask]
+                chunk_cm = confusion_matrix(targets_valid, preds_raw_valid, labels=all_labels)
+                results['chunk_confusion_matrix'] = chunk_cm.tolist()
+                results['chunk_confusion_matrix_labels'] = all_labels.tolist()
+                results['chunk_pred_success_rate'] = num_valid / num_total
         else:
-            results['confusion_matrix'] = None
-            results['confusion_matrix_labels'] = None
-            results['pred_success_rate'] = 0.0
-            print(f"Warning: All predictions failed for {dataset_info['name']}. Total samples: {num_total}")
+            results = {}
+            results['video_confusion_matrix'] = None
+            results['video_confusion_matrix_labels'] = None
+            print(f"Warning: All video predictions failed for {dataset_info['name']}. Total videos: {len(video_results)}")
+    else:
+        # 不使用投票机制，使用原有的chunk级别评估
+        results = get_metrics(preds, targets, dataset_info['metrics'], dataset_info['is_binary'])
+        
+        # 对于多分类任务，计算混淆矩阵
+        if not dataset_info['is_binary']:
+            # 过滤掉预测失败的样本（pred == -1）
+            valid_mask = preds_raw != -1
+            num_valid = valid_mask.sum()
+            num_total = len(preds_raw)
+            
+            if num_valid > 0:
+                targets_valid = targets[valid_mask]
+                preds_raw_valid = preds_raw[valid_mask]
+                
+                # 计算混淆矩阵
+                # 获取所有类别标签（包括预测和真实标签）
+                all_labels = np.arange(dataset_info['num_classes'])
+                cm = confusion_matrix(targets_valid, preds_raw_valid, labels=all_labels)
+                results['confusion_matrix'] = cm.tolist()
+                results['confusion_matrix_labels'] = all_labels.tolist()
+                results['pred_success_rate'] = num_valid / num_total  # 添加预测成功率
+            else:
+                results['confusion_matrix'] = None
+                results['confusion_matrix_labels'] = None
+                results['pred_success_rate'] = 0.0
+                print(f"Warning: All predictions failed for {dataset_info['name']}. Total samples: {num_total}")
 
     return results
 

@@ -63,22 +63,36 @@ class Model(torch.nn.Module):
         else:
             pretrained = torch.load(pretrained_path, map_location=torch.device("cpu"))
 
+        # 收集需要跳过的参数（维度不匹配或不存在）
+        keys_to_skip = set()
+        
         for k in self.state_dict():
             if k in pretrained:
-                assert pretrained[k].shape == self.state_dict()[k].shape, (
-                    f"{k} shape mismatch between pretrained model and current model "
-                    + f"{pretrained[k].shape} vs {self.state_dict()[k].shape}"
-                )
+                if pretrained[k].shape != self.state_dict()[k].shape:
+                    # 对于维度不匹配的参数，给出警告并跳过
+                    warnings.warn(
+                        f"⚠️  Skipping {k}: shape mismatch "
+                        f"{pretrained[k].shape} vs {self.state_dict()[k].shape}. "
+                        "Will use random initialization."
+                    )
+                    keys_to_skip.add(k)
+        
         for k in pretrained:
             if k not in self.state_dict():
                 warnings.warn(
                     f"Warning: /!\ Skipping {k} from {pretrained_path} "
                     "because it is not part of the current model"
                 )
+                keys_to_skip.add(k)
+
+        # 创建过滤后的state_dict，排除维度不匹配的参数
+        filtered_pretrained = {
+            k: v for k, v in pretrained.items() if k not in keys_to_skip
+        }
 
         # we set strict=False, because we can be sure
         # that all relevant keys are in pretrained
-        self.load_state_dict(pretrained, strict=False)
+        self.load_state_dict(filtered_pretrained, strict=False)
 
     def switch_ft_mode(self, ft_encoder_only=False):
         self.ft_only_encoder = ft_encoder_only
@@ -176,14 +190,70 @@ class Model(torch.nn.Module):
 
         if self.encoder is not None:
             # before prep_batch masking and things, we need to first let the splitted chunks of raw input through the encoder
-            features = self.encoder(batch["inputs"])
+            inputs = batch["inputs"]
+            
+            # 检查输入维度：如果是3维，需要reshape成4维 (batch, chunks, chann, time)
+            if inputs.dim() == 3:
+                # 从attention_mask推断num_chunks
+                # attention_mask在collate后是1维的 (batch*chunks,)，我们需要推断chunks数量
+                attention_mask = batch.get("attention_mask", None)
+                if attention_mask is not None:
+                    total_chunks = attention_mask.size(0)
+                    # 尝试常见的chunks数量（包括2, 4, 5, 8, 10等）
+                    # 优先尝试常见的值
+                    possible_chunks = [2, 4, 5, 8, 10, 16]
+                    num_chunks = None
+                    for test_chunks in possible_chunks:
+                        if total_chunks % test_chunks == 0:
+                            # 验证：inputs的第一维应该等于total_chunks
+                            if inputs.size(0) == total_chunks:
+                                num_chunks = test_chunks
+                                break
+                    
+                    if num_chunks is None:
+                        # 如果无法推断，尝试从inputs的第一维推断
+                        # 假设batch_size至少为1，尝试常见的chunks值
+                        for test_chunks in possible_chunks:
+                            if inputs.size(0) % test_chunks == 0:
+                                num_chunks = test_chunks
+                                break
+                    
+                    if num_chunks is None:
+                        # 如果还是无法推断，尝试所有可能的因子
+                        # 从大到小尝试，优先选择较大的chunks数（更合理）
+                        for test_chunks in range(16, 0, -1):
+                            if inputs.size(0) % test_chunks == 0 and total_chunks % test_chunks == 0:
+                                # 验证batch_size是否合理（至少为1）
+                                batch_size = inputs.size(0) // test_chunks
+                                if batch_size >= 1:
+                                    num_chunks = test_chunks
+                                    break
+                    
+                    if num_chunks is None:
+                        raise ValueError(
+                            f"Cannot infer num_chunks from inputs shape {inputs.shape} "
+                            f"and attention_mask shape {attention_mask.shape}. "
+                            f"Please ensure inputs are in correct format."
+                        )
+                    
+                    batch_size = inputs.size(0) // num_chunks
+                    chann = inputs.size(1)
+                    time = inputs.size(2)
+                    inputs = inputs.view(batch_size, num_chunks, chann, time)
+                else:
+                    raise ValueError(
+                        "Cannot reshape inputs: attention_mask not found in batch. "
+                        "Inputs shape: {}".format(inputs.shape)
+                    )
+            
+            features = self.encoder(inputs)
             # attempt for trying fine-tune only the encoder, but the encoder cannot combine information across chunks.
             if self.is_decoding_mode and self.ft_only_encoder:
                 outputs = {"outputs": features, "decoding_logits": features}
                 return (outputs, batch) if return_batch else outputs
 
             b, f1, f2 = features.size()
-            nchunks = batch["inputs"].size()[1]
+            nchunks = inputs.size()[1]  # 使用reshape后的inputs
             batch["inputs"] = features.view(b // nchunks, nchunks, f1 * f2)
 
         if prep_batch:

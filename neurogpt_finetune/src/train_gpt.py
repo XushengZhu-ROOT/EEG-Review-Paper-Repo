@@ -28,8 +28,9 @@ src/trainer: Trainer for model; invokes instance of
 src/model: Build full model from components (ie., embedder,
     decoder, unembedder). See make_model() below for details.
 """
-from batcher.downstream_dataset import MotorImageryDataset, KaggleERNDataset
+from batcher.downstream_dataset import KaggleERNDataset, Motor6ClassDataset, Emotion7ClassDataset, Sleep5ClassDataset
 import torch
+import sys
 import os
 import glob
 import argparse
@@ -42,9 +43,25 @@ import pandas as pd
 import numpy as np
 from encoder.conformer_braindecode import EEGConformer
 from torch import manual_seed
-import sys
 
-from utils import cv_split_bci, read_threshold_sub
+# Fix for torch._six compatibility issue with deepspeed
+# This module was removed in newer PyTorch versions but deepspeed still tries to import it
+# Must inject into sys.modules so that 'from torch._six import inf' works when deepspeed imports it
+# This needs to be done as early as possible, before any imports that might trigger deepspeed
+if not hasattr(torch, '_six'):
+    class _Six:
+        string_types = (str,)
+        integer_types = (int,)
+        text_type = str
+        binary_type = bytes
+        class_types = (type,)
+        inf = float('inf')
+    torch._six = _Six()
+    # Inject into sys.modules so that 'from torch._six import inf' works
+    # This is necessary because deepspeed does 'from torch._six import inf' at module level
+    sys.modules['torch._six'] = torch._six
+
+from utils import read_threshold_sub
 
 script_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(script_path, "../"))
@@ -52,7 +69,7 @@ sys.path.insert(0, os.path.join(script_path, "../"))
 from batcher.base import EEGDataset
 from decoder.make_decoder import make_decoder
 from embedder.make import make_embedder
-from trainer.make import make_trainer
+from trainer.make import make_trainer, compute_voting_metrics, extract_video_index, extract_subject_id
 from trainer.base import Trainer
 from decoder.unembedder import make_unembedder
 
@@ -191,37 +208,274 @@ def train(config: Dict = None) -> Trainer:
                 gpt_only=not config["use_encoder"],
             )
 
-        elif dataset_name == "bci2a":
+        elif dataset_name == "motor6class":
+            # 运动6分类数据集
+            # 确保路径是绝对路径或相对于脚本目录的路径
+            if not os.path.isabs(downstream_path):
+                script_dir = os.path.dirname(os.path.realpath(__file__))
+                script_dir = os.path.dirname(script_dir)  # 回到neurogpt_finetune目录
+                # 处理相对路径：如果以 ../ 开头，从当前工作目录解析；否则从脚本目录解析
+                if downstream_path.startswith('../'):
+                    # 从当前工作目录解析相对路径
+                    downstream_path = os.path.abspath(downstream_path)
+                else:
+                    # 从脚本目录解析相对路径
+                    downstream_path = os.path.normpath(os.path.join(script_dir, downstream_path.lstrip('./')))
+            
+            file_extension = "*.pickle"
+            train_path = os.path.join(downstream_path, "train")
+            val_path = os.path.join(downstream_path, "val")
+            test_path = os.path.join(downstream_path, "test")
+            
+            # 检查路径是否存在
+            if not os.path.exists(train_path):
+                raise ValueError(f"训练数据路径不存在: {train_path}")
+            if not os.path.exists(val_path):
+                raise ValueError(f"验证数据路径不存在: {val_path}")
+            if not os.path.exists(test_path):
+                raise ValueError(f"测试数据路径不存在: {test_path}")
+            
+            train_files = [
+                os.path.basename(f)
+                for f in glob.glob(os.path.join(train_path, file_extension))
+            ]
+            val_files = [
+                os.path.basename(f)
+                for f in glob.glob(os.path.join(val_path, file_extension))
+            ]
+            test_files = [
+                os.path.basename(f)
+                for f in glob.glob(os.path.join(test_path, file_extension))
+            ]
+            
+            print(f"INFO: 找到 {len(train_files)} 个训练文件, {len(val_files)} 个验证文件, {len(test_files)} 个测试文件")
 
-            train_folds, test_folds = cv_split_bci(
-                sorted(os.listdir(downstream_path))[:18]
-            )
-            train_files = train_folds[config["fold_i"]]
-            test_files = test_folds[config["fold_i"]]
-
-            train_dataset = MotorImageryDataset(
+            # 转换矩阵路径（相对于脚本运行目录）
+            matrix_p_path = config.get("matrix_p_path", "tMatrix_22x20_motor.npy")
+            if not os.path.isabs(matrix_p_path):
+                # 如果是相对路径，先尝试当前路径是否存在
+                if not os.path.exists(matrix_p_path):
+                    # 如果以 ../ 开头，从当前工作目录解析
+                    if matrix_p_path.startswith('../'):
+                        matrix_p_path = os.path.abspath(matrix_p_path)
+                    else:
+                        # 否则从脚本目录解析
+                        script_dir = os.path.dirname(os.path.realpath(__file__))
+                        script_dir = os.path.dirname(script_dir)  # 回到neurogpt_finetune目录
+                        matrix_p_path = os.path.join(script_dir, matrix_p_path.lstrip('./'))
+            
+            train_dataset = Motor6ClassDataset(
                 train_files,
                 sample_keys=["inputs", "attention_mask"],
                 chunk_len=config["chunk_len"],
                 num_chunks=config["num_chunks"],
                 ovlp=config["chunk_ovlp"],
-                root_path=downstream_path,
+                root_path=train_path,
+                matrix_p_path=matrix_p_path,
                 gpt_only=not config["use_encoder"],
             )
-            # pdb.set_trace()
 
-            test_dataset = MotorImageryDataset(
+            validation_dataset = Motor6ClassDataset(
+                val_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=val_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
+
+            test_dataset = Motor6ClassDataset(
                 test_files,
                 sample_keys=["inputs", "attention_mask"],
                 chunk_len=config["chunk_len"],
                 num_chunks=config["num_chunks"],
                 ovlp=config["chunk_ovlp"],
-                root_path=downstream_path,
+                root_path=test_path,
+                matrix_p_path=matrix_p_path,
                 gpt_only=not config["use_encoder"],
             )
 
-            validation_dataset = test_dataset
-            test_dataset = train_dataset
+        elif dataset_name == "emotion7class":
+            # Emotion 7分类数据集
+            # 确保路径是绝对路径或相对于脚本目录的路径
+            if not os.path.isabs(downstream_path):
+                script_dir = os.path.dirname(os.path.realpath(__file__))
+                script_dir = os.path.dirname(script_dir)  # 回到neurogpt_finetune目录
+                # 处理相对路径：如果以 ../ 开头，从当前工作目录解析；否则从脚本目录解析
+                if downstream_path.startswith('../'):
+                    # 从当前工作目录解析相对路径
+                    downstream_path = os.path.abspath(downstream_path)
+                else:
+                    # 从脚本目录解析相对路径
+                    downstream_path = os.path.normpath(os.path.join(script_dir, downstream_path.lstrip('./')))
+            
+            # 数据在子文件夹内（subject_X），需要递归查找
+            file_extension = "*.pickle"
+            train_path = os.path.join(downstream_path, "train")
+            val_path = os.path.join(downstream_path, "val")
+            test_path = os.path.join(downstream_path, "test")
+            
+            # 检查路径是否存在
+            if not os.path.exists(train_path):
+                raise ValueError(f"训练数据路径不存在: {train_path}")
+            if not os.path.exists(val_path):
+                raise ValueError(f"验证数据路径不存在: {val_path}")
+            if not os.path.exists(test_path):
+                raise ValueError(f"测试数据路径不存在: {test_path}")
+            
+            # 递归查找所有pickle文件（包括子文件夹）
+            train_files = [
+                os.path.relpath(f, train_path)
+                for f in glob.glob(os.path.join(train_path, "**", file_extension), recursive=True)
+            ]
+            val_files = [
+                os.path.relpath(f, val_path)
+                for f in glob.glob(os.path.join(val_path, "**", file_extension), recursive=True)
+            ]
+            test_files = [
+                os.path.relpath(f, test_path)
+                for f in glob.glob(os.path.join(test_path, "**", file_extension), recursive=True)
+            ]
+            
+            print(f"INFO: 找到 {len(train_files)} 个训练文件, {len(val_files)} 个验证文件, {len(test_files)} 个测试文件")
+
+            # 转换矩阵路径（相对于脚本运行目录）
+            matrix_p_path = config.get("matrix_p_path", "tMatrix_22x62_seed.npy")
+            if not os.path.isabs(matrix_p_path):
+                # 如果是相对路径，先尝试当前路径是否存在
+                if not os.path.exists(matrix_p_path):
+                    # 如果以 ../ 开头，从当前工作目录解析
+                    if matrix_p_path.startswith('../'):
+                        matrix_p_path = os.path.abspath(matrix_p_path)
+                    else:
+                        # 否则从脚本目录解析
+                        script_dir = os.path.dirname(os.path.realpath(__file__))
+                        script_dir = os.path.dirname(script_dir)  # 回到neurogpt_finetune目录
+                        matrix_p_path = os.path.join(script_dir, matrix_p_path.lstrip('./'))
+            
+            train_dataset = Emotion7ClassDataset(
+                train_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=train_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
+
+            validation_dataset = Emotion7ClassDataset(
+                val_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=val_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
+
+            test_dataset = Emotion7ClassDataset(
+                test_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=test_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
+
+        elif dataset_name == "sleep5class":
+            # Sleep 5分类数据集
+            # 确保路径是绝对路径或相对于脚本目录的路径
+            if not os.path.isabs(downstream_path):
+                script_dir = os.path.dirname(os.path.realpath(__file__))
+                script_dir = os.path.dirname(script_dir)  # 回到neurogpt_finetune目录
+                # 处理相对路径：如果以 ../ 开头，从当前工作目录解析；否则从脚本目录解析
+                if downstream_path.startswith('../'):
+                    # 从当前工作目录解析相对路径
+                    downstream_path = os.path.abspath(downstream_path)
+                else:
+                    # 从脚本目录解析相对路径
+                    downstream_path = os.path.normpath(os.path.join(script_dir, downstream_path.lstrip('./')))
+            
+            file_extension = "*.pickle"
+            train_path = os.path.join(downstream_path, "train")
+            val_path = os.path.join(downstream_path, "val")
+            test_path = os.path.join(downstream_path, "test")
+            
+            # 检查路径是否存在
+            if not os.path.exists(train_path):
+                raise ValueError(f"训练数据路径不存在: {train_path}")
+            if not os.path.exists(val_path):
+                raise ValueError(f"验证数据路径不存在: {val_path}")
+            if not os.path.exists(test_path):
+                raise ValueError(f"测试数据路径不存在: {test_path}")
+            
+            train_files = [
+                os.path.basename(f)
+                for f in glob.glob(os.path.join(train_path, file_extension))
+            ]
+            val_files = [
+                os.path.basename(f)
+                for f in glob.glob(os.path.join(val_path, file_extension))
+            ]
+            test_files = [
+                os.path.basename(f)
+                for f in glob.glob(os.path.join(test_path, file_extension))
+            ]
+            
+            print(f"INFO: 找到 {len(train_files)} 个训练文件, {len(val_files)} 个验证文件, {len(test_files)} 个测试文件")
+
+            # 转换矩阵路径（相对于脚本运行目录）
+            matrix_p_path = config.get("matrix_p_path", "tMatrix_22x6_seed.npy")
+            if not os.path.isabs(matrix_p_path):
+                # 如果是相对路径，先尝试当前路径是否存在
+                if not os.path.exists(matrix_p_path):
+                    # 如果以 ../ 开头，从当前工作目录解析
+                    if matrix_p_path.startswith('../'):
+                        matrix_p_path = os.path.abspath(matrix_p_path)
+                    else:
+                        # 否则从脚本目录解析
+                        script_dir = os.path.dirname(os.path.realpath(__file__))
+                        script_dir = os.path.dirname(script_dir)  # 回到neurogpt_finetune目录
+                        matrix_p_path = os.path.join(script_dir, matrix_p_path.lstrip('./'))
+            
+            train_dataset = Sleep5ClassDataset(
+                train_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=train_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
+
+            validation_dataset = Sleep5ClassDataset(
+                val_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=val_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
+
+            test_dataset = Sleep5ClassDataset(
+                test_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=test_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+            )
         else:
             # 如果 dataset_name 不匹配任何已知的情況
             raise ValueError(
@@ -315,15 +569,17 @@ def train(config: Dict = None) -> Trainer:
         save_steps=config[
             "eval_every_n_steps"
         ],  # necessary for "load_best_model_at_end=True"
-        load_best_model_at_end=True,
-        save_total_limit=2,
+        load_best_model_at_end=False,  # 禁用加载最佳模型，节省空间
+        save_total_limit=0,  # 不保存checkpoint，只保留分析所需的小文件
+        save_strategy="no",  # 完全禁用checkpoint保存
         metric_for_best_model=config["metric_for_best_model"],
         greater_is_better=True,
     )
 
     if config["do_train"]:
         trainer.train(resume_from_checkpoint=config["resume_from"])
-        trainer.save_model(os.path.join(config["log_dir"], "model_final"))
+        # 不保存model_final以节省磁盘空间，只保留分析所需的小文件（CSV、JSON、NPY）
+        # trainer.save_model(os.path.join(config["log_dir"], "model_final"))
 
     if test_dataset is not None:
         test_prediction = trainer.predict(test_dataset)
@@ -338,6 +594,300 @@ def train(config: Dict = None) -> Trainer:
             os.path.join(config["log_dir"], "test_label_ids.npy"),
             test_prediction.label_ids,
         )
+        
+        # 为所有数据集计算混淆矩阵
+        from sklearn.metrics import confusion_matrix
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        # 获取预测和真实标签
+        preds_logits = test_prediction.predictions
+        labels = test_prediction.label_ids
+        
+        # 处理 chunk 级别预测的情况（与 make_decoding_accuracy_metrics 中的逻辑一致）
+        # preds_logits 可能是 (batch_size * num_chunks, num_classes)
+        # labels 是 (batch_size,)
+        if len(preds_logits) != len(labels):
+            logits_batch_size = len(preds_logits)
+            labels_batch_size = len(labels)
+            
+            # 检查是否是 chunk 级别的情况
+            if logits_batch_size % labels_batch_size == 0:
+                num_chunks = logits_batch_size // labels_batch_size
+                # Reshape preds_logits to (batch_size, num_chunks, num_classes)
+                if preds_logits.ndim > 1:
+                    preds_logits = preds_logits.reshape(labels_batch_size, num_chunks, -1)
+                    # Average over chunks dimension to get (batch_size, num_classes)
+                    preds_logits = preds_logits.mean(axis=1)
+                else:
+                    # 如果已经是类别索引，也需要 reshape 和平均
+                    preds_logits = preds_logits.reshape(labels_batch_size, num_chunks)
+                    # 对每个 sample 的 chunks 做多数投票
+                    from collections import Counter
+                    preds_aggregated = []
+                    for i in range(labels_batch_size):
+                        chunk_preds = preds_logits[i]
+                        vote_counts = Counter(chunk_preds)
+                        preds_aggregated.append(vote_counts.most_common(1)[0][0])
+                    preds_logits = np.array(preds_aggregated)
+            else:
+                # 如果无法整除，尝试其他方法或截断
+                import math
+                gcd = math.gcd(logits_batch_size, labels_batch_size)
+                if gcd > 1:
+                    base_batch_size = gcd
+                    logits_num_chunks = logits_batch_size // base_batch_size
+                    if logits_num_chunks > 1 and preds_logits.ndim > 1:
+                        preds_logits = preds_logits.reshape(base_batch_size, logits_num_chunks, -1)
+                        preds_logits = preds_logits.mean(axis=1)
+                        # 如果 labels 也需要处理
+                        if labels_batch_size != base_batch_size:
+                            labels_num_chunks = labels_batch_size // base_batch_size
+                            if labels_num_chunks > 1:
+                                # 对 labels 也做平均（虽然不太合理，但至少能运行）
+                                labels = labels.reshape(base_batch_size, labels_num_chunks)
+                                labels = labels[:, 0]  # 取第一个，因为同一 sample 的 label 应该相同
+                    else:
+                        # 截断到最小长度
+                        min_len = min(logits_batch_size, labels_batch_size)
+                        preds_logits = preds_logits[:min_len]
+                        labels = labels[:min_len]
+                else:
+                    # 最后手段：截断
+                    min_len = min(logits_batch_size, labels_batch_size)
+                    preds_logits = preds_logits[:min_len]
+                    labels = labels[:min_len]
+        
+        # 转换为类别预测
+        if preds_logits.ndim > 1:
+            # 如果是 logits，取 argmax
+            y_pred = preds_logits.argmax(axis=-1)
+        else:
+            # 如果已经是类别索引
+            y_pred = preds_logits
+        
+        y_true = labels
+        
+        # 确定类别数量
+        num_classes = config["num_decoding_classes"]
+        
+        # 计算混淆矩阵
+        cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+        
+        # 保存混淆矩阵为CSV
+        cm_df = pd.DataFrame(
+            cm, 
+            index=[f'True {i}' for i in range(num_classes)],
+            columns=[f'Pred {i}' for i in range(num_classes)]
+        )
+        cm_df.to_csv(
+            os.path.join(config["log_dir"], "test_confusion_matrix.csv")
+        )
+        
+        # 保存混淆矩阵可视化
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(
+            cm, 
+            annot=True, 
+            fmt='d', 
+            cmap='Blues',
+            xticklabels=[f'Class {i}' for i in range(num_classes)],
+            yticklabels=[f'Class {i}' for i in range(num_classes)]
+        )
+        plt.title(f'Confusion Matrix - {config["dataset_name"]}')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(config["log_dir"], "test_confusion_matrix.png"),
+            dpi=300,
+            bbox_inches='tight'
+        )
+        plt.close()
+        
+        print(f"✓ 混淆矩阵已保存到: test_confusion_matrix.csv 和 test_confusion_matrix.png")
+        
+        # 投票评估（仅对emotion7class数据集）
+        if config["dataset_name"] == "emotion7class" and hasattr(test_dataset, 'epoch_ids'):
+            print("\n=== 进行投票评估 ===")
+            
+            # 从dataset中收集所有epoch_ids（predict的顺序应该和dataset的顺序一致）
+            sample_epoch_ids = test_dataset.epoch_ids
+            n_samples = len(sample_epoch_ids)
+            n_predictions = len(test_prediction.predictions)
+            
+            # 检测实际的chunks数量
+            if n_predictions % n_samples == 0:
+                actual_chunks_per_sample = n_predictions // n_samples
+                
+                # 为每个chunk的预测分配epoch_id
+                chunk_epoch_ids = []
+                chunk_labels = []
+                chunk_predictions = []
+                
+                for i, epoch_id in enumerate(sample_epoch_ids):
+                    # 为这个样本的所有chunks分配相同的epoch_id
+                    for chunk_idx in range(actual_chunks_per_sample):
+                        pred_idx = i * actual_chunks_per_sample + chunk_idx
+                        chunk_epoch_ids.append(epoch_id)
+                        
+                        # 获取这个chunk的预测
+                        if test_prediction.predictions.ndim == 1:
+                            chunk_pred = test_prediction.predictions[pred_idx]
+                        else:
+                            chunk_pred = test_prediction.predictions[pred_idx].argmax()
+                        chunk_predictions.append(chunk_pred)
+                        
+                        # label也应该重复
+                        if i < len(test_prediction.label_ids):
+                            chunk_labels.append(test_prediction.label_ids[i])
+                
+                # 如果label_ids的数量已经等于predictions，说明已经正确展开
+                if len(test_prediction.label_ids) == n_predictions:
+                    chunk_labels = test_prediction.label_ids
+                elif len(test_prediction.label_ids) == n_samples:
+                    # label_ids是样本级别的，需要展开到chunk级别
+                    chunk_labels = []
+                    for i, label in enumerate(test_prediction.label_ids):
+                        for _ in range(actual_chunks_per_sample):
+                            chunk_labels.append(label)
+                    chunk_labels = np.array(chunk_labels)
+                else:
+                    # 其他情况，使用已有的label_ids
+                    chunk_labels = test_prediction.label_ids[:n_predictions]
+                
+                # 使用展开后的predictions（argmax后的类别）
+                chunk_predictions_array = np.array(chunk_predictions)
+                
+                # 使用展开后的predictions（chunk级别的类别预测）
+                voting_metrics = compute_voting_metrics(
+                    chunk_predictions_array,  # 使用已经argmax后的类别
+                    chunk_labels,
+                    chunk_epoch_ids
+                )
+                
+                # 计算视频级别的预测和标签用于混淆矩阵
+                from collections import Counter
+                video_predictions = []
+                video_labels = []
+                video_groups = {}
+                
+                for i, epoch_id in enumerate(chunk_epoch_ids):
+                    video_index = extract_video_index(epoch_id)
+                    subject_id = extract_subject_id(epoch_id)
+                    
+                    if video_index is not None:
+                        video_key = (subject_id, video_index)
+                        if video_key not in video_groups:
+                            video_groups[video_key] = {'preds': [], 'label': None}
+                        video_groups[video_key]['preds'].append(int(chunk_predictions_array[i]))
+                        video_groups[video_key]['label'] = int(chunk_labels[i])
+                
+                # 进行投票得到视频级别的预测
+                for video_key, video_data in video_groups.items():
+                    preds = video_data['preds']
+                    true_label = video_data['label']
+                    
+                    if len(preds) == 0:
+                        continue
+                    
+                    # 多数投票
+                    vote_counts = Counter(preds)
+                    max_votes = max(vote_counts.values())
+                    majority_classes = [cls for cls, count in vote_counts.items() if count == max_votes]
+                    
+                    if len(majority_classes) == 1:
+                        video_pred = majority_classes[0]
+                    else:
+                        # 平票情况：如果真实标签在候选中，选择它；否则选择第一个
+                        if true_label in majority_classes:
+                            video_pred = true_label
+                        else:
+                            video_pred = majority_classes[0]
+                    
+                    video_predictions.append(video_pred)
+                    video_labels.append(true_label)
+                
+                video_predictions = np.array(video_predictions)
+                video_labels = np.array(video_labels)
+                
+                # 计算混淆矩阵
+                from sklearn.metrics import confusion_matrix
+                import matplotlib.pyplot as plt
+                import seaborn as sns
+                
+                num_classes = 6  # emotion 6分类（移除neutral后）
+                cm = confusion_matrix(video_labels, video_predictions, labels=list(range(num_classes)))
+                
+                # 保存混淆矩阵为CSV
+                cm_df = pd.DataFrame(
+                    cm, 
+                    index=[f'True {i}' for i in range(num_classes)],
+                    columns=[f'Pred {i}' for i in range(num_classes)]
+                )
+                cm_df.to_csv(
+                    os.path.join(config["log_dir"], "test_voting_confusion_matrix.csv")
+                )
+                
+                # 保存混淆矩阵可视化
+                plt.figure(figsize=(10, 8))
+                sns.heatmap(
+                    cm, 
+                    annot=True, 
+                    fmt='d', 
+                    cmap='Blues',
+                    xticklabels=[f'Class {i}' for i in range(num_classes)],
+                    yticklabels=[f'Class {i}' for i in range(num_classes)]
+                )
+                plt.title('Confusion Matrix - Video Level Voting')
+                plt.ylabel('True Label')
+                plt.xlabel('Predicted Label')
+                plt.tight_layout()
+                plt.savefig(
+                    os.path.join(config["log_dir"], "test_voting_confusion_matrix.png"),
+                    dpi=300,
+                    bbox_inches='tight'
+                )
+                plt.close()
+            else:
+                # 如果无法整除，说明有其他问题
+                print(f"  ⚠️  警告: predictions数量 ({n_predictions}) 不是样本数量 ({n_samples}) 的整数倍")
+                print(f"  尝试使用前 {n_samples} 个predictions进行投票评估")
+                
+                # 只使用前n_samples个predictions，对应的epoch_ids和labels
+                voting_metrics = compute_voting_metrics(
+                    test_prediction.predictions[:n_samples],
+                    test_prediction.label_ids[:n_samples],
+                    sample_epoch_ids[:n_samples]
+                )
+            
+            # 保存投票评估结果
+            voting_metrics_df = pd.DataFrame([voting_metrics], index=[0])
+            voting_metrics_df.to_csv(
+                os.path.join(config["log_dir"], "test_voting_metrics.csv"), 
+                index=False
+            )
+            
+            # 保存epoch_ids供后续分析（保存chunk级别的epoch_ids）
+            if 'chunk_epoch_ids' in locals():
+                np.save(
+                    os.path.join(config["log_dir"], "test_epoch_ids.npy"),
+                    np.array(chunk_epoch_ids, dtype=object),
+                )
+            else:
+                np.save(
+                    os.path.join(config["log_dir"], "test_epoch_ids.npy"),
+                    np.array(sample_epoch_ids, dtype=object),
+                )
+            
+            print(f"✓ 投票评估结果已保存到: test_voting_metrics.csv")
+            if 'chunk_epoch_ids' in locals():
+                print(f"✓ 混淆矩阵已保存到: test_voting_confusion_matrix.csv 和 test_voting_confusion_matrix.png")
+            print(f"  视频级别准确率: {voting_metrics['video_accuracy']:.4f}")
+            print(f"  视频级别BACC: {voting_metrics['video_bacc']:.4f}")
+            print(f"  评估的视频数量: {voting_metrics['num_videos']}")
+            if 'avg_subject_accuracy' in voting_metrics:
+                print(f"  平均Subject准确率: {voting_metrics['avg_subject_accuracy']:.4f}")
 
     return trainer
 
@@ -552,7 +1102,7 @@ def get_args() -> argparse.ArgumentParser:
         "--dataset-name",
         metavar="STR",
         default="bci2a",
-        choices=("KaggleERN", "stress"),
+        choices=("KaggleERN", "stress", "motor6class", "emotion7class", "sleep5class"),
         type=str,
         help="supported downstream dataset",
     )
@@ -1117,7 +1667,15 @@ def get_args() -> argparse.ArgumentParser:
         "--metric_for_best_model",
         metavar="STR",
         default="eval_validation_loss",
-        choices=("eval_validation_loss", "eval_validation_acc", "eval_validation_bacc"),
+        choices=(
+            "eval_validation_loss", 
+            "eval_validation_acc", 
+            "eval_validation_accuracy",
+            "eval_validation_bacc",
+            "eval_validation_kappa",
+            "eval_validation_f1_weighted",
+            "eval_validation_roc_auc_weighted",
+        ),
         type=str,
         help="record metric for saving trained model",
     )

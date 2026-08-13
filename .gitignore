@@ -208,3 +208,4 @@ __marimo__/
 .DS_Store
 biot_finetune/log/
 biot_finetune/pretrained-models/
+labram_finetune/checkpoints/

@@ -3,6 +3,8 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import os
+import re
+from collections import defaultdict
 from scipy.signal import resample
 from scipy.signal import butter, iirnotch, filtfilt
 from scipy.interpolate import interp1d
@@ -57,20 +59,101 @@ class KaggleERNLoader(torch.utils.data.Dataset):
         X = torch.FloatTensor(X)
         return X, Y
 
+# ===== Motion: cross-model-stable sample_id (ported from
+# cbramod/datasets/motortask_dataset.py's compute_sample_id, kept in sync
+# so BIOT and CBraMod produce identical sample_id strings for the same
+# underlying epoch file). epoch_id looks like "Sub04_Walkslow_epoch009".
+_MOTION_SAMPLE_ID_TASK_ORDER = ['Walk', '8', 'Horizontal', 'Vertical', 'Pick', 'Stair']
+_MOTION_SAMPLE_ID_SPEED_ORDER = ['slow', 'medium', 'fast']
+_MOTION_SAMPLE_ID_TASK_OFFSET = 3000
+_MOTION_SAMPLE_ID_SPEED_OFFSET = 1000
+_MOTION_SAMPLE_ID_RE = re.compile(r'^Sub(\d+)_(.+?)_epoch(\d+)$')
+_MOTION_SUBJECT_RE = re.compile(r'(Sub\d+)_')
+
+
+def _parse_motion_task_token(task_token):
+    for speed in _MOTION_SAMPLE_ID_SPEED_ORDER:
+        if task_token.endswith(speed):
+            return task_token[: -len(speed)], speed
+    raise ValueError(f"Cannot parse speed suffix (slow/medium/fast) from task token: {task_token!r}")
+
+
+def compute_motion_sample_id(epoch_id):
+    """Deterministic sample_id "S{subject:02d}_ep{index:05d}" from an
+    epoch_id like 'Sub04_Walkslow_epoch009'. Pure function of the string
+    itself, independent of shuffle/batch_size/num_workers, and identical
+    across models trained on the same underlying epoch files."""
+    m = _MOTION_SAMPLE_ID_RE.match(epoch_id)
+    if not m:
+        raise ValueError(f"Cannot parse epoch_id for sample_id: {epoch_id!r}")
+    subject_num = int(m.group(1))
+    task_token = m.group(2)
+    local_idx = int(m.group(3))
+    base_task, speed = _parse_motion_task_token(task_token)
+    if base_task not in _MOTION_SAMPLE_ID_TASK_ORDER:
+        raise ValueError(
+            f"Unknown base task {base_task!r} parsed from epoch_id {epoch_id!r}; "
+            f"expected one of {_MOTION_SAMPLE_ID_TASK_ORDER}"
+        )
+    task_idx = _MOTION_SAMPLE_ID_TASK_ORDER.index(base_task)
+    speed_idx = _MOTION_SAMPLE_ID_SPEED_ORDER.index(speed)
+    global_index = task_idx * _MOTION_SAMPLE_ID_TASK_OFFSET + speed_idx * _MOTION_SAMPLE_ID_SPEED_OFFSET + local_idx
+    if global_index > 99999:
+        raise ValueError(f"sample_id index overflow (>99999) for epoch_id {epoch_id!r}: {global_index}")
+    return f"S{subject_num:02d}_ep{global_index:05d}"
+
+
+def extract_motion_subject_id(name):
+    """'Sub04_8fast_epoch001.pickle' (or any path containing it) -> 'Sub04'."""
+    m = _MOTION_SUBJECT_RE.search(os.path.basename(name))
+    return m.group(1) if m else None
+
+
+def list_motion_files_by_subject(root):
+    """Scan root/{train,val,test}/*.pickle and group full paths by subject
+    ('Sub04' -> [path, ...]), for building a subject-independent split."""
+    subject_to_files = defaultdict(list)
+    for split in ("train", "val", "test"):
+        split_dir = os.path.join(root, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for fname in os.listdir(split_dir):
+            if not fname.endswith(".pickle"):
+                continue
+            sid = extract_motion_subject_id(fname)
+            if sid is None:
+                continue
+            subject_to_files[sid].append(os.path.join(split_dir, fname))
+    return subject_to_files
+
+
 class MotionLoader(torch.utils.data.Dataset):
-    def __init__(self, root, files, sampling_rate=200, in_channels=16):
+    def __init__(self, root, files, sampling_rate=200, in_channels=16, return_sample_id=False):
         self.root = root
         self.files = files
         self.default_rate = 200
         self.sampling_rate = sampling_rate
         self.in_channels = in_channels  # <<< 必須加上
+        self.return_sample_id = return_sample_id
 
         # 20 → 16 channel mapping
         self.MOTION_16CH = [1,2,4,6,7,17,14,12,15,16,0,3,13,18,5,8]
 
+        # sample_id 在构造时一次性算好，跟 self.files 一一对应；
+        # 与 shuffle / batch_size / num_workers 无关，解析失败直接报错。
+        self.sample_ids = [
+            compute_motion_sample_id(os.path.splitext(os.path.basename(f))[0])
+            for f in self.files
+        ]
+        if len(set(self.sample_ids)) != len(self.sample_ids):
+            raise ValueError(
+                "Duplicate sample_id detected in MotionLoader; check for "
+                "duplicate/conflicting epoch files."
+            )
+
     def __len__(self):
         return len(self.files)
-    
+
     def __getitem__(self, index):
 
         for _ in range(len(self.files)):
@@ -81,7 +164,7 @@ class MotionLoader(torch.utils.data.Dataset):
             X = X[self.MOTION_16CH, :]
 
             # --- 跳過不是16ch的資料（理論上不會發生） ---
-            if X.shape[0] != self.in_channels:  
+            if X.shape[0] != self.in_channels:
                 index = (index + 1) % len(self.files)
                 continue
 
@@ -97,8 +180,10 @@ class MotionLoader(torch.utils.data.Dataset):
 
             # --- convert dtype ---
             X = torch.tensor(X, dtype=torch.float32)
-            Y = torch.tensor(sample["label"] - 1, dtype=torch.long)
+            Y = torch.tensor(sample["label"], dtype=torch.long)
 
+            if self.return_sample_id:
+                return X, Y, self.sample_ids[index]
             return X, Y
 
         raise RuntimeError(
@@ -515,6 +600,16 @@ def collate_fn_biot_sleep_with_epoch_id(batch):
     epoch_id_batch = list(epoch_id_list)
     
     return X_batch, Y_batch, epoch_id_batch
+
+def collate_fn_motion_with_sample_id(batch):
+    """
+    自定义collate函数，用于处理MotionLoader(return_sample_id=True)返回(X, Y, sample_id)的情况
+    """
+    X_list, Y_list, sample_id_list = zip(*batch)
+    X_batch = torch.stack(X_list, dim=0)
+    Y_batch = torch.stack(Y_list, dim=0)
+    sample_id_batch = list(sample_id_list)
+    return X_batch, Y_batch, sample_id_batch
 
 class EEGSupervisedPretrainLoader(torch.utils.data.Dataset):
     def __init__(self, tuev_data, chb_mit_data, iiic_data, tuab_data):

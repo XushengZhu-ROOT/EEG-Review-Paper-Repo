@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-cd ~/EEG-Review-Paper-Repo/biot_finetune/
+cd /home/xuz056/LEM/motor/test_pipeline/biot_st/
 
 dataset=Motion
 gpu_id=0

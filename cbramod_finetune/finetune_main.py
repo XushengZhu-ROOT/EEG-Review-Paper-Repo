@@ -6,13 +6,21 @@ import os
 import numpy as np
 import torch
 
-from datasets import faced_dataset, seedv_dataset, physio_dataset, shu_dataset, isruc_dataset, chb_dataset, \
-    speech_dataset, mumtaz_dataset, seedvig_dataset, stress_dataset, tuev_dataset, tuab_dataset, bciciv2a_dataset, \
-    custom_stress_dataset, kaggleern_dataset
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('true', '1', 'yes'):
+        return True
+    elif v.lower() in ('false', '0', 'no'):
+        return False
+    raise argparse.ArgumentTypeError(f'Boolean value expected, got {v!r}')
+
+from datasets import custom_stress_dataset, kaggleern_dataset, \
+    motortask_dataset, seed_emotion_dataset, sleep_dataset
 from finetune_trainer import Trainer
-from models import model_for_faced, model_for_seedv, model_for_physio, model_for_shu, model_for_isruc, model_for_chb, \
-    model_for_speech, model_for_mumtaz, model_for_seedvig, model_for_stress, model_for_tuev, model_for_tuab, \
-    model_for_bciciv2a, model_for_custom_stress, model_for_kaggleern
+from models import model_for_custom_stress, model_for_kaggleern, \
+    model_for_motortask, model_for_seed_emotion, model_for_sleep
 
 def save_config(params):
     """Saves the configuration parameters to a YAML file."""
@@ -50,16 +58,16 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
     parser.add_argument('--classifier', type=str, default='all_patch_reps',
                         help='[all_patch_reps, all_patch_reps_twolayer, '
-                             'all_patch_reps_onelayer, avgpooling_patch_reps]')
+                             'all_patch_reps_onelayer, avgpooling_patch_reps, '
+                             'Labram_style_classifier, Labram_style_classifier2]')
     # all_patch_reps: use all patch features with a three-layer classifier;
     # all_patch_reps_twolayer: use all patch features with a two-layer classifier;
     # all_patch_reps_onelayer: use all patch features with a one-layer classifier;
     # avgpooling_patch_reps: use average pooling for patch features;
 
     """############ Downstream dataset settings ############"""
-    parser.add_argument('--downstream_dataset', type=str, default='FACED',
-                        help='[FACED, SEED-V, PhysioNet-MI, SHU-MI, ISRUC, CHB-MIT, BCIC2020-3, Mumtaz2016, '
-                             'SEED-VIG, MentalArithmetic, TUEV, TUAB, BCIC-IV-2a]')
+    parser.add_argument('--downstream_dataset', type=str, required=True,
+                        help='[CustomStress, KaggleERN, MotorTask, SEED-Emotion, Sleep]')
     parser.add_argument('--datasets_dir', type=str,
                         default='/data/datasets/BigDownstream/Faced/processed',
                         help='datasets_dir')
@@ -69,14 +77,45 @@ def main():
     parser.add_argument('--window_size', type=int, default=5, help='window size, for classifier')
     parser.add_argument('--pos_weight', default=None, type=float)
 
+    # ===== [R1] MotorTask 划分策略开关（默认保留旧的 random_epoch）=====
+    # split_mode:
+    #   - random_epoch: 使用磁盘上已有的 train/val/test 随机 epoch 划分（旧方法，有泄漏风险）
+    #   - subject_independent: 按受试者严格划分，避免同一受试者跨集合泄漏
+    parser.add_argument('--split_mode', type=str, default='random_epoch',
+                        choices=['random_epoch', 'subject_independent'],
+                        help='MotorTask data split strategy (default: random_epoch)')
+    # single_fold_debug=True: 只跑第一折 dry run（train 18 / val 1 / test 1），不做完整 LOSO
+    parser.add_argument('--single_fold_debug', type=str2bool, default=True,
+                        help='If True, only run the first subject-independent fold and stop')
+    # 可选：手动指定 val/test 受试者（例如 Sub20 / Sub21）；留空则用排序后末尾两名
+    parser.add_argument('--val_subject', type=str, default=None,
+                        help='Optional val subject id for subject_independent split, e.g. Sub20')
+    parser.add_argument('--test_subject', type=str, default=None,
+                        help='Optional test subject id for subject_independent split, e.g. Sub21')
+    # ===== [R2] 无验证子集的经典 LOSO：train = 除 test_subject 外全部受试者，无 val =====
+    # 需要同时传 --test_subject。默认 False，不影响 R1（18-1-1）行为。
+    parser.add_argument('--no_val_subject', type=str2bool, default=False,
+                        help='If True (with --test_subject set), use classic LOSO: '
+                             'N-1 train / 1 test, no separate validation subject. '
+                             'Reported metrics are fixed to the final epoch.')
+    # ===== [R2] 事后可复现指标所需的存档元数据（仅影响保存，不影响训练）=====
+    parser.add_argument('--model_name', type=str, default='cbramod',
+                        help='Model name used in saved {task}_{model}_fold{i}.npz/json filenames')
+    parser.add_argument('--task_name', type=str, default=None,
+                        help='Task name used in saved filenames; defaults to lowercased downstream_dataset')
+    parser.add_argument('--fold_idx', type=int, default=0,
+                        help='LOSO fold index (0-based), used in saved filenames and the fold JSON')
+    parser.add_argument('--fold_results_dir', type=str, default=None,
+                        help='Where to save {task}_{model}_fold{i}.npz/json; defaults to model_dir')
+
     """############ Downstream dataset settings ############"""
 
     parser.add_argument('--num_workers', type=int, default=10, help='num_workers')
     parser.add_argument('--label_smoothing', type=float, default=0.1, help='label_smoothing')
     parser.add_argument('--multi_lr', type=bool, default=True,
                         help='multi_lr')  # set different learning rates for different modules
-    parser.add_argument('--frozen', 
-                    action='store_true', 
+    parser.add_argument('--frozen',
+                    action='store_true',
                     help='Freeze the model (if this flag is present, set to True)')
     parser.add_argument('--use_pretrained_weights', type=bool,
                         default=True, help='use_pretrained_weights')
@@ -91,98 +130,7 @@ def main():
     setup_seed(params.seed)
     torch.cuda.set_device(params.cuda)
     print('The downstream dataset is {}'.format(params.downstream_dataset))
-    if params.downstream_dataset == 'FACED':
-        load_dataset = faced_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_faced.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
-    elif params.downstream_dataset == 'SEED-V':
-        load_dataset = seedv_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_seedv.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
-    elif params.downstream_dataset == 'PhysioNet-MI':
-        load_dataset = physio_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_physio.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
-    elif params.downstream_dataset == 'SHU-MI':
-        load_dataset = shu_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_shu.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_binaryclass()
-    elif params.downstream_dataset == 'ISRUC':
-        load_dataset = isruc_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_isruc.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
-    elif params.downstream_dataset == 'CHB-MIT':
-        load_dataset = chb_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_chb.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_binaryclass()
-    elif params.downstream_dataset == 'BCIC2020-3':
-        load_dataset = speech_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_speech.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
-    elif params.downstream_dataset == 'Mumtaz2016':
-        load_dataset = mumtaz_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_mumtaz.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_binaryclass()
-    elif params.downstream_dataset == 'SEED-VIG':
-        load_dataset = seedvig_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_seedvig.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_regression()
-    elif params.downstream_dataset == 'MentalArithmetic':
-        load_dataset = stress_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_stress.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_binaryclass()
-    elif params.downstream_dataset == 'TUEV':
-        load_dataset = tuev_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_tuev.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
-    elif params.downstream_dataset == 'TUAB':
-        load_dataset = tuab_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_tuab.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_binaryclass()
-    elif params.downstream_dataset == 'BCIC-IV-2a':
-        load_dataset = bciciv2a_dataset.LoadDataset(params)
-        data_loader = load_dataset.get_data_loader()
-        model = model_for_bciciv2a.Model(params)
-        save_architecture(model, params.model_dir)
-        t = Trainer(params, data_loader, model)
-        t.train_for_multiclass()
-    elif params.downstream_dataset == 'CustomStress':
+    if params.downstream_dataset == 'CustomStress':
         load_dataset = custom_stress_dataset.LoadDataset(params)
         data_loader = load_dataset.get_data_loader()
         model = model_for_custom_stress.Model(params)
@@ -196,6 +144,27 @@ def main():
         save_architecture(model, params.model_dir)
         t = Trainer(params, data_loader, model)
         t.train_for_binaryclass()
+    elif params.downstream_dataset == 'MotorTask':
+        load_dataset = motortask_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_motortask.Model(params)
+        save_architecture(model, params.model_dir)
+        t = Trainer(params, data_loader, model)
+        t.train_for_multiclass()
+    elif params.downstream_dataset == 'SEED-Emotion':
+        load_dataset = seed_emotion_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_seed_emotion.Model(params)
+        save_architecture(model, params.model_dir)
+        t = Trainer(params, data_loader, model)
+        t.train_for_multiclass()
+    elif params.downstream_dataset == 'Sleep':
+        load_dataset = sleep_dataset.LoadDataset(params)
+        data_loader = load_dataset.get_data_loader()
+        model = model_for_sleep.Model(params)
+        save_architecture(model, params.model_dir)
+        t = Trainer(params, data_loader, model)
+        t.train_for_multiclass()
     print('Done!!!!!')
 
 

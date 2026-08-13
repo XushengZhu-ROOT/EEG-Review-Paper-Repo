@@ -8,6 +8,24 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 # from apex import amp
 from tqdm.auto import tqdm
 import torch
+import sys
+
+# Fix for torch._six compatibility issue with deepspeed
+# This module was removed in newer PyTorch versions but deepspeed still tries to import it
+# Must inject into sys.modules so that 'from torch._six import inf' works when deepspeed imports it
+if not hasattr(torch, '_six'):
+    class _Six:
+        string_types = (str,)
+        integer_types = (int,)
+        text_type = str
+        binary_type = bytes
+        class_types = (type,)
+        inf = float('inf')
+    torch._six = _Six()
+    # Inject into sys.modules so that 'from torch._six import inf' works
+    # This is necessary because deepspeed does 'from torch._six import inf' at module level
+    sys.modules['torch._six'] = torch._six
+
 from torch import nn
 from transformers import Trainer
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
@@ -23,7 +41,18 @@ from transformers.data.data_collator import (
     DataCollatorWithPadding,
     default_data_collator,
 )
-from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
+# Try to import deepspeed functions from different locations (depending on transformers version)
+try:
+    from transformers.integrations.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
+except ImportError:
+    try:
+        from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
+    except ImportError:
+        # If deepspeed is not available, define dummy functions
+        def deepspeed_init(*args, **kwargs):
+            raise RuntimeError("DeepSpeed is not available")
+        def is_deepspeed_zero3_enabled():
+            return False
 from transformers.models.auto.modeling_auto import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
     MODEL_MAPPING_NAMES,
@@ -94,7 +123,7 @@ class Trainer(Trainer):
             return DataLoader(
                 train_dataset,
                 batch_size=self.args.per_device_train_batch_size,
-                # collate_fn=data_collator,
+                collate_fn=data_collator,
                 num_workers=self.args.dataloader_num_workers,
                 pin_memory=True,
             )
@@ -104,7 +133,7 @@ class Trainer(Trainer):
             train_dataset,
             batch_size=self._train_batch_size,
             sampler=train_sampler,
-            # collate_fn=data_collator,
+            collate_fn=data_collator,
             drop_last=self.args.dataloader_drop_last,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=True,
@@ -125,7 +154,35 @@ class Trainer(Trainer):
         """
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
-        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        
+        # 处理字典类型的eval_dataset：如果传入的是字符串（字典的键），从字典中获取对应的数据集
+        if isinstance(eval_dataset, (str, bytes)) and isinstance(self.eval_dataset, dict):
+            dataset_key = eval_dataset if isinstance(eval_dataset, str) else eval_dataset.decode('utf-8')
+            if dataset_key in self.eval_dataset:
+                eval_dataset = self.eval_dataset[dataset_key]
+            else:
+                raise KeyError(
+                    f"eval_dataset key '{dataset_key}' not found in self.eval_dataset. "
+                    f"Available keys: {list(self.eval_dataset.keys())}"
+                )
+        elif eval_dataset is None:
+            # 如果eval_dataset是None，使用self.eval_dataset
+            # 但如果self.eval_dataset是字典，需要选择一个默认的数据集
+            if isinstance(self.eval_dataset, dict):
+                # 如果有多个数据集，使用第一个（通常是'validation'）
+                if len(self.eval_dataset) > 0:
+                    eval_dataset = next(iter(self.eval_dataset.values()))
+                else:
+                    raise ValueError("self.eval_dataset is an empty dict.")
+            else:
+                eval_dataset = self.eval_dataset
+        elif isinstance(eval_dataset, dict):
+            # 如果传入的是字典，使用第一个数据集
+            if len(eval_dataset) > 0:
+                eval_dataset = next(iter(eval_dataset.values()))
+            else:
+                raise ValueError("eval_dataset is an empty dict.")
+        
         data_collator = self.data_collator
 
         # if is_datasets_available() and isinstance(eval_dataset, datasets.Dataset):
@@ -145,18 +202,18 @@ class Trainer(Trainer):
             return DataLoader(
                 eval_dataset,
                 batch_size=self.args.eval_batch_size,
-                # collate_fn=data_collator,
+                collate_fn=data_collator,
                 num_workers=self.args.dataloader_num_workers,
                 pin_memory=self.args.dataloader_pin_memory,
             )
-
+        
         eval_sampler = self._get_eval_sampler(eval_dataset)
 
         return DataLoader(
             eval_dataset,
             sampler=eval_sampler,
             batch_size=self.args.eval_batch_size,
-            # collate_fn=data_collator,
+            collate_fn=data_collator,
             drop_last=self.args.dataloader_drop_last,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
@@ -173,7 +230,7 @@ class Trainer(Trainer):
                 The test dataset to use. If it is a [`~datasets.Dataset`], columns not accepted by the
                 `model.forward()` method are automatically removed. It must implement `__len__`.
         """
-        # data_collator = self.data_collator
+        data_collator = self.data_collator
 
         if isinstance(test_dataset, torch.utils.data.IterableDataset):
             if self.args.world_size > 1:
@@ -187,7 +244,7 @@ class Trainer(Trainer):
             return DataLoader(
                 test_dataset,
                 batch_size=self.args.eval_batch_size,
-                # collate_fn=data_collator,
+                collate_fn=data_collator,
                 num_workers=self.args.dataloader_num_workers,
                 pin_memory=self.args.dataloader_pin_memory,
             )
@@ -199,7 +256,7 @@ class Trainer(Trainer):
             test_dataset,
             sampler=test_sampler,
             batch_size=self.args.eval_batch_size,
-            # collate_fn=data_collator,
+            collate_fn=data_collator,
             drop_last=self.args.dataloader_drop_last,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,

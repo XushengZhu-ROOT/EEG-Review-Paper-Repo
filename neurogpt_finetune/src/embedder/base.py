@@ -162,8 +162,64 @@ class BaseEmbedder(torch.nn.Module):
     def decoding_multiclass_loss(
         self, decoding_logits, labels, **kwargs
     ) -> Dict[str, torch.tensor]:
-        # pdb.set_trace()
-        # print(f"使用 CrossEntropyLoss")
+        # Handle the case where decoding_logits has batch_size * num_chunks dimension
+        # but labels only has batch_size dimension
+        # This happens when each sample is split into multiple chunks
+        if decoding_logits.size(0) != labels.size(0):
+            # Calculate num_chunks from the size mismatch
+            logits_batch_size = decoding_logits.size(0)
+            labels_batch_size = labels.size(0)
+            
+            # Check if logits_batch_size is divisible by labels_batch_size
+            if logits_batch_size % labels_batch_size == 0:
+                num_chunks = logits_batch_size // labels_batch_size
+                # Expand labels to match decoding_logits: repeat each label num_chunks times
+                labels = labels.repeat_interleave(num_chunks)
+            else:
+                # If not divisible, try to find the greatest common divisor (GCD)
+                # This handles cases where there might be some reshaping or partial batches
+                import math
+                gcd = math.gcd(logits_batch_size, labels_batch_size)
+                
+                if gcd > 1:
+                    # Use GCD to find the base batch size
+                    logits_num_chunks = logits_batch_size // gcd
+                    labels_num_chunks = labels_batch_size // gcd
+                    
+                    # If logits have more chunks per sample, expand labels
+                    if logits_num_chunks > labels_num_chunks:
+                        if logits_num_chunks % labels_num_chunks == 0:
+                            expand_factor = logits_num_chunks // labels_num_chunks
+                            labels = labels.repeat_interleave(expand_factor)
+                        else:
+                            # If still not divisible, try repeating the entire labels tensor
+                            # This handles edge cases where the relationship is more complex
+                            repeat_factor = logits_batch_size // labels_batch_size
+                            if logits_batch_size == labels_batch_size * repeat_factor:
+                                labels = labels.repeat_interleave(repeat_factor)
+                            else:
+                                # Last resort: repeat to match exactly
+                                labels = labels.repeat(logits_batch_size // labels_batch_size + 1)[:logits_batch_size]
+                    else:
+                        raise ValueError(
+                            f"Batch size mismatch: decoding_logits has {logits_batch_size} samples, "
+                            f"labels has {labels_batch_size} samples. "
+                            f"GCD: {gcd}, logits_chunks: {logits_num_chunks}, labels_chunks: {labels_num_chunks}. "
+                            f"Cannot align chunks properly."
+                        )
+                else:
+                    # If GCD is 1, try simple repetition
+                    # This might happen with edge cases or partial batches
+                    if logits_batch_size > labels_batch_size:
+                        # Try to repeat labels to match logits
+                        repeat_factor = (logits_batch_size + labels_batch_size - 1) // labels_batch_size
+                        labels = labels.repeat(repeat_factor)[:logits_batch_size]
+                    else:
+                        raise ValueError(
+                            f"Batch size mismatch: decoding_logits has {logits_batch_size} samples, "
+                            f"labels has {labels_batch_size} samples. "
+                            f"GCD is 1, cannot infer relationship."
+                        )
         return {
             "decoding_loss": self.xe_loss(
                 input=decoding_logits, target=labels.to(dtype=torch.long)

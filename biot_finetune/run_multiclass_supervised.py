@@ -70,11 +70,16 @@ from model import (
     CBraMod_3lyStyle_LayerNorm_BIOT,
     CBraMod_3lyStyle_LayerNorm_Ada_BIOT,
 )
-from utils import TUEVLoader, HARLoader, MotionLoader, SEEDLoader, SleepLoader, BiotSleepLoader, collate_fn_seed_with_epoch_id, collate_fn_sleep_with_epoch_id, collate_fn_biot_sleep_with_epoch_id
+from utils import (
+    TUEVLoader, HARLoader, MotionLoader, SEEDLoader, SleepLoader, BiotSleepLoader,
+    collate_fn_seed_with_epoch_id, collate_fn_sleep_with_epoch_id, collate_fn_biot_sleep_with_epoch_id,
+    collate_fn_motion_with_sample_id, list_motion_files_by_subject,
+)
 
 import json
 import yaml
 import re
+import time as _time
 from collections import defaultdict, Counter
 
 # ============ SEED视频投票评估辅助函数 ============
@@ -848,58 +853,140 @@ def prepare_Motion_dataloader(args):
     np.random.seed(seed)
 
     # === 你的 dataset 根目錄 ===
-    root = "../../AllSubjects_Epochs"
+    root = "AllSubjects_Epochs"
 
-    train_files = os.listdir(os.path.join(root, "train"))
-    val_files = os.listdir(os.path.join(root, "val"))
-    test_files = os.listdir(os.path.join(root, "test"))
+    split_mode = getattr(args, "split_mode", "random_epoch")
 
-    print("train/val/test:", len(train_files), len(val_files), len(test_files))
+    if split_mode == "random_epoch":
+        # ===== [保留原逻辑] 完全不变，行为与修改前一致 =====
+        train_files = os.listdir(os.path.join(root, "train"))
+        val_files = os.listdir(os.path.join(root, "val"))
+        test_files = os.listdir(os.path.join(root, "test"))
 
-    # === DataLoaders ===
-    train_loader = torch.utils.data.DataLoader(
-        MotionLoader(
-            os.path.join(root, "train"),
-            train_files,
-            sampling_rate=args.sampling_rate,
-            in_channels=args.in_channels
-        ),
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        # num_workers=args.num_workers,
-        num_workers=0,
-        persistent_workers=False,
-    )
+        print("train/val/test:", len(train_files), len(val_files), len(test_files))
 
-    val_loader = torch.utils.data.DataLoader(
-        MotionLoader(
-            os.path.join(root, "val"),
-            val_files,
-            sampling_rate=args.sampling_rate
-        ),
-        batch_size=args.batch_size,
-        shuffle=False,
-        # num_workers=args.num_workers,
-        num_workers=0,
-        persistent_workers=False,
-    )
+        # === DataLoaders ===
+        train_loader = torch.utils.data.DataLoader(
+            MotionLoader(
+                os.path.join(root, "train"),
+                train_files,
+                sampling_rate=args.sampling_rate,
+                in_channels=args.in_channels
+            ),
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            # num_workers=args.num_workers,
+            num_workers=0,
+            persistent_workers=False,
+        )
 
-    test_loader = torch.utils.data.DataLoader(
-        MotionLoader(
-            os.path.join(root, "test"),
-            test_files,
-            sampling_rate=args.sampling_rate
-        ),
-        batch_size=args.batch_size,
-        shuffle=False,
-        # num_workers=args.num_workers,
-        num_workers=0,
-        persistent_workers=False,
-    )
+        val_loader = torch.utils.data.DataLoader(
+            MotionLoader(
+                os.path.join(root, "val"),
+                val_files,
+                sampling_rate=args.sampling_rate
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+            # num_workers=args.num_workers,
+            num_workers=0,
+            persistent_workers=False,
+        )
 
-    print("Loader sizes:", len(train_loader), len(val_loader), len(test_loader))
-    return train_loader, test_loader, val_loader
+        test_loader = torch.utils.data.DataLoader(
+            MotionLoader(
+                os.path.join(root, "test"),
+                test_files,
+                sampling_rate=args.sampling_rate
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+            # num_workers=args.num_workers,
+            num_workers=0,
+            persistent_workers=False,
+        )
+
+        print("Loader sizes:", len(train_loader), len(val_loader), len(test_loader))
+        return train_loader, test_loader, val_loader, None
+
+    elif split_mode == "subject_independent":
+        # ===== [新增] 20-fold LOSO：test = 指定受试者，val = 另一个指定受试者，
+        # train = 其余受试者。三个子集的受试者互不重叠，合并 train/val/test
+        # 三个目录下的全部 epoch 后按受试者重新分组。 =====
+        if not args.test_subject or not args.val_subject:
+            raise ValueError(
+                "split_mode=subject_independent requires --test_subject and --val_subject"
+            )
+        if args.test_subject == args.val_subject:
+            raise ValueError("--test_subject and --val_subject must be different")
+
+        subject_to_files = list_motion_files_by_subject(root)
+        subjects = sorted(subject_to_files.keys(), key=lambda s: int(s[3:]))
+        for s in (args.test_subject, args.val_subject):
+            if s not in subject_to_files:
+                raise ValueError(f"Subject {s!r} not found among {subjects}")
+
+        train_subjects = [s for s in subjects if s not in (args.test_subject, args.val_subject)]
+        val_subjects = [args.val_subject]
+        test_subjects = [args.test_subject]
+
+        def gather(subj_list):
+            files = []
+            for s in subj_list:
+                files.extend(subject_to_files[s])
+            return files
+
+        train_files = gather(train_subjects)
+        val_files = gather(val_subjects)
+        test_files = gather(test_subjects)
+
+        print(f"[split_mode=subject_independent] fold={args.fold_idx}  "
+              f"test={args.test_subject}  val={args.val_subject}  "
+              f"train={len(train_subjects)} subjects")
+        print("train/val/test files:", len(train_files), len(val_files), len(test_files))
+
+        train_loader = torch.utils.data.DataLoader(
+            MotionLoader(
+                "", train_files,
+                sampling_rate=args.sampling_rate,
+                in_channels=args.in_channels,
+            ),
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0,
+            persistent_workers=False,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            MotionLoader(
+                "", val_files,
+                sampling_rate=args.sampling_rate,
+                in_channels=args.in_channels,
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            persistent_workers=False,
+        )
+        test_loader = torch.utils.data.DataLoader(
+            MotionLoader(
+                "", test_files,
+                sampling_rate=args.sampling_rate,
+                in_channels=args.in_channels,
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            persistent_workers=False,
+        )
+
+        print("Loader sizes:", len(train_loader), len(val_loader), len(test_loader))
+        motion_test_meta = {"root": "", "files": test_files}
+        return train_loader, test_loader, val_loader, motion_test_meta
+
+    else:
+        raise ValueError(f"Unknown split_mode: {split_mode!r}")
 
 def prepare_SEED_dataloader(args):
     """
@@ -1228,13 +1315,181 @@ def prepare_BiotSleep_dataloader(args):
     print("Loader sizes:", len(train_loader), len(val_loader), len(test_loader))
     return train_loader, test_loader, val_loader
 
+
+class BestEpochTracker(pl.Callback):
+    """[新增] 纯观察者：记录验证集 val_bacc 最好的那个 epoch（1-indexed），
+    不修改 LitModel_finetune 的任何训练/验证逻辑，只读 trainer.callback_metrics。
+    仅在 Motion + subject_independent 20折路径下挂载。"""
+
+    def __init__(self, monitor="val_bacc"):
+        self.monitor = monitor
+        self.best_score = float("-inf")
+        self.best_epoch = 0
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        score = trainer.callback_metrics.get(self.monitor)
+        if score is None:
+            return
+        score = float(score)
+        if score > self.best_score:
+            self.best_score = score
+            self.best_epoch = trainer.current_epoch + 1
+
+
+def save_motion_fold_results(args, lightning_model, checkpoint_callback, motion_test_meta,
+                              best_epoch, train_time_sec, save_dir):
+    """[新增] 用被选中的最佳 epoch 权重对 test 集重新推理一次，保存
+    {task}_{model}_fold{i:02d}.npz (sample_id/y_true/y_pred/y_prob/subject_id)
+    和 .json (fold/test_subject/val_subject/balanced_accuracy/best_epoch/
+    hyperparams/train_time_sec/peak_gpu_mem_mb/gpu_name)。
+    只在 Motion + subject_independent 时被调用；失败直接抛异常，不静默跳过；
+    已存在的旧结果会先改名备份（加时间戳），不会被静默覆盖。"""
+
+    # 显式从 best checkpoint 重新加载权重，不依赖 trainer.test(ckpt_path="best")
+    # 是否会把权重原地留在 lightning_model 上这种隐式行为。
+    best_ckpt_path = checkpoint_callback.best_model_path
+    if not best_ckpt_path or not os.path.exists(best_ckpt_path):
+        raise RuntimeError(
+            f"save_motion_fold_results: no best checkpoint found (best_model_path={best_ckpt_path!r})"
+        )
+    state = torch.load(best_ckpt_path, map_location="cpu")
+    lightning_model.load_state_dict(state["state_dict"])
+
+    model = lightning_model.model
+    device = next(model.parameters()).device
+    model.eval()
+
+    sid_test_loader = torch.utils.data.DataLoader(
+        MotionLoader(
+            motion_test_meta["root"], motion_test_meta["files"],
+            sampling_rate=args.sampling_rate, in_channels=args.in_channels,
+            return_sample_id=True,
+        ),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn_motion_with_sample_id,
+    )
+
+    subj_re = re.compile(r'^S(\d+)_')
+    sample_ids, y_true, y_pred, y_prob, subject_ids = [], [], [], [], []
+    with torch.no_grad():
+        for X, Y, batch_sample_ids in sid_test_loader:
+            X = X.to(device)
+            logits = model(X)
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(logits, dim=1)
+            for i, sid in enumerate(batch_sample_ids):
+                m = subj_re.match(sid)
+                if not m:
+                    raise ValueError(f"Cannot parse subject_id from sample_id: {sid!r}")
+                sample_ids.append(sid)
+                y_true.append(int(Y[i].item()))
+                y_pred.append(int(preds[i].cpu().item()))
+                y_prob.append(probs[i].cpu().numpy())
+                subject_ids.append(int(m.group(1)))
+
+    if len(sample_ids) == 0:
+        raise RuntimeError("save_motion_fold_results: no samples collected, refusing to save an empty file.")
+
+    sample_ids_arr = np.array(sample_ids)
+    order = np.argsort(sample_ids_arr)
+    sample_ids_arr = sample_ids_arr[order]
+    y_true_arr = np.array(y_true, dtype=np.int64)[order]
+    y_pred_arr = np.array(y_pred, dtype=np.int64)[order]
+    y_prob_arr = np.array(y_prob, dtype=np.float32)[order]
+    subject_id_arr = np.array(subject_ids, dtype=np.int64)[order]
+
+    task = args.task_name if args.task_name else args.dataset.lower()
+    model_name = args.model_name
+    os.makedirs(save_dir, exist_ok=True)
+    npz_path = os.path.join(save_dir, f"{task}_{model_name}_fold{args.fold_idx:02d}.npz")
+    json_path = os.path.join(save_dir, f"{task}_{model_name}_fold{args.fold_idx:02d}.json")
+
+    # 已有旧结果先改名备份，绝不静默覆盖
+    for path in (npz_path, json_path):
+        if os.path.exists(path):
+            ts = _time.strftime("%Y%m%d-%H%M%S")
+            backup_path = f"{path}.bak-{ts}"
+            os.rename(path, backup_path)
+            print(f"[warn] existing fold result found, backed up to {backup_path}")
+
+    np.savez(
+        npz_path,
+        sample_id=sample_ids_arr,
+        y_true=y_true_arr,
+        y_pred=y_pred_arr,
+        y_prob=y_prob_arr,
+        subject_id=subject_id_arr,
+    )
+    if not os.path.exists(npz_path):
+        raise RuntimeError(f"save_motion_fold_results: failed to write {npz_path}")
+    _reload = np.load(npz_path)
+    for key in ("sample_id", "y_true", "y_pred", "y_prob", "subject_id"):
+        if key not in _reload:
+            raise RuntimeError(f"save_motion_fold_results: {npz_path} missing key {key!r} after write")
+
+    balanced_accuracy = float(balanced_accuracy_score(y_true_arr, y_pred_arr))
+
+    hyperparams = {
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "optimizer": "Adam",
+        "seed": 4523,
+        "model": args.model,
+        "dataset_channels": args.dataset_channels,
+        "in_channels": args.in_channels,
+        "sample_length": args.sample_length,
+        "sampling_rate": args.sampling_rate,
+        "token_size": args.token_size,
+        "hop_length": args.hop_length,
+        "freeze_backbone": bool(args.freeze_backbone),
+    }
+
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    peak_gpu_mem_mb = (torch.cuda.max_memory_allocated(0) / (1024 ** 2)) if torch.cuda.is_available() else None
+
+    meta = {
+        "fold": args.fold_idx,
+        "test_subject": args.test_subject,
+        "val_subject": args.val_subject,
+        "balanced_accuracy": balanced_accuracy,
+        "best_epoch": best_epoch,
+        "saved_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": hyperparams,
+        "train_time_sec": train_time_sec,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "gpu_name": gpu_name,
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"save_motion_fold_results: failed to write {json_path}")
+    with open(json_path) as f:
+        json.load(f)  # 回读校验 JSON 没写坏
+
+    print(f"Saved fold predictions to {npz_path}")
+    print(f"Saved fold metadata to {json_path}")
+    print(f"  fold={args.fold_idx} test={args.test_subject} val={args.val_subject} "
+          f"best_epoch={best_epoch} balanced_accuracy={balanced_accuracy:.5f}")
+
+
 def supervised(args):
+    motion_test_meta = None
+    is_motion_loso = (
+        args.dataset == "Motion"
+        and getattr(args, "split_mode", "random_epoch") == "subject_independent"
+    )
+
     # get data loaders
     if args.dataset == "TUEV":
         train_loader, test_loader, val_loader = prepare_TUEV_dataloader(args)
 
     elif args.dataset == "Motion":
-        train_loader, test_loader, val_loader = prepare_Motion_dataloader(args)
+        train_loader, test_loader, val_loader, motion_test_meta = prepare_Motion_dataloader(args)
 
     elif args.dataset in ["SEED", "SEED-ST"]:
         train_loader, test_loader, val_loader = prepare_SEED_dataloader(args)
@@ -1379,6 +1634,12 @@ def supervised(args):
 
     # logger and callbacks
     version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}"
+    if is_motion_loso:
+        # [新增] 20折共用同一组超参数，仅 test/val 受试者不同；不加区分会导致
+        # 20 折全部落在同一个 ./log/{version} 目录，互相覆盖 checkpoint/日志。
+        # 时间戳保证同一折被重跑（比如中断后重试）也不会覆盖上一次的产物。
+        run_timestamp = _time.strftime("%Y%m%d-%H%M%S")
+        version += f"-fold{args.fold_idx:02d}-test{args.test_subject}-{run_timestamp}"
     logger = TensorBoardLogger(
         save_dir="./",
         version=version,
@@ -1409,6 +1670,27 @@ def supervised(args):
     #     monitor="val_f1_macro", patience=5, verbose=True, mode="max"
     # )
 
+    # [新增] 仅在 Motion + subject_independent 20折路径下挂载
+    # ModelCheckpoint(monitor="val_bacc")：此前 callbacks=[] 意味着
+    # enable_checkpointing=True 用的是 PL 默认的"最后一轮"checkpoint，
+    # 下面 trainer.test(ckpt_path="best") 名不副实地一直在用最后一轮而不是
+    # 验证集最好的一轮。这里修好这个选择逻辑，但只作用于这条新路径，
+    # 其他数据集 / Motion 的 random_epoch 路径都保持 callbacks=[] 不变。
+    checkpoint_callback = None
+    best_epoch_tracker = None
+    if is_motion_loso:
+        checkpoint_callback = ModelCheckpoint(
+            monitor="val_bacc",
+            mode="max",
+            save_top_k=1,
+            filename="best-{epoch:02d}-{val_bacc:.5f}",
+            auto_insert_metric_name=False,
+        )
+        best_epoch_tracker = BestEpochTracker(monitor="val_bacc")
+        callbacks = [checkpoint_callback, best_epoch_tracker]
+    else:
+        callbacks = []  # 移除早停回调
+
     trainer = pl.Trainer(
         # devices=[0],
         accelerator="gpu",
@@ -1419,7 +1701,7 @@ def supervised(args):
         enable_checkpointing=True,
         logger=logger,
         max_epochs=args.epochs,
-        callbacks=[],  # 移除早停回调
+        callbacks=callbacks,
     )
     # trainer = pl.Trainer(
     #     accelerator="cpu",
@@ -1432,9 +1714,13 @@ def supervised(args):
     # )
 
     # train the model
+    if is_motion_loso and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    train_start_time = _time.time()
     trainer.fit(
         lightning_model, train_dataloaders=train_loader, val_dataloaders=val_loader
     )
+    train_time_sec = _time.time() - train_start_time
 
     # test the model
     pretrain_result = trainer.test(
@@ -1444,7 +1730,15 @@ def supervised(args):
     print("最终测试结果:")
     print("="*50)
     print(pretrain_result)
-    
+
+    # [新增] 20折 LOSO 下，用最佳 epoch 权重对 test 集重新推理，落盘
+    # sample_id/y_true/y_pred/y_prob/subject_id 供事后复现所有指标
+    if is_motion_loso:
+        save_motion_fold_results(
+            args, lightning_model, checkpoint_callback, motion_test_meta,
+            best_epoch_tracker.best_epoch, train_time_sec, save_dir=(args.fold_results_dir or log_dir),
+        )
+
     # 如果结果中包含混淆矩阵，也打印出来
     if "confusion_matrix" in pretrain_result:
         print("\n" + "="*50)
@@ -1504,6 +1798,26 @@ if __name__ == "__main__":
         action="store_true",
         help="Freeze the backbone during training (default: False)."
     )
+    # ===== [新增] Motion 20折 subject-independent LOSO 相关参数 =====
+    # 默认值完全复现今天的行为：split_mode 默认 random_epoch，其余数据集/
+    # Motion 的旧路径都不读这些新参数。
+    parser.add_argument(
+        "--split_mode", type=str, default="random_epoch",
+        choices=["random_epoch", "subject_independent"],
+        help="Motion dataset split strategy; only Motion reads this."
+    )
+    parser.add_argument("--test_subject", type=str, default=None,
+                        help="e.g. Sub04; required when split_mode=subject_independent")
+    parser.add_argument("--val_subject", type=str, default=None,
+                        help="e.g. Sub05; required when split_mode=subject_independent")
+    parser.add_argument("--fold_idx", type=int, default=0,
+                        help="LOSO fold index (0-based), used in saved filenames/log dir")
+    parser.add_argument("--model_name", type=str, default="biot",
+                        help="model label used in saved {task}_{model}_fold{i}.npz/json filenames")
+    parser.add_argument("--task_name", type=str, default=None,
+                        help="task label used in saved filenames; defaults to dataset.lower()")
+    parser.add_argument("--fold_results_dir", type=str, default=None,
+                        help="where to save {task}_{model}_fold{i}.npz/json; defaults to the run's log_dir")
     args = parser.parse_args()
     print(args)
 

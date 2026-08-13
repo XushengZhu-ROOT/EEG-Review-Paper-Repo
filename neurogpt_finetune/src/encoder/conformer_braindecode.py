@@ -186,7 +186,12 @@ class EEGConformer(EEGModuleMixin, nn.Module):
 
         if self.is_decoding_mode:
             # pdb.set_trace()
-            x = self.fc(x)
+            # Flatten transformer output from (batch * chunks, seq_len, emb_size) to (batch * chunks, final_fc_length)
+            # where final_fc_length = seq_len * emb_size
+            if x.dim() == 3:
+                x = x.contiguous().view(batch * chunks, -1)  # Flatten: (batch * chunks, seq_len * emb_size)
+            # Store batch and chunks info for fc layer to use
+            x = self.fc(x, batch_size=batch, num_chunks=chunks)
             x = self.final_layer(x)
         return x
 
@@ -424,8 +429,18 @@ class _FullyConnected_3ly(nn.Module):
     ):
 
         super().__init__()
+        self.final_fc_length = final_fc_length
+        self.out_channels = out_channels
+        # Create linear layers for common chunk counts (2, 4, 5, 8, 10)
+        # This supports both motor6class (2 chunks) and emotion7class (5 chunks)
+        self.linear_layers = nn.ModuleDict({
+            '2': nn.Linear(final_fc_length * 2, out_channels),
+            '4': nn.Linear(final_fc_length * 4, out_channels),
+            '5': nn.Linear(final_fc_length * 5, out_channels),
+            '8': nn.Linear(final_fc_length * 8, out_channels),
+            '10': nn.Linear(final_fc_length * 10, out_channels),
+        })
         self.fc = nn.Sequential(
-            nn.Linear(final_fc_length * 2, out_channels),
             nn.ELU(),
             nn.Dropout(drop_prob_1),
             nn.Linear(out_channels, hidden_channels),
@@ -433,8 +448,35 @@ class _FullyConnected_3ly(nn.Module):
             nn.Dropout(drop_prob_2),
         )
 
-    def forward(self, x):
-        x = x.contiguous().view(x.size(0) // 2, -1)
+    def forward(self, x, batch_size=None, num_chunks=None):
+        # If batch_size and num_chunks are provided, reshape to group by samples
+        if batch_size is not None and num_chunks is not None:
+            # Reshape: (batch * chunks, final_fc_length) -> (batch, chunks * final_fc_length)
+            x = x.contiguous().view(batch_size, num_chunks * self.final_fc_length)
+            # Use the appropriate linear layer based on num_chunks
+            chunk_key = str(num_chunks)
+            if chunk_key in self.linear_layers:
+                x = self.linear_layers[chunk_key](x)
+            else:
+                # Fallback: create a new linear layer dynamically (not ideal but works)
+                # This should rarely happen
+                if not hasattr(self, f'_dynamic_linear_{num_chunks}'):
+                    setattr(self, f'_dynamic_linear_{num_chunks}', 
+                           nn.Linear(num_chunks * self.final_fc_length, self.out_channels).to(x.device))
+                x = getattr(self, f'_dynamic_linear_{num_chunks}')(x)
+        else:
+            # Fallback to original logic: assume 2 chunks per sample
+            # This maintains backward compatibility with existing code
+            if x.size(0) % 2 == 0 and x.size(1) == self.final_fc_length:
+                x = x.contiguous().view(x.size(0) // 2, -1)
+                x = self.linear_layers['2'](x)
+            else:
+                # If dimensions don't match, try to infer
+                # This is a fallback for edge cases
+                raise ValueError(
+                    f"Cannot process input with shape {x.shape}. "
+                    f"Expected (batch * chunks, final_fc_length) or provide batch_size and num_chunks."
+                )
         out = self.fc(x)
         return out
 
