@@ -85,7 +85,8 @@ def main():
     results = []
     with torch.no_grad():
         for batch in tqdm(loader, desc='Predicting'):
-            x, y, epoch_ids = batch
+            # collate 现在返回 (x, y, epoch_ids, sample_ids) 四元组；这里不需要 sample_ids
+            x, y, epoch_ids = batch[0], batch[1], batch[2]
             x = x.to(device)
             pred = model(x)
             pred_cls = torch.argmax(pred, dim=-1).cpu().numpy()

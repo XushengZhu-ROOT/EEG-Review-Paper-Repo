@@ -209,3 +209,12 @@ __marimo__/
 biot_finetune/log/
 biot_finetune/pretrained-models/
 labram_finetune/checkpoints/
+
+# cbramod_finetune: raw data / pretrained weights / experiment outputs — regenerate or
+# copy locally, never commit (large binary, changes every run)
+cbramod_finetune/AllSubjects_Epochs/
+cbramod_finetune/pretrained_weights/
+cbramod_finetune/models_weights/
+cbramod_finetune/fold_results/
+cbramod_finetune/fold_results_smoke/
+cbramod_finetune/viz_R1/
