@@ -71,7 +71,7 @@ from model import (
     CBraMod_3lyStyle_LayerNorm_Ada_BIOT,
 )
 from utils import (
-    TUEVLoader, HARLoader, MotionLoader, SEEDLoader, SleepLoader, BiotSleepLoader,
+    TUEVLoader, HARLoader, MotionLoader, MotionSTLoader, SEEDLoader, SleepLoader, BiotSleepLoader,
     collate_fn_seed_with_epoch_id, collate_fn_sleep_with_epoch_id, collate_fn_biot_sleep_with_epoch_id,
     collate_fn_motion_with_sample_id, list_motion_files_by_subject,
 )
@@ -860,8 +860,15 @@ def prepare_Motion_dataloader(args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    # === 你的 dataset 根目錄 ===
-    root = "AllSubjects_Epochs"
+    # === dataset 根目錄：Motion 用 BIOT 的 AllSubjects_Epochs（原样不动），
+    # Motion-ST 用 STTransformer 的 Motiondata_ST（原生 20ch @ 250Hz，不做
+    # BIOT 那套 20->16 通道映射） ===
+    if args.dataset == "Motion-ST":
+        root = "Motiondata_ST"
+        loader_cls = MotionSTLoader
+    else:
+        root = "AllSubjects_Epochs"
+        loader_cls = MotionLoader
 
     split_mode = getattr(args, "split_mode", "random_epoch")
 
@@ -875,7 +882,7 @@ def prepare_Motion_dataloader(args):
 
         # === DataLoaders ===
         train_loader = torch.utils.data.DataLoader(
-            MotionLoader(
+            loader_cls(
                 os.path.join(root, "train"),
                 train_files,
                 sampling_rate=args.sampling_rate,
@@ -890,7 +897,7 @@ def prepare_Motion_dataloader(args):
         )
 
         val_loader = torch.utils.data.DataLoader(
-            MotionLoader(
+            loader_cls(
                 os.path.join(root, "val"),
                 val_files,
                 sampling_rate=args.sampling_rate
@@ -903,7 +910,7 @@ def prepare_Motion_dataloader(args):
         )
 
         test_loader = torch.utils.data.DataLoader(
-            MotionLoader(
+            loader_cls(
                 os.path.join(root, "test"),
                 test_files,
                 sampling_rate=args.sampling_rate
@@ -955,7 +962,7 @@ def prepare_Motion_dataloader(args):
         print("train/val/test files:", len(train_files), len(val_files), len(test_files))
 
         train_loader = torch.utils.data.DataLoader(
-            MotionLoader(
+            loader_cls(
                 "", train_files,
                 sampling_rate=args.sampling_rate,
                 in_channels=args.in_channels,
@@ -967,7 +974,7 @@ def prepare_Motion_dataloader(args):
             persistent_workers=False,
         )
         val_loader = torch.utils.data.DataLoader(
-            MotionLoader(
+            loader_cls(
                 "", val_files,
                 sampling_rate=args.sampling_rate,
                 in_channels=args.in_channels,
@@ -978,7 +985,7 @@ def prepare_Motion_dataloader(args):
             persistent_workers=False,
         )
         test_loader = torch.utils.data.DataLoader(
-            MotionLoader(
+            loader_cls(
                 "", test_files,
                 sampling_rate=args.sampling_rate,
                 in_channels=args.in_channels,
@@ -1367,8 +1374,9 @@ def save_motion_fold_results(args, lightning_model, checkpoint_callback, motion_
     device = next(model.parameters()).device
     model.eval()
 
+    loader_cls = MotionSTLoader if args.dataset == "Motion-ST" else MotionLoader
     sid_test_loader = torch.utils.data.DataLoader(
-        MotionLoader(
+        loader_cls(
             motion_test_meta["root"], motion_test_meta["files"],
             sampling_rate=args.sampling_rate, in_channels=args.in_channels,
             return_sample_id=True,
@@ -1488,7 +1496,7 @@ def save_motion_fold_results(args, lightning_model, checkpoint_callback, motion_
 def supervised(args):
     motion_test_meta = None
     is_motion_loso = (
-        args.dataset == "Motion"
+        args.dataset in ("Motion", "Motion-ST")
         and getattr(args, "split_mode", "random_epoch") == "subject_independent"
     )
 
@@ -1496,7 +1504,7 @@ def supervised(args):
     if args.dataset == "TUEV":
         train_loader, test_loader, val_loader = prepare_TUEV_dataloader(args)
 
-    elif args.dataset == "Motion":
+    elif args.dataset in ("Motion", "Motion-ST"):
         train_loader, test_loader, val_loader, motion_test_meta = prepare_Motion_dataloader(args)
 
     elif args.dataset in ["SEED", "SEED-ST"]:

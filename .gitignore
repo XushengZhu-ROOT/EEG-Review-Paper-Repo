@@ -1,3 +1,15 @@
+# Repo-wide: any folder (at any depth, any project) with "epoch", "data",
+# "result", or "log" in its name is raw EEG data / generated epoch dumps /
+# training logs / experiment results -- always regenerate or copy locally,
+# never commit (large, changes every run). Exceptions: source-code folders
+# that happen to have "data" in the name are explicitly un-ignored below.
+**/*[Ee]poch*/
+**/*[Dd]ata*/
+**/*[Rr]esult*/
+**/*[Ll]og*/
+!cbramod_finetune/datasets/
+!neurolm_finetune/text_dataset_maker/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
