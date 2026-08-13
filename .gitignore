@@ -221,3 +221,16 @@ cbramod_finetune/models_weights/
 cbramod_finetune/fold_results/
 cbramod_finetune/fold_results_smoke/
 cbramod_finetune/viz_R1/
+
+# eegpt_finetune: raw data / pretrained checkpoint / experiment outputs — regenerate or
+# copy locally, never commit (large binary, changes every run)
+eegpt_finetune/kaggle_data/
+eegpt_finetune/sleep_data/
+eegpt_finetune/seed_data/
+eegpt_finetune/Stress_data/
+eegpt_finetune/Motiondata/
+eegpt_finetune/output/
+eegpt_finetune/fold_results_eegpt/
+eegpt_finetune/fold_results_eegpt_smoke/
+eegpt_finetune/*.ckpt
+eegpt_finetune/*.pickle
