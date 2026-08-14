@@ -4,6 +4,7 @@ https://github.com/935963004/NeuroLM
 """
 
 import os
+import sys
 import time
 import json
 import yaml
@@ -14,13 +15,14 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score
 
 from model.model_neurolm import NeuroLM
 from model.model import GPTConfig
 from pathlib import Path
 import tiktoken
 from utils import prepare_KaggleERN_dataset, prepare_STRESS_dataset, prepare_SEED7_dataset, prepare_motor_dataset, prepare_sleep_dataset, cosine_scheduler, get_metrics
+from utils import prepare_motor_dataset_loso
 from torch.utils.data.dataset import ConcatDataset
 
 
@@ -74,6 +76,54 @@ def _print_confusion_matrices(results, dataset_info, split_name):
             print(row)
 
 
+def compute_class_token_ids(loader, num_classes):
+    """从数据集自身的 prompt / answer 文本张量推导每个类别的“答案 token id”及答案位置 k。
+
+    找出各类别 answer 文本第一个互不相同的 token 位置 k，该位置的 token 即类别 token。
+    评估时：喂入各类别的“共同前缀” answer_text[:k]（即读完 prompt 后应生成第一个答案 token 之前的上下文），
+    读取最后位置的 logits，对这些类别 token 取 softmax 即得到类别概率。
+
+    这样对 GPT-2 BPE 是否把 '(' 与字母合并都成立：
+      - 不合并: k == len(prompt)，前缀就是完整 prompt，预测的是字母 token；
+      - 合并:   k == len(prompt)-1，前缀是去掉尾部 '(' 的 prompt，预测的是 '(A' 这类合并 token。
+    两种情况都与训练时的监督位置一致（训练用 prompt_len-1 对齐）。
+
+    自检（fail loud）：
+      - 必须存在互不相同的位置 k；
+      - loader.prompt 的前 k 个 token 必须等于共同前缀（即前缀与 prompt 一致）；
+      - 1 <= k <= len(prompt)；
+      - 各类别 token 两两不同。
+    返回 (class_token_ids, k)。
+    """
+    if not hasattr(loader, 'prompt') or not hasattr(loader, 'text'):
+        raise RuntimeError("loader 没有 prompt / text，无法推导 class token id（需 is_instruct=True）")
+
+    prompt = loader.prompt.cpu()
+    p = int(prompt.size(0))
+    texts = [loader.text[c].cpu() for c in range(num_classes)]
+    min_len = min(int(t.size(0)) for t in texts)
+
+    k = None
+    for i in range(min_len):
+        toks_i = set(int(t[i].item()) for t in texts)
+        if len(toks_i) > 1:
+            k = i
+            break
+    if k is None:
+        raise RuntimeError("各类别 answer 文本没有任何互不相同的 token，无法区分类别")
+    if not (1 <= k <= p):
+        raise RuntimeError(f"答案位置 k={k} 不在 [1, prompt_len={p}] 内，假设不成立")
+    # 共同前缀应与 prompt 的前 k 个 token 一致
+    if not torch.equal(prompt[:k], texts[0][:k]):
+        raise RuntimeError("answer 文本的共同前缀与 prompt 不一致，假设不成立")
+
+    ids = [int(t[k].item()) for t in texts]
+    if len(set(ids)) != num_classes:
+        raise RuntimeError(f"类别 token id 不是两两不同: {ids}")
+    print(f"class_token_ids (num_classes={num_classes}): {ids}, answer_pos k={k}, prompt_len p={p}")
+    return ids, k
+
+
 def init(args):
     global ctx, master_process, ddp, ddp_world_size, ddp_rank, device, dtype, device_type, ddp_local_rank
     # various inits, derived attributes, I/O setup
@@ -107,8 +157,9 @@ def init(args):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 
-def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_max_len=-1):
+def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_max_len=-1, fold=None):
         dataset_info = {'name': downstream_dataset}
+        dataset_info['loso_meta'] = None
         if downstream_dataset == 'KaggleERN':
             dataset_train, dataset_test, dataset_val = prepare_KaggleERN_dataset(Path(args.dataset_dir), chan_size=args.chan_size, is_instruct=True, 
                                                                             eeg_max_len=eeg_max_len, text_max_len=text_max_len)
@@ -161,7 +212,14 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             #     print(f"Note: result_idx will be automatically determined from first successful prediction during evaluation.")
             #     print(f"{'='*80}\n")
         elif downstream_dataset == 'MOTOR':
-            dataset_train, dataset_test, dataset_val = prepare_motor_dataset(Path(args.dataset_dir), is_instruct=True, 
+            if fold is not None:
+                # leave-one-subject-out: 忽略原始 train/val/test 划分，按被试重新分折
+                dataset_train, dataset_test, dataset_val, loso_meta = prepare_motor_dataset_loso(
+                    Path(args.dataset_dir), fold=fold, is_instruct=True,
+                    eeg_max_len=eeg_max_len, text_max_len=text_max_len, n_folds=args.n_folds)
+                dataset_info['loso_meta'] = loso_meta
+            else:
+                dataset_train, dataset_test, dataset_val = prepare_motor_dataset(Path(args.dataset_dir), is_instruct=True,
                                                                             eeg_max_len=eeg_max_len, text_max_len=text_max_len)
 
             dataset_info['metrics'] = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
@@ -188,6 +246,13 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
         dataset_info['dataset_train'] = dataset_train
         dataset_info['dataset_val'] = dataset_val
         dataset_info['dataset_test'] = dataset_test
+
+        # LOSO 评估：数据集会额外返回 sample_id / subject_id，并用答案位置 logits 计算 softmax 概率
+        dataset_info['has_sample_id'] = (fold is not None)
+        if fold is not None:
+            _cti, _apos = compute_class_token_ids(dataset_test, dataset_info['num_classes'])
+            dataset_info['class_token_ids'] = _cti
+            dataset_info['answer_pos'] = _apos
 
         if ddp:
             sampler_train = torch.utils.data.DistributedSampler(
@@ -303,7 +368,7 @@ def main(args):
             f"Unsupported dataset: {args.dataset_dir}\n"
             f"Path must contain: ['stress', 'kaggleern', 'seed', 'motor', 'sleep']"
         )
-    all_datasets.append(get_instruct_datasets(args, name, eeg_max_len=248, text_max_len=80))
+    all_datasets.append(get_instruct_datasets(args, name, eeg_max_len=248, text_max_len=80, fold=args.fold))
         
     if concat_datasets:
         merge_datasets = ConcatDataset([dataset_info['dataset_train'] for dataset_info in all_datasets])
@@ -458,7 +523,18 @@ def main(args):
     raw_model = model.module if ddp else model # unwrap DDP container if needed
     if args.eval_only:
         start_epoch = 0
+
+    # ===== LOSO 状态：验证集选最佳 epoch + 训练计时 + 显存峰值 =====
+    loso_enabled = args.fold is not None
+    best_val_bacc = -1.0
+    best_epoch = -1
+    best_test_payload = None
+    train_time_sec = 0.0
+    if loso_enabled and device_type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+
     for epoch in range(start_epoch, args.epochs):
+        epoch_train_start = time.time()
         for dataset_info in datasets:
             if args.eval_only:
                 break
@@ -571,6 +647,32 @@ def main(args):
         #         print(f"saving checkpoint to {checkpoint_out_dir}")
         #         torch.save(checkpoint, os.path.join(checkpoint_out_dir, f'ckpt-{epoch}.pt'))
         
+        # 累计训练耗时（不含评估）
+        train_time_sec += time.time() - epoch_train_start
+
+        # ===== LOSO：用验证集 balanced_accuracy 选最佳 epoch；测试集结果留到折末保存 =====
+        if loso_enabled:
+            for dataset_info in all_datasets:
+                val_payload = evaluate_probs(raw_model, dataset_info, dataset_info['data_loader_val'])
+                test_payload = evaluate_probs(raw_model, dataset_info, dataset_info['data_loader_test'])
+                val_bacc = float(balanced_accuracy_score(val_payload['y_true'], val_payload['y_pred']))
+                test_bacc = float(balanced_accuracy_score(test_payload['y_true'], test_payload['y_pred']))
+                print(f"[fold {args.fold}] epoch {epoch}: val_bacc={val_bacc:.4f} test_bacc={test_bacc:.4f}")
+                if master_process and args.wandb_log:
+                    wandb.log({
+                        f'val_{dataset_info["name"]}/balanced_accuracy': val_bacc,
+                        f'test_{dataset_info["name"]}/balanced_accuracy': test_bacc,
+                        'epoch': epoch,
+                    })
+                # 验证集更优则记录该 epoch 的测试集预测
+                if val_bacc > best_val_bacc:
+                    best_val_bacc = val_bacc
+                    best_epoch = epoch
+                    best_test_payload = test_payload
+            if args.eval_only:
+                break
+            continue
+
         # validation and test
         for dataset_info in all_datasets:
             print('Dataset:', dataset_info['name'])
@@ -622,6 +724,51 @@ def main(args):
                     })
         if args.eval_only:
             break
+
+    # ===== 折末：保存该折测试集结果（npz + json）。保存失败直接报错退出 =====
+    if loso_enabled:
+        if best_test_payload is None:
+            raise RuntimeError(f"[fold {args.fold}] 没有可保存的测试结果（best_test_payload 为空）")
+        peak_gpu_mem_mb = 0.0
+        gpu_name = 'cpu'
+        if device_type == 'cuda':
+            peak_gpu_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            gpu_name = torch.cuda.get_device_name(device)
+        loso_meta = all_datasets[0].get('loso_meta') or {}
+        hyperparams = {
+            'learning_rate': args.learning_rate,
+            'min_lr': args.min_lr,
+            'weight_decay': args.weight_decay,
+            'beta1': args.beta1,
+            'beta2': args.beta2,
+            'eeg_batch_size': args.eeg_batch_size,
+            'text_batch_size': args.text_batch_size,
+            'epochs': args.epochs,
+            'warmup_epochs': args.warmup_epochs,
+            'warmup_ratio': args.warmup_ratio,
+            'grad_clip': args.grad_clip,
+            'block_size': args.block_size,
+            'decay_lr': bool(args.decay_lr),
+            'seed': args.seed,
+        }
+        fold_stats = {
+            'test_subject': loso_meta.get('test_subject'),
+            'val_subject': loso_meta.get('val_subject'),
+            'best_epoch': best_epoch,
+            'best_val_bacc': best_val_bacc,
+            'hyperparams': hyperparams,
+            'train_time_sec': train_time_sec,
+            'peak_gpu_mem_mb': peak_gpu_mem_mb,
+            'gpu_name': gpu_name,
+        }
+        if master_process:
+            try:
+                save_fold_results(args, all_datasets[0]['name'], best_test_payload, fold_stats)
+            except Exception as e:
+                print(f"[fold {args.fold}] 保存结果失败: {e}", file=sys.stderr)
+                if ddp:
+                    destroy_process_group()
+                raise
 
     if ddp:
         destroy_process_group()
@@ -1212,6 +1359,143 @@ def evaluate(model, dataset_info, dataloader, decode):
     return results
 
 
+@torch.no_grad()
+def evaluate_probs(model, dataset_info, dataloader):
+    """LOSO 评估：对答案位置的 logits，在各类别 token 上做 softmax，得到每个样本的类别概率。
+
+    注意：这里 model 应传入未包 DDP 的 raw_model（与原 evaluate 一致）。
+    评估用的 val/test dataloader 使用 SequentialSampler，各 rank 看到完整数据且结果一致，
+    因此每个 rank 计算得到相同结果，最终只由 master_process 落盘。
+
+    返回 payload dict:
+      sample_id (N,) str, subject_id (N,) int, y_true (N,) int,
+      y_pred (N,) int(=argmax(y_prob)), y_prob (N, C) float
+    """
+    model.eval()
+    class_token_ids = dataset_info['class_token_ids']
+    answer_pos = dataset_info['answer_pos']             # k：答案 token 在 prompt/answer 里的位置
+    cti = torch.as_tensor(class_token_ids, device=device, dtype=torch.long)
+
+    all_sid, all_subj, all_true, all_prob = [], [], [], []
+    for batch in dataloader:
+        # MotorLoader(is_val=True) 返回 9 元组，末两个是 sample_id / subject_id
+        X_eeg, X_text, label, input_chans, input_time, input_mask, gpt_mask, sample_id, subject_id = batch
+
+        X_eeg = X_eeg.float().to(device, non_blocking=True)
+        X_text = X_text.to(device, non_blocking=True)
+        input_chans = input_chans.to(device, non_blocking=True)
+        input_time = input_time.to(device, non_blocking=True)
+        gpt_mask = gpt_mask.to(device, non_blocking=True)
+        if input_mask is not None:
+            input_mask = input_mask.to(device, non_blocking=True)
+
+        # 只喂到答案位置之前的“共同前缀”（X_text 在验证集里就是完整 prompt，长度 p）。
+        # answer_pos == p 时为无操作；== p-1 时会去掉尾部 '(' token。相应裁剪 eeg-text 注意力掩码。
+        E = X_eeg.size(1)                                # eeg token 数（与掩码 eeg 段一致）
+        X_text = X_text[:, :answer_pos]
+        gpt_mask = gpt_mask[:, :, :E + answer_pos, :E + answer_pos]
+
+        with ctx:
+            # 复用 NeuroLM.forward：y_eeg=y_text=None -> 只返回最后一个位置的 logits，
+            # 即“下一个 token”（答案字母）的分布。等价于 generate 的第 0 步。
+            _, _, logits = model(
+                x_eeg=X_eeg, y_eeg=None, x_text=X_text, y_text=None,
+                input_chans=input_chans, input_time=input_time,
+                input_mask=input_mask, eeg_mask=None, eeg_text_mask=gpt_mask)
+
+        last_logits = logits[:, -1, :].float()          # [B, vocab]
+        class_logits = last_logits[:, cti]              # [B, C]
+        prob = torch.softmax(class_logits, dim=-1)      # [B, C]
+
+        all_prob.append(prob.cpu().numpy())
+        if torch.is_tensor(label):
+            all_true.append(label.cpu().numpy().reshape(-1))
+        else:
+            all_true.append(np.asarray(label).reshape(-1))
+        all_sid.extend([str(s) for s in sample_id])
+        if torch.is_tensor(subject_id):
+            all_subj.extend([int(s) for s in subject_id.cpu().numpy().reshape(-1)])
+        else:
+            all_subj.extend([int(s) for s in subject_id])
+
+    model.train()
+
+    y_prob = np.concatenate(all_prob, axis=0).astype(np.float32)
+    y_true = np.concatenate(all_true, axis=0).astype(np.int64)
+    y_pred = y_prob.argmax(axis=1).astype(np.int64)
+    sample_id = np.asarray(all_sid, dtype=object)
+    subject_id = np.asarray(all_subj, dtype=np.int64)
+
+    assert len(sample_id) == len(y_true) == len(y_pred) == y_prob.shape[0] == len(subject_id), \
+        "evaluate_probs: 各数组长度不一致"
+    return {
+        'sample_id': sample_id,
+        'subject_id': subject_id,
+        'y_true': y_true,
+        'y_pred': y_pred,
+        'y_prob': y_prob,
+    }
+
+
+def save_fold_results(args, name, payload, fold_stats):
+    """按 sample_id 排序后写出 {task}_{model}_fold{i:02d}.npz 与 .json。
+
+    失败直接抛错退出（不静默跳过）。仅在 master_process 调用。
+    """
+    task = args.task_name if args.task_name else name.lower()
+    model_name = args.model_name
+    results_dir = args.results_dir if args.results_dir else args.out_dir
+    os.makedirs(results_dir, exist_ok=True)
+    base = f"{task}_{model_name}_fold{args.fold:02d}"
+    npz_path = os.path.join(results_dir, base + '.npz')
+    json_path = os.path.join(results_dir, base + '.json')
+
+    # 按 sample_id 稳定排序，保证可复现
+    order = np.argsort(payload['sample_id'].astype('U'), kind='stable')
+    sample_id = payload['sample_id'][order].astype('U')
+    y_true = payload['y_true'][order].astype(np.int64)
+    y_pred = payload['y_pred'][order].astype(np.int64)
+    y_prob = payload['y_prob'][order].astype(np.float32)
+    subject_id = payload['subject_id'][order].astype(np.int64)
+
+    fold_bacc = float(balanced_accuracy_score(y_true, y_pred))
+
+    np.savez(
+        npz_path,
+        sample_id=sample_id,      # (N,) str
+        y_true=y_true,            # (N,) int
+        y_pred=y_pred,            # (N,) int (argmax)
+        y_prob=y_prob,            # (N, C) float, softmax
+        subject_id=subject_id,    # (N,) int
+    )
+
+    meta = {
+        'fold': int(args.fold),
+        'test_subject': fold_stats['test_subject'],
+        'val_subject': fold_stats['val_subject'],
+        'balanced_accuracy': fold_bacc,
+        'best_epoch': int(fold_stats['best_epoch']),
+        'best_val_balanced_accuracy': float(fold_stats['best_val_bacc']),
+        'num_samples': int(len(sample_id)),
+        'num_classes': int(y_prob.shape[1]),
+        'task': task,
+        'model': model_name,
+        'hyperparams': fold_stats['hyperparams'],
+        'train_time_sec': float(fold_stats['train_time_sec']),
+        'peak_gpu_mem_mb': float(fold_stats['peak_gpu_mem_mb']),
+        'gpu_name': fold_stats['gpu_name'],
+    }
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(make_json_serializable(meta), f, ensure_ascii=False, indent=2)
+
+    # 落盘自检
+    if not (os.path.exists(npz_path) and os.path.exists(json_path)):
+        raise RuntimeError(f"结果文件保存失败: {npz_path} / {json_path}")
+    print(f"[fold {args.fold}] saved: {npz_path}")
+    print(f"[fold {args.fold}] saved: {json_path}")
+    print(f"[fold {args.fold}] test balanced_accuracy = {fold_bacc:.4f} (best_epoch={fold_stats['best_epoch']})")
+
+
 def get_args():
     parser = argparse.ArgumentParser('VQ training script', add_help=False)
     parser.add_argument('--out_dir', default='./', help='path where to save, empty for no saving')
@@ -1249,6 +1533,18 @@ def get_args():
     parser.add_argument('--seed', default=1337, type=int)
 
     parser.add_argument('--compile', default=False, action='store_true')
+
+    # leave-one-subject-out / 结果保存相关（仅在 --fold 指定时启用 LOSO 逻辑）
+    parser.add_argument('--fold', default=None, type=int,
+                        help='LOSO 折号（0..N-1）。指定后启用按被试留一的分折与结果保存；不指定则维持原行为')
+    parser.add_argument('--n_folds', default=None, type=int,
+                        help='折数上限，默认 None 即等于被试数 N')
+    parser.add_argument('--model_name', default='NeuroLM', type=str,
+                        help='用于结果文件名 {task}_{model}_fold{i}.npz/json 中的模型标识')
+    parser.add_argument('--task_name', default=None, type=str,
+                        help='结果文件名中的任务标识，默认取数据集名小写（如 motor）')
+    parser.add_argument('--results_dir', default=None, type=str,
+                        help='npz/json 结果保存目录，默认 out_dir')
 
     return parser.parse_args()
 

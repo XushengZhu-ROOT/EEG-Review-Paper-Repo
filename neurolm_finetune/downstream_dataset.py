@@ -13,7 +13,56 @@ import tiktoken
 import numpy as np
 import pickle
 import os
+import re
+from collections import defaultdict
 from dataset import standard_1020
+
+
+def _parse_subject_id(fname):
+    """从文件名解析被试编号，例如 'Sub01_8fast_epoch002.pickle' -> 1。
+    兼容 'Sub01' / 'Sub1' / 'subject_1' / 'subject01' 等写法。解析失败返回 -1。"""
+    base = os.path.basename(fname)
+    m = re.search(r'[Ss]ub(?:ject)?_?0*(\d+)', base)
+    if m:
+        return int(m.group(1))
+    return -1
+
+
+def _build_stable_sample_ids(files, session_of=None):
+    """为一批文件构造稳定、可复现、与 shuffle/batch/worker 无关的 sample_id。
+
+    - 无 session:   S{subject:02d}_ep{index:05d}
+    - 有 session:   S{subject:02d}_sess{session:02d}_ep{index:05d}
+
+    index 在 (subject[, session]) 分组内，按 basename 排序后从 0 递增。
+    因为在 leave-one-subject-out 里同一 subject 的所有文件都在同一个 split，
+    组内枚举等价于对该 subject 全量文件枚举，故不同模型、不同 batch 设置下集合完全一致。
+
+    返回: (sample_ids, subject_ids) 两个与 files 等长、顺序对齐的 list。
+    """
+    subject_ids = [_parse_subject_id(f) for f in files]
+    groups = defaultdict(list)
+    for i, f in enumerate(files):
+        if session_of is not None:
+            key = (subject_ids[i], session_of[i])
+        else:
+            key = (subject_ids[i],)
+        groups[key].append(i)
+
+    sample_ids = [None] * len(files)
+    for key, idxs in groups.items():
+        idxs_sorted = sorted(idxs, key=lambda i: os.path.basename(files[i]))
+        for ep, i in enumerate(idxs_sorted):
+            subj = key[0]
+            if session_of is not None:
+                sess = key[1]
+                sample_ids[i] = f"S{subj:02d}_sess{sess:02d}_ep{ep:05d}"
+            else:
+                sample_ids[i] = f"S{subj:02d}_ep{ep:05d}"
+
+    assert len(set(sample_ids)) == len(sample_ids), \
+        "sample_id 出现重复，请检查文件名或被试/ session 解析逻辑"
+    return sample_ids, subject_ids
 
 
 def get_chans(ch_names):
@@ -369,7 +418,11 @@ class SEED7Loader(Dataset):
  
 
 class MotorLoader(Dataset):
-    """Motor imagery 6-class classification loader (Label0, Walk, 8, Horizontal, Vertical, Pick)"""
+    """Motor imagery 6-class classification loader (Label0, Walk, 8, Horizontal, Vertical, Pick)
+
+    root 可以是一个目录（files 为相对文件名），也可以为 None（files 为绝对路径，
+    用于 leave-one-subject-out：同一 split 的文件可能来自 train/val/test 多个物理目录）。
+    """
     def __init__(self, root, files, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False):
         self.root = root
         self.files = files
@@ -379,6 +432,10 @@ class MotorLoader(Dataset):
         self.is_val = is_val
         self.eeg_max_len = eeg_max_len
         self.text_max_len = text_max_len
+
+        # 稳定的 sample_id / subject_id（构造时确定，随 __getitem__ 返回，不受 shuffle 影响）
+        # Motor 数据集无 session，故 sample_id 形如 S{subject:02d}_ep{index:05d}
+        self.sample_ids, self.subject_ids = _build_stable_sample_ids(files, session_of=None)
 
         # 20 channels for Motor dataset
         self.ch_names = ['F7','FP1','FP2','F8','F3','FZ','F4','C3','CZ','P8','P7','PZ','P4','T3','P3','O1','O2','C4','T4','A2']
@@ -401,8 +458,14 @@ class MotorLoader(Dataset):
     def __len__(self):
         return len(self.files)
 
+    def _resolve_path(self, index):
+        f = self.files[index]
+        if self.root is None or os.path.isabs(f):
+            return f
+        return os.path.join(self.root, f)
+
     def __getitem__(self, index):
-        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        sample = pickle.load(open(self._resolve_path(index), "rb"))
         X = sample["signal"]
         Y = sample["label"]
 
@@ -460,7 +523,9 @@ class MotorLoader(Dataset):
         gpt_mask[:, :, valid_eeg_len:X_eeg.size(0)] = 0
         
         if self.is_val:
-            return X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
+            # 评估阶段额外返回稳定的 sample_id 与 subject_id，供事后计算所有下游指标
+            return (X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool(),
+                    self.sample_ids[index], self.subject_ids[index])
         
         Y_text = torch.full_like(text, fill_value=-1)
         prompt_len = self.prompt.size(0) - 1
@@ -571,4 +636,3 @@ class SleepLoader(Dataset):
         prompt_len = self.prompt.size(0) - 1
         Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
         return X_eeg, text, Y_text, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
-        

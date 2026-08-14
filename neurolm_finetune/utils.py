@@ -5,10 +5,13 @@ https://github.com/935963004/NeuroLM
 
 #from pyhealth.metrics import binary_metrics_fn, multiclass_metrics_fn
 import math
+import re
 import numpy as np
 import os
 import pickle
+from collections import defaultdict
 from downstream_dataset import KaggleERNLoader, CustomStressLoader, SEED7Loader, MotorLoader, SleepLoader
+from downstream_dataset import _parse_subject_id
 from metrics import binary_metrics_fn, multiclass_metrics_fn
 
 
@@ -169,6 +172,136 @@ def prepare_motor_dataset(root, is_instruct=False, eeg_max_len=-1, text_max_len=
     test_dataset = MotorLoader(test_folder, test_files, is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
     val_dataset = MotorLoader(val_folder, val_files, is_instruct=is_instruct, is_val=True, eeg_max_len=eeg_max_len, text_max_len=text_max_len)
     return train_dataset, test_dataset, val_dataset
+
+
+def _gather_motor_files_by_subject(root, expected_channels=20, valid_labels=None):
+    """把 root 下 train/val/test 里所有 .pickle 汇总（忽略原始划分），
+    过滤到 20 通道，按 subject 分组。返回 {subject_id: [abs_path, ...]}（每组已按 basename 排序）。
+
+    这样 leave-one-subject-out 的划分完全由 subject 决定，与原始 train/val/test 无关。
+
+    valid_labels: 若给定（如 {0,1,2,3,4,5}），则只保留 label 在该集合内的样本。
+      原始 pipeline 中 train 只喂 self.text[label]（label 必须是 0..num_classes-1），
+      而 val/test 走 prompt 分支不查 label，因此原始 val/test 里可能混有超出类别范围的
+      label（如 6）。LOSO 会把 val/test 的样本也放进 train，故必须在此统一过滤，
+      否则训练时 self.text[label] 会 KeyError，评估时也会引入模型无法表示的类别。
+    """
+    subdirs = [d for d in ["train", "val", "test"] if os.path.isdir(os.path.join(root, d))]
+    if not subdirs:
+        # 兼容：root 本身直接放着 pickle
+        subdirs = ["."]
+
+    seen_basenames = set()
+    subj_to_paths = defaultdict(list)
+    total = 0
+    kept = 0
+    skipped = 0
+    label_skipped = 0
+    dropped_label_hist = defaultdict(int)
+    for d in subdirs:
+        folder = os.path.join(root, d)
+        for f in sorted(os.listdir(folder)):
+            if not f.endswith(".pickle"):
+                continue
+            total += 1
+            if f in seen_basenames:  # 去重（同名文件只保留一次）
+                continue
+            file_path = os.path.join(folder, f)
+            try:
+                sample = pickle.load(open(file_path, "rb"))
+                if "signal" not in sample:
+                    skipped += 1
+                    continue
+                if sample["signal"].shape[0] != expected_channels:
+                    skipped += 1
+                    continue
+                # 标签范围过滤：超出类别范围的样本一律丢弃（train/val/test 一致）
+                if valid_labels is not None:
+                    lbl = sample.get("label", None)
+                    try:
+                        lbl_int = int(lbl)
+                    except (TypeError, ValueError):
+                        lbl_int = None
+                    if lbl_int not in valid_labels:
+                        label_skipped += 1
+                        dropped_label_hist[lbl] += 1
+                        continue
+            except Exception as e:
+                skipped += 1
+                continue
+            subj = _parse_subject_id(f)
+            if subj < 0:
+                skipped += 1
+                if skipped <= 5:
+                    print(f"  Skipping {f}: cannot parse subject id")
+                continue
+            seen_basenames.add(f)
+            subj_to_paths[subj].append(os.path.abspath(file_path))
+            kept += 1
+
+    for subj in subj_to_paths:
+        subj_to_paths[subj] = sorted(subj_to_paths[subj], key=lambda p: os.path.basename(p))
+
+    print(f"Motor LOSO - scanned {total} files across {subdirs}: kept {kept}, "
+          f"skipped {skipped} (bad channel/missing), label_skipped {label_skipped}, "
+          f"subjects found: {sorted(subj_to_paths.keys())}")
+    if valid_labels is not None and label_skipped > 0:
+        print(f"Motor LOSO - dropped out-of-range labels (valid={sorted(valid_labels)}): "
+              f"{dict(dropped_label_hist)}")
+    return subj_to_paths
+
+
+def prepare_motor_dataset_loso(root, fold, is_instruct=False, eeg_max_len=-1, text_max_len=-1,
+                               n_folds=None, expected_channels=20, num_classes=6):
+    """Leave-one-subject-out 划分（第 fold 折）。
+
+    N = 被试数。test = subjects[fold]，val = subjects[(fold+1) % N]，train = 其余被试。
+    只保留 label 在 [0, num_classes) 内的样本（Motor 为 6 类）。
+    返回 (train_dataset, test_dataset, val_dataset, meta)。
+    """
+    valid_labels = set(range(num_classes))
+    subj_to_paths = _gather_motor_files_by_subject(
+        root, expected_channels=expected_channels, valid_labels=valid_labels)
+    subjects = sorted(subj_to_paths.keys())
+    N = len(subjects)
+    if N < 3:
+        raise ValueError(f"LOSO 需要至少 3 个被试，实际只有 {N} 个: {subjects}")
+
+    total_folds = N if n_folds is None else min(int(n_folds), N)
+    if not (0 <= fold < total_folds):
+        raise ValueError(f"fold={fold} 超出范围 [0, {total_folds})")
+
+    test_subject = subjects[fold]
+    val_subject = subjects[(fold + 1) % N]
+    train_subjects = [s for s in subjects if s != test_subject and s != val_subject]
+
+    train_files, val_files, test_files = [], [], []
+    for s in train_subjects:
+        train_files.extend(subj_to_paths[s])
+    val_files.extend(subj_to_paths[val_subject])
+    test_files.extend(subj_to_paths[test_subject])
+
+    print(f"Motor LOSO fold {fold}/{total_folds} | N={N} | "
+          f"test=S{test_subject} ({len(test_files)}), val=S{val_subject} ({len(val_files)}), "
+          f"train={train_subjects} ({len(train_files)})")
+
+    # root=None -> files 视为绝对路径
+    train_dataset = MotorLoader(None, train_files, is_instruct=is_instruct,
+                                eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+    test_dataset = MotorLoader(None, test_files, is_instruct=is_instruct, is_val=True,
+                               eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+    val_dataset = MotorLoader(None, val_files, is_instruct=is_instruct, is_val=True,
+                              eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+
+    meta = {
+        'test_subject': int(test_subject),
+        'val_subject': int(val_subject),
+        'train_subjects': [int(s) for s in train_subjects],
+        'n_folds': int(total_folds),
+        'num_subjects': int(N),
+        'subjects': [int(s) for s in subjects],
+    }
+    return train_dataset, test_dataset, val_dataset, meta
 
 
 def prepare_sleep_dataset(root, is_instruct=False, eeg_max_len=-1, text_max_len=-1):
