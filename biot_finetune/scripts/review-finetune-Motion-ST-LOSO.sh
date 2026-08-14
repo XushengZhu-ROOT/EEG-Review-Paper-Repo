@@ -1,26 +1,33 @@
 #!/bin/bash
 # =============================================================================
-# Motion fine-tune launcher (20-fold subject-independent LOSO, val-selected epoch)
+# Motion-ST fine-tune launcher (20-fold subject-independent LOSO, val-selected epoch)
 # =============================================================================
-# Mirrors cbramod/review-finetune-motortask_R2_loso.sh's protocol, applied to
-# the BIOT-side training script:
+# ST-transformer counterpart of review-finetune-Motion-LOSO.sh (the BIOT
+# script). Same protocol, same run_multiclass_supervised.py entry point:
 #   fold i: test = subjects[i], val = subjects[(i+1) % N], train = rest.
-#   Best epoch picked by validation BACC (see ModelCheckpoint + BestEpochTracker
-#   in run_multiclass_supervised.py, only active when --split_mode
-#   subject_independent). After each fold, {task}_{model}_fold{i:02d}.npz/.json
-#   are written under fold_results_dir so every downstream metric can be
-#   recomputed later without retraining (see save_motion_fold_results()).
+#   Best epoch picked by validation BACC (ModelCheckpoint + BestEpochTracker,
+#   only active when --split_mode subject_independent). After each fold,
+#   {task}_{model}_fold{i:02d}.npz/.json are written under fold_results_dir
+#   so every downstream metric can be recomputed later without retraining.
 #
-# This script only exercises the "author config" hyperparameters (matching
-# review-finetune-Motion.sh's single run, not its HPO sweep). The original
-# review-finetune-Motion.sh is untouched and keeps behaving exactly as before.
+# Differences from the BIOT script (see prepare_Motion_dataloader() /
+# MotionSTLoader in utils.py):
+#   - dataset=Motion-ST reads from Motiondata_ST (native 20ch @ 250Hz),
+#     not AllSubjects_Epochs (BIOT's 200Hz data, hard-reduced to 16ch to
+#     match the pretrained checkpoint).
+#   - STTransformer has no pretrained backbone, so there's no
+#     pretrain_model_path / channel-matching concern: in_channels=20 uses
+#     all native channels, matching how Sleep/SEED already feed
+#     STTransformer their full channel count.
+#   - sample_length=1 (Motiondata_ST epochs are 1s @ 250Hz = 250 samples;
+#     see datamake/movement_st.py's epoch_duration=1.0), not the 3s used
+#     by the BIOT Motion script.
+#   - lr=1e-3, wd=1e-3, bs=512.
 #
-# Subject list is discovered dynamically from AllSubjects_Epochs rather than
-# hardcoded, so a future data fix (like the Sub04 20ch fix that started this)
-# can't silently go stale here.
+# The BIOT script/pipeline is untouched by this file.
 #
 # Usage:
-#   bash review-finetune-Motion-LOSO.sh
+#   bash review-finetune-Motion-ST-LOSO.sh
 # Resumable: a fold is skipped if its .json already exists under fold_results_dir.
 # =============================================================================
 set -e
@@ -30,38 +37,29 @@ set -e
 # where to.
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-dataset=Motion
+dataset=Motion-ST
 gpu_id=0
 
-dataset_channels=16
+dataset_channels=20
+in_channels=20
 sample_length=1
+sampling_rate=250
 epochs=50
-pretrain_model_channels=16
-pretrain_path=pretrained-models/EEG-PREST-${pretrain_model_channels}-channels.ckpt
 
-classifier_type=CBraMod_3lyStyle_LayerNorm-BIOT
-model_name=biot
+classifier_type=STTransformer
+model_name=st
 task_name=motion
 
-lr=0.0005
-wd=0.00001
+lr=0.001
+wd=0.001
 bs=512
-pos_weight=0.413
 
-freeze_type=all
-
-if [ "${freeze_type}" = "linear_probe" ]; then
-    FREEZE_ARG="--freeze_backbone"
-else
-    FREEZE_ARG=""
-fi
-
-fold_results_dir=./fold_results_biot
+fold_results_dir=./fold_results_st
 
 # === 动态发现受试者列表（不写死），并按数字排序 ===
 mapfile -t SUBJECTS < <(
     for split in train val test; do
-        ls "AllSubjects_Epochs/${split}" 2>/dev/null
+        ls "Motiondata_ST/${split}" 2>/dev/null
     done | grep -oE 'Sub[0-9]+' | sort -u -t b -k2 -n
 )
 N=${#SUBJECTS[@]}
@@ -97,26 +95,21 @@ for (( i=0; i<N; i++ )); do
         --dataset ${dataset} \
         --n_classes 6 \
         --dataset_channels ${dataset_channels} \
-        --in_channels ${pretrain_model_channels} \
-        --sampling_rate 200 \
-        --token_size 200 \
-        --hop_length 100 \
+        --in_channels ${in_channels} \
+        --sampling_rate ${sampling_rate} \
         --sample_length ${sample_length} \
         --batch_size ${bs} \
         --lr ${lr} \
         --weight_decay ${wd} \
-        --pos_weight ${pos_weight} \
         --epochs ${epochs} \
         --model ${classifier_type} \
-        --pretrain_model_path ${pretrain_path} \
         --split_mode subject_independent \
         --test_subject ${test_subject} \
         --val_subject ${val_subject} \
         --fold_idx $i \
         --model_name ${model_name} \
         --task_name ${task_name} \
-        --fold_results_dir ${fold_results_dir} \
-        ${FREEZE_ARG}
+        --fold_results_dir ${fold_results_dir}
 done
 
 echo "All LOSO folds done. npz/json results under: ${fold_results_dir}"

@@ -191,6 +191,64 @@ class MotionLoader(torch.utils.data.Dataset):
         )
 
 
+class MotionSTLoader(torch.utils.data.Dataset):
+    """Motion loader for the STTransformer path (Motiondata_ST, native 20ch
+    @ 250Hz). Unlike MotionLoader, which hard-selects 16 of 20 channels to
+    match BIOT's 16-channel pretrained checkpoint, STTransformer trains from
+    scratch with no channel-count constraint -- so this keeps all native
+    channels, mirroring how Sleep/SEED already feed STTransformer their full
+    native channel count. Kept as a separate class so MotionLoader (BIOT)
+    stays untouched. Same sample_id scheme as MotionLoader so BIOT and ST
+    produce identical sample_id sets for the same underlying epoch files."""
+
+    def __init__(self, root, files, sampling_rate=250, in_channels=20, return_sample_id=False):
+        self.root = root
+        self.files = files
+        self.default_rate = 250
+        self.sampling_rate = sampling_rate
+        self.in_channels = in_channels
+        self.return_sample_id = return_sample_id
+
+        self.sample_ids = [
+            compute_motion_sample_id(os.path.splitext(os.path.basename(f))[0])
+            for f in self.files
+        ]
+        if len(set(self.sample_ids)) != len(self.sample_ids):
+            raise ValueError(
+                "Duplicate sample_id detected in MotionSTLoader; check for "
+                "duplicate/conflicting epoch files."
+            )
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["signal"]
+
+        if X.shape[0] != self.in_channels:
+            raise ValueError(
+                f"MotionSTLoader: expected {self.in_channels} channels, got "
+                f"{X.shape[0]} in {self.files[index]!r}"
+            )
+
+        if self.sampling_rate != self.default_rate:
+            n_target = int(round(X.shape[-1] * self.sampling_rate / self.default_rate))
+            X = resample(X, n_target, axis=-1)
+
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+
+        X = torch.tensor(X, dtype=torch.float32)
+        Y = torch.tensor(sample["label"], dtype=torch.long)
+
+        if self.return_sample_id:
+            return X, Y, self.sample_ids[index]
+        return X, Y
+
+
 class SEEDLoader(torch.utils.data.Dataset):
     """
     SEED数据集加载器

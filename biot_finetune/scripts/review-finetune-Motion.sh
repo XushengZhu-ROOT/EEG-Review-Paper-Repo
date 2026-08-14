@@ -10,7 +10,7 @@ dataset=Motion
 gpu_id=0
 
 dataset_channels=16
-sample_length=3
+sample_length=1
 epochs=50
 pretrain_model_channels=16
 pretrain_path=pretrained-models/EEG-PREST-${pretrain_model_channels}-channels.ckpt
