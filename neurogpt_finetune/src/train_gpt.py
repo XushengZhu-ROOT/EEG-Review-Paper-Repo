@@ -35,6 +35,7 @@ import os
 import glob
 import argparse
 import pdb
+import time
 from typing import Dict
 import json
 from datetime import datetime
@@ -61,7 +62,7 @@ if not hasattr(torch, '_six'):
     # This is necessary because deepspeed does 'from torch._six import inf' at module level
     sys.modules['torch._six'] = torch._six
 
-from utils import read_threshold_sub
+from utils import read_threshold_sub, list_motor_files_by_subject
 
 script_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(script_path, "../"))
@@ -74,6 +75,208 @@ from trainer.base import Trainer
 from decoder.unembedder import make_unembedder
 
 os.environ["WANDB_DISABLED"] = "true"
+
+
+def prepare_motor6class_dataset_subject_independent(
+    downstream_path, test_subject, val_subject, matrix_p_path, chunk_len, num_chunks, ovlp, gpt_only,
+):
+    """[LOSO] 20折 subject-independent 划分：test = test_subject, val = val_subject,
+    train = 其余全部受试者。与 cbramod_finetune/datasets/motortask_dataset.py、
+    biot_finetune/eegpt_finetune 的 Motion 划分、labram_finetune 的
+    prepare_Motor_dataset_subject_independent 使用同一批底层 AllSubjects_Epochs
+    pickle 文件、同一套受试者提取规则，保证同一折在不同模型间的
+    train/val/test 受试者集合完全一致。
+    """
+    subject_to_files = list_motor_files_by_subject(downstream_path)
+    subjects = sorted(subject_to_files.keys(), key=lambda s: int(s[3:]))
+    if len(subjects) < 3:
+        raise ValueError(f"Need at least 3 subjects for subject-independent split, got {len(subjects)}: {subjects}")
+    for s in (test_subject, val_subject):
+        if s not in subject_to_files:
+            raise ValueError(f"Subject {s!r} not found among {subjects}")
+    if test_subject == val_subject:
+        raise ValueError("test_subject and val_subject must be different")
+
+    train_subjects = [s for s in subjects if s not in (test_subject, val_subject)]
+
+    def gather(subj_list):
+        files = []
+        for s in subj_list:
+            files.extend(subject_to_files[s])
+        return files
+
+    train_files = gather(train_subjects)
+    val_files = gather([val_subject])
+    test_files = gather([test_subject])
+
+    print("=" * 70)
+    print(f"[split_mode=subject_independent] test={test_subject} val={val_subject} "
+          f"train={len(train_subjects)} subjects")
+    print(f"  All subjects ({len(subjects)}): {subjects}")
+    print(f"  file counts: train={len(train_files)} val={len(val_files)} test={len(test_files)}")
+    print("=" * 70)
+
+    # list_motor_files_by_subject 已经返回绝对路径；root_path 传 downstream_path
+    # 只是为了满足 EEGDataset.__init__ 里 root_path != "" 的分支，绝对路径本身
+    # 会让 os.path.join(root_path, abs_path) 直接忽略 root_path（no-op）。
+    train_dataset = Motor6ClassDataset(
+        train_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
+        ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
+    )
+    validation_dataset = Motor6ClassDataset(
+        val_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
+        ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
+    )
+    # test_dataset 需要 sample_id/subject_id 才能事后从保存的 npz 重新算所有指标。
+    test_dataset = Motor6ClassDataset(
+        test_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
+        ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
+        return_sample_id=True,
+    )
+    return train_dataset, validation_dataset, test_dataset
+
+
+def save_loso_fold_results(config: Dict, trainer: Trainer, test_dataset, test_prediction, train_time_sec: float) -> None:
+    """[LOSO] 保存单折 Motor6Class LOSO 结果：
+      {task}_{model}_fold{i:02d}.npz -- sample_id / y_true / y_pred / y_prob(softmax) / subject_id
+      {task}_{model}_fold{i:02d}.json -- fold / test_subject / val_subject / balanced_accuracy /
+                                          best_epoch / hyperparams / train_time_sec /
+                                          peak_gpu_mem_mb / gpu_name
+    直接复用 trainer.predict(test_dataset) 已经算出来的结果（test_dataset 以
+    return_sample_id=True 构造，predict() 内部走的是确定性的 SequentialSampler，
+    顺序与 test_dataset.sample_ids/.subject_ids 逐条对应），不重新加载模型/
+    重新推理，也不改动训练逻辑。best_epoch 取自 trainer.state（HF Trainer 的
+    load_best_model_at_end 已经按 --metric_for_best_model 选出了最佳checkpoint，
+    这里只是把同一个选择记录下来）。任何失败都直接抛异常退出，不静默跳过。
+    """
+    if not getattr(test_dataset, "return_sample_id", False):
+        raise RuntimeError("save_loso_fold_results requires test_dataset built with return_sample_id=True")
+
+    sample_ids = test_dataset.sample_ids
+    subject_ids = test_dataset.subject_ids
+    n = len(sample_ids)
+    if n == 0:
+        raise RuntimeError("save_loso_fold_results: test_dataset has 0 samples, refusing to save an empty file.")
+
+    preds_logits = np.asarray(test_prediction.predictions)
+    y_true_raw = np.asarray(test_prediction.label_ids)
+    if len(preds_logits) != n or len(y_true_raw) != n:
+        raise RuntimeError(
+            f"save_loso_fold_results: prediction length mismatch "
+            f"(predictions={len(preds_logits)}, labels={len(y_true_raw)}, expected {n} from test_dataset)"
+        )
+
+    y_prob_all = torch.nn.functional.softmax(torch.from_numpy(preds_logits).float(), dim=-1).numpy()
+    y_pred_all = preds_logits.argmax(axis=-1)
+
+    sample_ids_arr = np.array(sample_ids)
+    order = np.argsort(sample_ids_arr)
+    sample_ids_arr = sample_ids_arr[order]
+    y_true_arr = y_true_raw.astype(np.int64)[order]
+    y_pred_arr = y_pred_all.astype(np.int64)[order]
+    y_prob_arr = y_prob_all.astype(np.float32)[order]
+    subject_id_arr = np.array(subject_ids, dtype=np.int64)[order]
+
+    from sklearn.metrics import balanced_accuracy_score
+    balanced_accuracy = float(balanced_accuracy_score(y_true_arr, y_pred_arr))
+
+    # best_epoch/best_step: HF Trainer 的 state.log_history 里，验证集
+    # --metric_for_best_model 达到 state.best_metric 的那条记录对应的 epoch/step。
+    metric_key = config["metric_for_best_model"]
+    best_epoch, best_step = None, None
+    if trainer.state.best_metric is not None:
+        for entry in trainer.state.log_history:
+            if metric_key in entry and abs(entry[metric_key] - trainer.state.best_metric) < 1e-6:
+                best_epoch = entry.get("epoch")
+                best_step = entry.get("step")
+                break
+    if best_epoch is None:
+        raise RuntimeError(
+            "save_loso_fold_results: could not determine best_epoch from trainer.state "
+            f"(best_metric={trainer.state.best_metric}, metric_for_best_model={metric_key!r})."
+        )
+
+    task = config.get("task_name") or config["dataset_name"]
+    model_name = config.get("model_name") or "neurogpt"
+    fold_idx = config["fold_idx"]
+    save_dir = config.get("fold_results_dir") or config["log_dir"]
+    if not save_dir:
+        raise ValueError("save_loso_fold_results requires --fold-results-dir or --log-dir to be set")
+    os.makedirs(save_dir, exist_ok=True)
+
+    npz_path = os.path.join(save_dir, f"{task}_{model_name}_fold{fold_idx:02d}.npz")
+    json_path = os.path.join(save_dir, f"{task}_{model_name}_fold{fold_idx:02d}.json")
+
+    # 已有旧结果先改名备份，绝不静默覆盖
+    for path in (npz_path, json_path):
+        if os.path.exists(path):
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_path = f"{path}.bak-{ts}"
+            os.rename(path, backup_path)
+            print(f"[warn] existing fold result found, backed up to {backup_path}")
+
+    np.savez(
+        npz_path,
+        sample_id=sample_ids_arr,
+        y_true=y_true_arr,
+        y_pred=y_pred_arr,
+        y_prob=y_prob_arr,
+        subject_id=subject_id_arr,
+    )
+    if not os.path.exists(npz_path):
+        raise RuntimeError(f"save_loso_fold_results: failed to write {npz_path}")
+    _reload = np.load(npz_path)
+    for key in ("sample_id", "y_true", "y_pred", "y_prob", "subject_id"):
+        if key not in _reload:
+            raise RuntimeError(f"save_loso_fold_results: {npz_path} missing key {key!r} after write")
+        if len(_reload[key]) != n:
+            raise RuntimeError(f"save_loso_fold_results: {npz_path} key {key!r} length mismatch after write")
+
+    hyperparams = {
+        "learning_rate": config["learning_rate"],
+        "weight_decay": config["weight_decay"],
+        "per_device_training_batch_size": config["per_device_training_batch_size"],
+        "training_steps": config["training_steps"],
+        "eval_every_n_steps": config["eval_every_n_steps"],
+        "optim": config["optim"],
+        "seed": config["seed"],
+        "metric_for_best_model": metric_key,
+        "cls_head_layer": config["cls_head_layer"],
+        "ft_only_encoder": config["ft_only_encoder"],
+        "num_hidden_layers": config["num_hidden_layers"],
+        "num_encoder_layers": config["num_encoder_layers"],
+        "embedding_dim": config["embedding_dim"],
+    }
+
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    peak_gpu_mem_mb = (torch.cuda.max_memory_allocated(0) / (1024 ** 2)) if torch.cuda.is_available() else None
+
+    meta = {
+        "fold": fold_idx,
+        "test_subject": config.get("test_subject"),
+        "val_subject": config.get("val_subject"),
+        "balanced_accuracy": balanced_accuracy,
+        "best_epoch": int(round(best_epoch)),
+        "best_epoch_exact": best_epoch,
+        "best_step": best_step,
+        "saved_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": hyperparams,
+        "train_time_sec": train_time_sec,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "gpu_name": gpu_name,
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"save_loso_fold_results: failed to write {json_path}")
+    with open(json_path) as f:
+        json.load(f)  # 回读校验 JSON 没写坏
+
+    print(f"Saved fold predictions to {npz_path}")
+    print(f"Saved fold metadata to {json_path}")
+    print(f"  fold={fold_idx} test={config.get('test_subject')} val={config.get('val_subject')} "
+          f"best_epoch={meta['best_epoch']} balanced_accuracy={balanced_accuracy:.5f}")
 
 
 def train(config: Dict = None) -> Trainer:
@@ -147,6 +350,15 @@ def train(config: Dict = None) -> Trainer:
         downstream_path = config["dst_data_path"]
 
         print(f"INFO: Using {dataset_name} for downstream task.")
+
+        # [LOSO] 目前仅 motor6class 支持 20 折 subject-independent 划分；
+        # 不传 --split-mode（默认 random_epoch）时，其余分支行为完全不变。
+        split_mode = config.get("split_mode", "random_epoch")
+        if split_mode == "subject_independent" and dataset_name != "motor6class":
+            raise ValueError(
+                f"--split-mode subject_independent is only supported for "
+                f"--dataset-name motor6class, got {dataset_name!r}"
+            )
 
         if dataset_name in ["KaggleERN", "stress"]:
 
@@ -222,34 +434,6 @@ def train(config: Dict = None) -> Trainer:
                     # 从脚本目录解析相对路径
                     downstream_path = os.path.normpath(os.path.join(script_dir, downstream_path.lstrip('./')))
             
-            file_extension = "*.pickle"
-            train_path = os.path.join(downstream_path, "train")
-            val_path = os.path.join(downstream_path, "val")
-            test_path = os.path.join(downstream_path, "test")
-            
-            # 检查路径是否存在
-            if not os.path.exists(train_path):
-                raise ValueError(f"训练数据路径不存在: {train_path}")
-            if not os.path.exists(val_path):
-                raise ValueError(f"验证数据路径不存在: {val_path}")
-            if not os.path.exists(test_path):
-                raise ValueError(f"测试数据路径不存在: {test_path}")
-            
-            train_files = [
-                os.path.basename(f)
-                for f in glob.glob(os.path.join(train_path, file_extension))
-            ]
-            val_files = [
-                os.path.basename(f)
-                for f in glob.glob(os.path.join(val_path, file_extension))
-            ]
-            test_files = [
-                os.path.basename(f)
-                for f in glob.glob(os.path.join(test_path, file_extension))
-            ]
-            
-            print(f"INFO: 找到 {len(train_files)} 个训练文件, {len(val_files)} 个验证文件, {len(test_files)} 个测试文件")
-
             # 转换矩阵路径（相对于脚本运行目录）
             matrix_p_path = config.get("matrix_p_path", "tMatrix_22x20_motor.npy")
             if not os.path.isabs(matrix_p_path):
@@ -263,39 +447,86 @@ def train(config: Dict = None) -> Trainer:
                         script_dir = os.path.dirname(os.path.realpath(__file__))
                         script_dir = os.path.dirname(script_dir)  # 回到neurogpt_finetune目录
                         matrix_p_path = os.path.join(script_dir, matrix_p_path.lstrip('./'))
-            
-            train_dataset = Motor6ClassDataset(
-                train_files,
-                sample_keys=["inputs", "attention_mask"],
-                chunk_len=config["chunk_len"],
-                num_chunks=config["num_chunks"],
-                ovlp=config["chunk_ovlp"],
-                root_path=train_path,
-                matrix_p_path=matrix_p_path,
-                gpt_only=not config["use_encoder"],
-            )
 
-            validation_dataset = Motor6ClassDataset(
-                val_files,
-                sample_keys=["inputs", "attention_mask"],
-                chunk_len=config["chunk_len"],
-                num_chunks=config["num_chunks"],
-                ovlp=config["chunk_ovlp"],
-                root_path=val_path,
-                matrix_p_path=matrix_p_path,
-                gpt_only=not config["use_encoder"],
-            )
+            if split_mode == "subject_independent":
+                # [LOSO] 20折 subject-independent 划分，从 downstream_path 下的
+                # train/val/test 子目录里按受试者重新分组，不使用原来固定的
+                # train/val/test 划分。
+                if not config.get("test_subject") or not config.get("val_subject"):
+                    raise ValueError(
+                        "--split-mode subject_independent requires --test-subject and --val-subject"
+                    )
+                train_dataset, validation_dataset, test_dataset = prepare_motor6class_dataset_subject_independent(
+                    downstream_path,
+                    config["test_subject"],
+                    config["val_subject"],
+                    matrix_p_path=matrix_p_path,
+                    chunk_len=config["chunk_len"],
+                    num_chunks=config["num_chunks"],
+                    ovlp=config["chunk_ovlp"],
+                    gpt_only=not config["use_encoder"],
+                )
+            else:
+                file_extension = "*.pickle"
+                train_path = os.path.join(downstream_path, "train")
+                val_path = os.path.join(downstream_path, "val")
+                test_path = os.path.join(downstream_path, "test")
 
-            test_dataset = Motor6ClassDataset(
-                test_files,
-                sample_keys=["inputs", "attention_mask"],
-                chunk_len=config["chunk_len"],
-                num_chunks=config["num_chunks"],
-                ovlp=config["chunk_ovlp"],
-                root_path=test_path,
-                matrix_p_path=matrix_p_path,
-                gpt_only=not config["use_encoder"],
-            )
+                # 检查路径是否存在
+                if not os.path.exists(train_path):
+                    raise ValueError(f"训练数据路径不存在: {train_path}")
+                if not os.path.exists(val_path):
+                    raise ValueError(f"验证数据路径不存在: {val_path}")
+                if not os.path.exists(test_path):
+                    raise ValueError(f"测试数据路径不存在: {test_path}")
+
+                train_files = [
+                    os.path.basename(f)
+                    for f in glob.glob(os.path.join(train_path, file_extension))
+                ]
+                val_files = [
+                    os.path.basename(f)
+                    for f in glob.glob(os.path.join(val_path, file_extension))
+                ]
+                test_files = [
+                    os.path.basename(f)
+                    for f in glob.glob(os.path.join(test_path, file_extension))
+                ]
+
+                print(f"INFO: 找到 {len(train_files)} 个训练文件, {len(val_files)} 个验证文件, {len(test_files)} 个测试文件")
+
+                train_dataset = Motor6ClassDataset(
+                    train_files,
+                    sample_keys=["inputs", "attention_mask"],
+                    chunk_len=config["chunk_len"],
+                    num_chunks=config["num_chunks"],
+                    ovlp=config["chunk_ovlp"],
+                    root_path=train_path,
+                    matrix_p_path=matrix_p_path,
+                    gpt_only=not config["use_encoder"],
+                )
+
+                validation_dataset = Motor6ClassDataset(
+                    val_files,
+                    sample_keys=["inputs", "attention_mask"],
+                    chunk_len=config["chunk_len"],
+                    num_chunks=config["num_chunks"],
+                    ovlp=config["chunk_ovlp"],
+                    root_path=val_path,
+                    matrix_p_path=matrix_p_path,
+                    gpt_only=not config["use_encoder"],
+                )
+
+                test_dataset = Motor6ClassDataset(
+                    test_files,
+                    sample_keys=["inputs", "attention_mask"],
+                    chunk_len=config["chunk_len"],
+                    num_chunks=config["num_chunks"],
+                    ovlp=config["chunk_ovlp"],
+                    root_path=test_path,
+                    matrix_p_path=matrix_p_path,
+                    gpt_only=not config["use_encoder"],
+                )
 
         elif dataset_name == "emotion7class":
             # Emotion 7分类数据集
@@ -569,20 +800,32 @@ def train(config: Dict = None) -> Trainer:
         save_steps=config[
             "eval_every_n_steps"
         ],  # necessary for "load_best_model_at_end=True"
-        load_best_model_at_end=False,  # 禁用加载最佳模型，节省空间
-        save_total_limit=0,  # 不保存checkpoint，只保留分析所需的小文件
-        save_strategy="no",  # 完全禁用checkpoint保存
+        load_best_model_at_end=True,
+        save_total_limit=1,  # 只保留最新/最佳 checkpoint，避免磁盘爆掉
+        save_strategy="steps",
         metric_for_best_model=config["metric_for_best_model"],
         greater_is_better=True,
     )
 
+    loso_mode = config.get("split_mode", "random_epoch") == "subject_independent"
+    if loso_mode and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    train_start_time = time.time()
+
     if config["do_train"]:
         trainer.train(resume_from_checkpoint=config["resume_from"])
-        # 不保存model_final以节省磁盘空间，只保留分析所需的小文件（CSV、JSON、NPY）
-        # trainer.save_model(os.path.join(config["log_dir"], "model_final"))
+        trainer.save_model(os.path.join(config["log_dir"], "model_final"))
+
+    train_time_sec = time.time() - train_start_time
 
     if test_dataset is not None:
         test_prediction = trainer.predict(test_dataset)
+
+        if loso_mode:
+            # [LOSO] 保存 {task}_{model}_fold{i:02d}.npz/.json，让所有下游指标
+            # 事后都能从这两个文件重新算，不需要重跑训练。不改动上面已有的
+            # test_metrics.csv/test_predictions.npy 等既有保存逻辑。
+            save_loso_fold_results(config, trainer, test_dataset, test_prediction, train_time_sec)
         pd.DataFrame(test_prediction.metrics, index=[0]).to_csv(
             os.path.join(config["log_dir"], "test_metrics.csv"), index=False
         )
@@ -1678,6 +1921,61 @@ def get_args() -> argparse.ArgumentParser:
         ),
         type=str,
         help="record metric for saving trained model",
+    )
+
+    # ===== [LOSO] 20-fold subject-independent LOSO（目前仅 --dataset-name motor6class 支持）=====
+    # 不传 --split-mode（默认 random_epoch）时，行为与之前完全一致。
+    parser.add_argument(
+        "--split-mode",
+        metavar="STR",
+        default="random_epoch",
+        choices=("random_epoch", "subject_independent"),
+        type=str,
+        help="random_epoch(默认)=旧的固定 train/val/test 目录划分; "
+        "subject_independent=20折 LOSO 单折训练，需要 --test-subject/--val-subject "
+        "（目前仅 --dataset-name motor6class 支持）。",
+    )
+    parser.add_argument(
+        "--test-subject",
+        metavar="STR",
+        default=None,
+        type=str,
+        help="e.g. Sub04；--split-mode subject_independent 时必填",
+    )
+    parser.add_argument(
+        "--val-subject",
+        metavar="STR",
+        default=None,
+        type=str,
+        help="e.g. Sub05；--split-mode subject_independent 时必填",
+    )
+    parser.add_argument(
+        "--fold-idx",
+        metavar="INT",
+        default=0,
+        type=int,
+        help="LOSO fold 序号（0-based），用于保存文件名 {task}_{model}_fold{i:02d}",
+    )
+    parser.add_argument(
+        "--model-name",
+        metavar="STR",
+        default="neurogpt",
+        type=str,
+        help="保存 {task}_{model}_fold{i}.npz/json 时使用的模型名",
+    )
+    parser.add_argument(
+        "--task-name",
+        metavar="STR",
+        default=None,
+        type=str,
+        help="保存 {task}_{model}_fold{i}.npz/json 时使用的任务名；默认取 --dataset-name",
+    )
+    parser.add_argument(
+        "--fold-results-dir",
+        metavar="DIR",
+        default=None,
+        type=str,
+        help="npz/json 保存目录；默认使用 --log-dir",
     )
 
     return parser

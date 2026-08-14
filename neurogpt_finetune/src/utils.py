@@ -1,6 +1,8 @@
 import os
 import pdb
+import re
 import shutil
+from collections import defaultdict
 
 import h5py
 import numpy as np
@@ -97,5 +99,75 @@ def exclude_sz_subs(csv_file, lower_bound=2599, upper_bound=1000000, files_all=N
         sz_subs = f.readlines()
     filtered_files = [f for f in all_files if not any(sub_id in f for sub_id in sz_subs)]
     # pdb.set_trace()
-    return filtered_files        
+    return filtered_files
+
+
+# ===== [LOSO] Motor task sample_id -- ported verbatim (same regex/offsets) from
+# labram_finetune/utils.py so that the sample_id set computed here for a given
+# underlying AllSubjects_Epochs pickle file is byte-identical to what every other
+# already-converted model (cbramod/biot/eegpt/neurolm/labram) computes for that
+# same file. Do not change the constants/regex without updating all sibling
+# model dirs in lockstep -- cross-model comparisons depend on this matching. =====
+_MOTOR_SAMPLE_ID_TASK_ORDER = ['Walk', '8', 'Horizontal', 'Vertical', 'Pick', 'Stair']
+_MOTOR_SAMPLE_ID_SPEED_ORDER = ['slow', 'medium', 'fast']
+_MOTOR_SAMPLE_ID_TASK_OFFSET = 3000
+_MOTOR_SAMPLE_ID_SPEED_OFFSET = 1000
+_MOTOR_SAMPLE_ID_RE = re.compile(r'^Sub(\d+)_(.+?)_epoch(\d+)$')
+_MOTOR_SUBJECT_RE = re.compile(r'(Sub\d+)_')
+
+
+def _parse_motor_task_token(task_token):
+    for speed in _MOTOR_SAMPLE_ID_SPEED_ORDER:
+        if task_token.endswith(speed):
+            return task_token[: -len(speed)], speed
+    raise ValueError(f"Cannot parse speed suffix (slow/medium/fast) from task token: {task_token!r}")
+
+
+def compute_motor_sample_id(epoch_id):
+    """由 epoch_id（如 'Sub04_Walkslow_epoch009'）确定性地生成 sample_id，
+    格式：S{subject:02d}_ep{index:05d}（Motor 无 session 概念，不加 sess 段）。"""
+    m = _MOTOR_SAMPLE_ID_RE.match(epoch_id)
+    if not m:
+        raise ValueError(f"Cannot parse epoch_id for sample_id: {epoch_id!r}")
+    subject_num = int(m.group(1))
+    task_token = m.group(2)
+    local_idx = int(m.group(3))
+    base_task, speed = _parse_motor_task_token(task_token)
+    if base_task not in _MOTOR_SAMPLE_ID_TASK_ORDER:
+        raise ValueError(
+            f"Unknown base task {base_task!r} parsed from epoch_id {epoch_id!r}; "
+            f"expected one of {_MOTOR_SAMPLE_ID_TASK_ORDER}"
+        )
+    task_idx = _MOTOR_SAMPLE_ID_TASK_ORDER.index(base_task)
+    speed_idx = _MOTOR_SAMPLE_ID_SPEED_ORDER.index(speed)
+    global_index = task_idx * _MOTOR_SAMPLE_ID_TASK_OFFSET + speed_idx * _MOTOR_SAMPLE_ID_SPEED_OFFSET + local_idx
+    if global_index > 99999:
+        raise ValueError(f"sample_id index overflow (>99999) for epoch_id {epoch_id!r}: {global_index}")
+    return f"S{subject_num:02d}_ep{global_index:05d}"
+
+
+def extract_motor_subject_id(name):
+    """'Sub04_8fast_epoch001.pickle'（或包含它的任意路径）-> 'Sub04'。"""
+    m = _MOTOR_SUBJECT_RE.search(os.path.basename(name))
+    return m.group(1) if m else None
+
+
+def list_motor_files_by_subject(root):
+    """[LOSO] 扫描 root/{train,val,test}/*.pickle，按受试者分组（'Sub04' -> [abs_path, ...]），
+    用于构造受试者独立（LOSO）划分。返回绝对路径，方便直接喂给 EEGDataset
+    （EEGDataset 在 root_path 非空时会对 filenames 再 os.path.join 一次，
+    绝对路径能保证这次多余的 join 是无害的 no-op）。"""
+    subject_to_files = defaultdict(list)
+    for split in ("train", "val", "test"):
+        split_dir = os.path.join(root, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for fname in os.listdir(split_dir):
+            if not fname.endswith(".pickle"):
+                continue
+            sid = extract_motor_subject_id(fname)
+            if sid is None:
+                continue
+            subject_to_files[sid].append(os.path.abspath(os.path.join(split_dir, fname)))
+    return subject_to_files
 

@@ -8,6 +8,7 @@ from typing import Tuple, List, Dict
 from batcher.base import EEGDataset
 from scipy.io import loadmat
 from scipy.signal import butter, filtfilt
+from utils import compute_motor_sample_id, extract_motor_subject_id
 
 
 
@@ -130,7 +131,7 @@ class Motor6ClassDataset(EEGDataset):
     """
     运动6分类数据集类
     - 20通道输入，转换为22通道
-    - 6分类任务 (0: Label0, 1: Walk, 2: 8, 3: Horizontal, 4: Vertical, 5: Pick)
+    - 6分类任务 (0: Walk, 1: 8, 2: Horizontal, 3: Vertical, 4: Pick, 5: Stair)
     - 1秒数据（250个时间点@250Hz），复制成2秒（500个时间点）以匹配预训练模型
     """
     def __init__(
@@ -143,6 +144,7 @@ class Motor6ClassDataset(EEGDataset):
         root_path="",
         matrix_p_path=None,
         gpt_only=True,
+        return_sample_id=False,
     ):
         super().__init__(
             filenames,
@@ -153,6 +155,10 @@ class Motor6ClassDataset(EEGDataset):
             root_path=root_path,
             gpt_only=gpt_only,
         )
+
+        # [LOSO] 是否在 __getitem__ 中额外返回 sample_id；默认 False，
+        # 与现有非 LOSO 调用方行为完全一致。
+        self.return_sample_id = return_sample_id
 
         # 加载通道转换矩阵 P (22, 20)
         try:
@@ -172,7 +178,7 @@ class Motor6ClassDataset(EEGDataset):
             )
             raise
 
-        self.trials, self.labels, self.num_trials_per_file = self.get_trials_all()
+        self.trials, self.labels, self.sample_ids, self.subject_ids, self.num_trials_per_file = self.get_trials_all()
         print(f"✓ 成功加载 {self.num_trials_per_file} 个样本")
 
     def __len__(self):
@@ -194,15 +200,19 @@ class Motor6ClassDataset(EEGDataset):
 
         return np.matmul(self.P, data)  # Output shape: (22, N_samples)
 
-    def get_trials_all(self) -> Tuple[np.ndarray, np.ndarray, int]:
+    def get_trials_all(self) -> Tuple[np.ndarray, np.ndarray, List[str], List[int], int]:
         """
         加载所有数据并映射通道
-        返回: (trials, labels, num_trials)
+        返回: (trials, labels, sample_ids, subject_ids, num_trials)
         - 自动跳过30通道的数据
         - 将1秒数据（250个时间点）复制成2秒（500个时间点）
+        - sample_ids/subject_ids 只在 self.return_sample_id=True 时才计算（[LOSO]），
+          与 trials_all/labels_all 在同一个循环里同步 append，保证跳过的样本不会错位。
         """
         trials_all = []
         labels_all = []
+        sample_ids_all = []
+        subject_ids_all = []
         skipped_30ch = 0
         skipped_other = 0
 
@@ -253,8 +263,16 @@ class Motor6ClassDataset(EEGDataset):
             trials_all.append(mapped_data)
             labels_all.append(label)
 
+            if self.return_sample_id:
+                epoch_id = os.path.splitext(os.path.basename(file_path))[0]
+                sample_ids_all.append(compute_motor_sample_id(epoch_id))
+                subj = extract_motor_subject_id(file_path)
+                if subj is None:
+                    raise ValueError(f"Cannot extract subject id from {file_path}")
+                subject_ids_all.append(int(subj[3:]))
+
         total_num = len(trials_all)
-        
+
         # 输出统计信息
         if skipped_30ch > 0:
             print(f"ℹ️  跳过 {skipped_30ch} 个30通道的样本")
@@ -264,10 +282,22 @@ class Motor6ClassDataset(EEGDataset):
         if total_num == 0:
             raise ValueError("没有成功加载任何样本！请检查数据路径和格式。")
 
+        if self.return_sample_id and len(set(sample_ids_all)) != len(sample_ids_all):
+            raise ValueError(
+                "Duplicate sample_id detected in Motor6ClassDataset; "
+                "check for duplicate/conflicting epoch files."
+            )
+
         # Stack所有trial: (Total_Trials, 22, 500)
         trials_all_arr = np.stack(trials_all, axis=0)
 
-        return self.normalize(trials_all_arr), np.array(labels_all).flatten(), total_num
+        return (
+            self.normalize(trials_all_arr),
+            np.array(labels_all).flatten(),
+            sample_ids_all,
+            subject_ids_all,
+            total_num,
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -276,11 +306,14 @@ class Motor6ClassDataset(EEGDataset):
         trial_data_normalized = self.trials[idx]  # (22, 500)
         label = self.labels[idx]  # int (0-5)
 
-        return self.preprocess_sample(
+        result = self.preprocess_sample(
             sample=trial_data_normalized,
             seq_len=self.num_chunks,  # 2
             labels=label,
         )
+        if self.return_sample_id:
+            result["sample_id"] = self.sample_ids[idx]
+        return result
 
 
 class Emotion7ClassDataset(EEGDataset):
