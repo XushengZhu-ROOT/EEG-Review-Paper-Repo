@@ -4,6 +4,7 @@
 tmux new -s motion_st_loso
 cd /path/to/biot_finetune
 bash scripts/review-finetune-Motion-ST-LOSO.sh
+bash scripts/review-finetune-Motion-LOSO.sh
 
 跑完后用现成的脚本聚合结果：
 

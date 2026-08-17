@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-从 save_eegpt_fold_results() 存的 {task}_{model}_fold{i:02d}.npz 里，
+从 save_loso_fold_results() 存的 {task}_{model}_fold{i:02d}.npz 里，
 纯粹靠 y_true / y_pred / y_prob 重新算所有下游指标——不读训练日志、不碰模型、不重跑训练。
 
 用法：
-  python3 compute_metrics_from_npz.py --npz fold_results_eegpt/motion_eegpt_fold00.npz
-  python3 compute_metrics_from_npz.py --npz_dir fold_results_eegpt --task motion --model eegpt
+  python3 compute_metrics_from_npz.py --npz fold_results_labram/motor_labram_fold00.npz
+  python3 compute_metrics_from_npz.py --npz_dir fold_results_labram --task motor --model labram
 
 如果同目录下有同名 .json（sidecar 元信息），会额外把它里面记录的 balanced_accuracy
 拿出来和这里重新算出来的做比对，两边理论上应该完全一致（因为 json 里的数字
 本来就是训练脚本在同一次推理里算出来的）——如果对不上，说明保存/复现流程有问题。
 
-与 cbramod_finetune/compute_metrics_from_npz.py、biot_finetune/compute_metrics_from_npz.py
-逻辑完全一致（npz/json 是同一套 schema），只是拷到 eegpt_finetune 下方便直接用。
+与 cbramod_finetune/compute_metrics_from_npz.py、biot_finetune/compute_metrics_from_npz.py、
+eegpt_finetune/compute_metrics_from_npz.py 逻辑完全一致（npz/json 是同一套 schema），
+只是拷到 labram_finetune 下方便直接用。
 """
 import argparse
 import glob
@@ -42,7 +43,7 @@ def compute_metrics(npz_path, n_classes):
     if not (len(y_true) == len(y_pred) == len(y_prob) == len(subject_id) == n):
         raise ValueError(f"{npz_path}: array length mismatch")
 
-    # sample_id 必须是排好序的（save_eegpt_fold_results 写入前排过序）
+    # sample_id 必须是排好序的（save_loso_fold_results 写入前排过序）
     if list(sample_id) != sorted(sample_id):
         raise ValueError(f"{npz_path}: sample_id is not sorted; file may be corrupted or hand-edited")
 

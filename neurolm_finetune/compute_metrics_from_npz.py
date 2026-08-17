@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-从 save_eegpt_fold_results() 存的 {task}_{model}_fold{i:02d}.npz 里，
+[R2] 从 save_fold_predictions_npz 存的 {task}_{model}_fold{i:02d}.npz 里，
 纯粹靠 y_true / y_pred / y_prob 重新算所有下游指标——不读训练日志、不碰模型、不重跑训练。
 
 用法：
-  python3 compute_metrics_from_npz.py --npz fold_results_eegpt/motion_eegpt_fold00.npz
-  python3 compute_metrics_from_npz.py --npz_dir fold_results_eegpt --task motion --model eegpt
+  python3 compute_metrics_from_npz.py --npz_dir results/MOTOR/loso_lr5e-4_wd0.1 --task motor --model NeuroLM
+
 
 如果同目录下有同名 .json（sidecar 元信息），会额外把它里面记录的 balanced_accuracy
 拿出来和这里重新算出来的做比对，两边理论上应该完全一致（因为 json 里的数字
 本来就是训练脚本在同一次推理里算出来的）——如果对不上，说明保存/复现流程有问题。
-
-与 cbramod_finetune/compute_metrics_from_npz.py、biot_finetune/compute_metrics_from_npz.py
-逻辑完全一致（npz/json 是同一套 schema），只是拷到 eegpt_finetune 下方便直接用。
 """
 import argparse
 import glob
@@ -42,7 +39,7 @@ def compute_metrics(npz_path, n_classes):
     if not (len(y_true) == len(y_pred) == len(y_prob) == len(subject_id) == n):
         raise ValueError(f"{npz_path}: array length mismatch")
 
-    # sample_id 必须是排好序的（save_eegpt_fold_results 写入前排过序）
+    # sample_id 必须是排好序的（save_fold_predictions_npz 写入前排过序）
     if list(sample_id) != sorted(sample_id):
         raise ValueError(f"{npz_path}: sample_id is not sorted; file may be corrupted or hand-edited")
 
@@ -53,9 +50,9 @@ def compute_metrics(npz_path, n_classes):
         raise ValueError(f"{npz_path}: y_prob.argmax() != y_pred for {n_mismatch}/{n} samples")
 
     # labels 显式固定为 0..n_classes-1：某个 fold 的 test/val 受试者可能完全没有
-    # 某一类的样本（如 Sub05 没有 Horizontal），不传 labels 的话 sklearn 会按这个
-    # 文件里实际出现的类别数推断形状，per_class_recall/confusion_matrix 就可能
-    # 比 n_classes 小一维，跨文件比较或求和时对不上。
+    # 某一类的样本（如 MotorTask 的 Sub05 没有 Horizontal），不传 labels 的话
+    # sklearn 会按这个文件里实际出现的类别数推断形状，per_class_recall/
+    # confusion_matrix 就可能比 n_classes 小一维，跨文件比较或求和时对不上。
     labels = list(range(n_classes))
 
     # kappa/macro_f1 只在这一折真实出现过的类别上取平均：某个类完全没有真实样本时

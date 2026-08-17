@@ -12,6 +12,7 @@ import argparse
 import datetime
 from pyexpat import model
 import numpy as np
+import re
 import time
 import torch
 import torch.backends.cudnn as cudnn
@@ -192,6 +193,26 @@ def get_args():
     parser.add_argument('--dataset', default='TUAB', type=str,
                         help='dataset: TUAB | TUEV')
 
+    # ===== [LOSO] 20-fold subject-independent LOSO（目前仅 --dataset Motor 支持）=====
+    # 不传 --split_mode（默认 random_epoch）时，行为与之前完全一致。
+    parser.add_argument('--split_mode', type=str, default='random_epoch',
+                        choices=['random_epoch', 'subject_independent'],
+                        help='random_epoch(默认)=旧的固定 train/val/test 目录划分；'
+                             'subject_independent=20折 LOSO 单折训练，需要 --test_subject/--val_subject'
+                             '（目前仅 --dataset Motor 支持）。')
+    parser.add_argument('--test_subject', type=str, default=None,
+                        help='e.g. Sub04；split_mode=subject_independent 时必填')
+    parser.add_argument('--val_subject', type=str, default=None,
+                        help='e.g. Sub05；split_mode=subject_independent 时必填')
+    parser.add_argument('--fold_idx', type=int, default=0,
+                        help='LOSO fold 序号（0-based），用于保存文件名 {task}_{model}_fold{i:02d}')
+    parser.add_argument('--model_name', type=str, default='labram',
+                        help='保存 {task}_{model}_fold{i}.npz/json 时使用的模型名')
+    parser.add_argument('--task_name', type=str, default=None,
+                        help='保存 {task}_{model}_fold{i}.npz/json 时使用的任务名；默认取 --dataset 的小写')
+    parser.add_argument('--fold_results_dir', type=str, default=None,
+                        help='npz/json 保存目录；默认使用 --output_dir')
+
     known_args, _ = parser.parse_known_args()
 
     if known_args.enable_deepspeed:
@@ -267,6 +288,10 @@ def get_models(args):
 
 
 def get_dataset(args):
+    if getattr(args, 'split_mode', 'random_epoch') == 'subject_independent' and args.dataset != 'Motor':
+        raise ValueError(
+            f"--split_mode subject_independent is only supported for --dataset Motor, got {args.dataset!r}"
+        )
     if args.dataset == 'KaggleERN':
         train_dataset, test_dataset, val_dataset = utils.prepare_KaggleERN_dataset(args.dataset_path)
         ch_names = ['FP1', 'FP2', 'AF7', 'AF3', 'AF4', 'AF8', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', \
@@ -278,7 +303,14 @@ def get_dataset(args):
 
 
     elif args.dataset == 'Motor':
-        train_dataset, test_dataset, val_dataset = utils.prepare_Motor_dataset(args.dataset_path)
+        split_mode = getattr(args, 'split_mode', 'random_epoch')
+        if split_mode == 'subject_independent':
+            if not args.test_subject or not args.val_subject:
+                raise ValueError("--split_mode subject_independent requires --test_subject and --val_subject")
+            train_dataset, test_dataset, val_dataset = utils.prepare_Motor_dataset_subject_independent(
+                args.dataset_path, args.test_subject, args.val_subject)
+        else:
+            train_dataset, test_dataset, val_dataset = utils.prepare_Motor_dataset(args.dataset_path)
         # ch_names = ['F7', 'Fp1', 'Fp2', 'F8', 'F3', 'Fz', 'F4', 'C3', 'Cz', 'P8', 'P7', 'Pz', 'P4', 'T3', 'P3', 'O1', 'O2', 'C4', 'T4', 'A2']
         ch_names = ['F7','FP1','FP2','F8','F3','FZ','F4','C3','CZ','P8','P7','PZ','P4','T3','P3','O1','O2','C4','T4','A2']
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
@@ -322,6 +354,158 @@ def get_dataset(args):
         args.nb_classes = 1
         metrics = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
     return train_dataset, test_dataset, val_dataset, ch_names, metrics
+
+
+def save_loso_fold_results(args, model_without_ddp, device, dataset_test, ch_names,
+                            best_epoch, train_time_sec, n_parameters):
+    """[LOSO] 用调用方已经载入 model_without_ddp 的最佳验证 epoch 权重，对 test 集重新做一次
+    干净的推理（带 sample_id），保存：
+      {task}_{model}_fold{i:02d}.npz  -- sample_id / y_true / y_pred / y_prob(softmax) / subject_id
+      {task}_{model}_fold{i:02d}.json -- fold / test_subject / val_subject / balanced_accuracy /
+                                          best_epoch / hyperparams / train_time_sec /
+                                          peak_gpu_mem_mb / gpu_name
+    不改动训练逻辑/模型定义，只是复用已经训练好的模型做一次推理并落盘。
+    任何失败（没有样本、写文件失败、写完读不回来）都直接抛异常，不静默跳过。
+    """
+    model_without_ddp.eval()
+    input_chans = utils.get_input_chans(ch_names) if ch_names is not None else None
+
+    # 复用当前 fold 的 test 文件列表（dataset_test.root / .files），重新构造一个
+    # return_sample_id=True 的 MotorLoader，与训练/评估时用的是同一批底层 pickle 文件。
+    sid_dataset = utils.MotorLoader(
+        dataset_test.root, dataset_test.files,
+        sampling_rate=dataset_test.sampling_rate,
+        data_key=dataset_test.data_key, label_key=dataset_test.label_key,
+        expected_channels=dataset_test.expected_channels,
+        return_sample_id=True,
+    )
+    sid_loader = torch.utils.data.DataLoader(
+        sid_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=0, collate_fn=utils.skip_failed_collate,
+    )
+
+    subj_re = re.compile(r'^S(\d+)_')
+    sample_ids, y_true, y_pred, y_prob, subject_ids = [], [], [], [], []
+    with torch.no_grad():
+        for batch in sid_loader:
+            if batch is None:
+                continue
+            X, Y, batch_sample_ids = batch
+            X = X.float().to(device, non_blocking=True) / 100
+            if len(X.shape) != 3:
+                raise ValueError(f"save_loso_fold_results: unexpected input shape {X.shape}")
+            B, N, T = X.shape
+            if T != 200:
+                raise ValueError(f"save_loso_fold_results: expected T=200 for Motor, got {T}")
+            X = X.view(B, N, 1, 200)
+
+            output = model_without_ddp(X, input_chans=input_chans)
+            probs = torch.softmax(output, dim=-1).cpu()
+            preds = torch.argmax(output, dim=-1).cpu()
+            for i, sid in enumerate(batch_sample_ids):
+                m = subj_re.match(sid)
+                if not m:
+                    raise ValueError(f"Cannot parse subject_id from sample_id: {sid!r}")
+                sample_ids.append(sid)
+                y_true.append(int(Y[i]))
+                y_pred.append(int(preds[i].item()))
+                y_prob.append(probs[i].numpy())
+                subject_ids.append(int(m.group(1)))
+
+    if len(sample_ids) == 0:
+        raise RuntimeError("save_loso_fold_results: no samples collected, refusing to save an empty file.")
+
+    sample_ids_arr = np.array(sample_ids)
+    order = np.argsort(sample_ids_arr)
+    sample_ids_arr = sample_ids_arr[order]
+    y_true_arr = np.array(y_true, dtype=np.int64)[order]
+    y_pred_arr = np.array(y_pred, dtype=np.int64)[order]
+    y_prob_arr = np.array(y_prob, dtype=np.float32)[order]
+    subject_id_arr = np.array(subject_ids, dtype=np.int64)[order]
+
+    task = args.task_name or args.dataset.lower()
+    model_name = args.model_name or "labram"
+    fold_idx = args.fold_idx
+    save_dir = args.fold_results_dir or args.output_dir
+    if not save_dir:
+        raise ValueError("save_loso_fold_results requires --fold_results_dir or --output_dir to be set")
+    os.makedirs(save_dir, exist_ok=True)
+
+    npz_path = os.path.join(save_dir, f"{task}_{model_name}_fold{fold_idx:02d}.npz")
+    json_path = os.path.join(save_dir, f"{task}_{model_name}_fold{fold_idx:02d}.json")
+
+    # 已有旧结果先改名备份，绝不静默覆盖
+    for path in (npz_path, json_path):
+        if os.path.exists(path):
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            backup_path = f"{path}.bak-{ts}"
+            os.rename(path, backup_path)
+            print(f"[warn] existing fold result found, backed up to {backup_path}")
+
+    np.savez(
+        npz_path,
+        sample_id=sample_ids_arr,
+        y_true=y_true_arr,
+        y_pred=y_pred_arr,
+        y_prob=y_prob_arr,
+        subject_id=subject_id_arr,
+    )
+    if not os.path.exists(npz_path):
+        raise RuntimeError(f"save_loso_fold_results: failed to write {npz_path}")
+    _reload = np.load(npz_path)
+    for key in ("sample_id", "y_true", "y_pred", "y_prob", "subject_id"):
+        if key not in _reload:
+            raise RuntimeError(f"save_loso_fold_results: {npz_path} missing key {key!r} after write")
+        if len(_reload[key]) != len(sample_ids_arr):
+            raise RuntimeError(f"save_loso_fold_results: {npz_path} key {key!r} length mismatch after write")
+
+    from sklearn.metrics import balanced_accuracy_score
+    balanced_accuracy = float(balanced_accuracy_score(y_true_arr, y_pred_arr))
+
+    hyperparams = {
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "optimizer": args.opt,
+        "seed": args.seed,
+        "layer_decay": args.layer_decay,
+        "warmup_epochs": args.warmup_epochs,
+        "drop_path": args.drop_path,
+        "smoothing": args.smoothing,
+        "freeze_backbone": bool(args.freeze_backbone),
+        "channel_size": args.channel_size,
+        "model": args.model,
+        "n_parameters": n_parameters,
+    }
+
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    peak_gpu_mem_mb = (torch.cuda.max_memory_allocated(0) / (1024 ** 2)) if torch.cuda.is_available() else None
+
+    meta = {
+        "fold": fold_idx,
+        "test_subject": args.test_subject,
+        "val_subject": args.val_subject,
+        "balanced_accuracy": balanced_accuracy,
+        "best_epoch": best_epoch,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": hyperparams,
+        "train_time_sec": train_time_sec,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "gpu_name": gpu_name,
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"save_loso_fold_results: failed to write {json_path}")
+    with open(json_path) as f:
+        json.load(f)  # 回读校验 JSON 没写坏
+
+    print(f"Saved fold predictions to {npz_path}")
+    print(f"Saved fold metadata to {json_path}")
+    print(f"  fold={fold_idx} test={args.test_subject} val={args.val_subject} "
+          f"best_epoch={best_epoch} balanced_accuracy={balanced_accuracy:.5f}")
 
 
 def main(args, ds_init):
@@ -744,6 +928,16 @@ def main(args, ds_init):
     start_time = time.time()
     max_accuracy = 0.0
     max_accuracy_test = 0.0
+
+    # ===== [LOSO] 按验证集 balanced_accuracy 选出的最佳 epoch（20折 subject_independent
+    # 用）。纯粹是额外的记账，不改变上面 max_accuracy 这条已有分支的行为/其他数据集的训练流程。=====
+    loso_mode = getattr(args, 'split_mode', 'random_epoch') == 'subject_independent'
+    best_val_bacc = -1.0
+    best_epoch_loso = 0
+    best_model_state_loso = None
+    if loso_mode and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -782,12 +976,11 @@ def main(args, ds_init):
                         print(f"  GPU {i} Utilization: {gpu_stats[f'gpu_{i}_utilization_%']:.1f}%")
             print(f"{'='*60}\n")
 
-        # 已取消保存epoch checkpoint
-        # if args.output_dir and args.save_ckpt:
-        #     utils.save_model(
-        #         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-        #         loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema, save_ckpt_freq=args.save_ckpt_freq)
-            
+        if args.output_dir and args.save_ckpt:
+            utils.save_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema, save_ckpt_freq=args.save_ckpt_freq)
+
         if data_loader_val is not None:
             val_stats = evaluate(data_loader_val, model, device, header='Val:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
             print(f"Accuracy of the network on the {len(dataset_val)} val EEG: {val_stats['accuracy']:.2f}%")
@@ -796,12 +989,20 @@ def main(args, ds_init):
             
             if max_accuracy < val_stats["accuracy"]:
                 max_accuracy = val_stats["accuracy"]
-                # 已取消保存最佳模型checkpoint
-                # if args.output_dir and args.save_ckpt:
-                #     utils.save_model(
-                #         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                #         loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
+                if args.output_dir and args.save_ckpt:
+                    utils.save_model(
+                        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                        loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
                 max_accuracy_test = test_stats["accuracy"]
+
+            # ===== [LOSO] 按验证集 balanced_accuracy 记录最佳 epoch 的模型权重（内存中），
+            # 用于训练结束后重新对 test 集做一次干净的推理，事后保存 npz/json。=====
+            if loso_mode:
+                current_val_bacc = val_stats.get('balanced_accuracy')
+                if current_val_bacc is not None and current_val_bacc > best_val_bacc:
+                    best_val_bacc = current_val_bacc
+                    best_epoch_loso = epoch + 1
+                    best_model_state_loso = {k: v.clone().cpu() for k, v in model_without_ddp.state_dict().items()}
 
             print(f'Max accuracy val: {max_accuracy:.2f}%, max accuracy test: {max_accuracy_test:.2f}%')
             if log_writer is not None:
@@ -871,7 +1072,24 @@ def main(args, ds_init):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-    
+
+    # ===== [LOSO] 用被选中的最佳 epoch 权重（不是训练循环结束时留在 model 里的最后一轮权重）
+    # 对 test 集重新推理一次，保存 {task}_{model}_fold{i:02d}.npz/.json，
+    # 让所有下游指标事后都能从这两个文件重新算，不需要重跑训练。
+    # 保存失败直接抛异常退出，不静默跳过。=====
+    if loso_mode and utils.is_main_process():
+        if best_model_state_loso is None:
+            raise RuntimeError(
+                "LOSO fold training finished but best_model_state_loso is None "
+                "(val balanced_accuracy was never recorded) -- check --epochs / dataset."
+            )
+        model_without_ddp.load_state_dict(best_model_state_loso)
+        model_without_ddp.to(device)
+        save_loso_fold_results(
+            args, model_without_ddp, device, dataset_test, ch_names,
+            best_epoch_loso, total_time, n_parameters,
+        )
+
     # 保存詳細的資源使用報告
     if args.output_dir and utils.is_main_process():
         # 計算平均GPU使用率

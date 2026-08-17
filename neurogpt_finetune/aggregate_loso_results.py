@@ -57,6 +57,13 @@ def load_fold(json_path, n_classes):
     # break summation across folds.
     labels = list(range(n_classes))
 
+    # kappa/macro_f1 只在这一折真实出现过的类别上取平均：某个类完全没有真实样本时
+    # (如 Sub05 没有 Horizontal)，recall 分母为 0，这一类是"算不出来"而不是"算出来是0"，
+    # 跟 balanced_accuracy_score 的现有行为保持一致（sklearn 内部对没有真实样本的类做
+    # NaN 跳过，只在剩下的类里平均），避免模型因为一个本来就不可能预测对的类被扣分。
+    # confusion_matrix/per_class_recall 仍用完整的 0..n_classes-1，因为要跨折求和/按位置 zip，形状必须固定。
+    labels_present = sorted(set(y_true.tolist()))
+
     return {
         "fold": meta["fold"],
         "val_subject": meta.get("val_subject"),
@@ -65,8 +72,8 @@ def load_fold(json_path, n_classes):
         "n_samples": int(len(y_true)),
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(bacc),
-        "kappa": float(cohen_kappa_score(y_true, y_pred)),
-        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "kappa": float(cohen_kappa_score(y_true, y_pred, labels=labels_present)),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro", labels=labels_present, zero_division=0)),
         "train_time_sec": meta.get("train_time_sec"),
         "peak_gpu_mem_mb": meta.get("peak_gpu_mem_mb"),
         "gpu_name": meta.get("gpu_name"),

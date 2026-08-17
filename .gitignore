@@ -246,3 +246,10 @@ eegpt_finetune/fold_results_eegpt/
 eegpt_finetune/fold_results_eegpt_smoke/
 eegpt_finetune/*.ckpt
 eegpt_finetune/*.pickle
+
+# neurogpt_finetune: pretrained weights / experiment outputs — regenerate or copy
+# locally, never commit (large binary, changes every run). Small channel-mapping
+# matrices (tMatrix_*.npy) are deliberately NOT ignored — they're checked-in config,
+# not generated data.
+neurogpt_finetune/pytorch_model.bin
+neurogpt_finetune/pretrained_model/

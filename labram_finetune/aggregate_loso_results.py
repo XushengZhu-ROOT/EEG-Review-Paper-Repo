@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Aggregate results across the 20 LOSO folds produced by
-scripts/review-finetune-Motion-LOSO.sh (see save_eegpt_fold_results() in
-linear_probe_EEGPT_Motor.py).
+review-finetune-Motor-LOSO.sh (see save_loso_fold_results() in
+run_class_finetuning.py).
 
 Reads directly from the {task}_{model}_fold{i:02d}.json / .npz pair written
-by save_eegpt_fold_results() -- everything needed (test_subject, val_subject,
+by save_loso_fold_results() -- everything needed (test_subject, val_subject,
 best_epoch, balanced_accuracy) is already in the json, and accuracy/kappa/
 macro_f1 are recomputed fresh from the sibling .npz so the printed table
 isn't just repeating the json's one saved number. Recomputed
@@ -13,13 +13,13 @@ balanced_accuracy is checked against the json's saved value (same
 self-consistency check as compute_metrics_from_npz.py) and raises if they
 disagree.
 
-Ported from biot_finetune/aggregate_loso_results.py (same npz/json schema,
-same logic) with defaults switched to the eegpt fold_results directory/model
-name.
+Ported from eegpt_finetune/aggregate_loso_results.py / biot_finetune's
+(same npz/json schema, same logic) with defaults switched to the labram
+fold_results directory/model name.
 
 Usage:
   python3 aggregate_loso_results.py
-  python3 aggregate_loso_results.py --fold_results_dir ./fold_results_eegpt --task motion --model eegpt --out loso_results_eegpt.csv
+  python3 aggregate_loso_results.py --fold_results_dir ./fold_results_labram --task motor --model labram --out loso_results_labram.csv
 """
 import argparse
 import glob
@@ -83,12 +83,12 @@ def load_fold(json_path, n_classes):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fold_results_dir", type=str, default="./fold_results_eegpt")
-    parser.add_argument("--task", type=str, default="motion")
-    parser.add_argument("--model", type=str, default="eegpt")
+    parser.add_argument("--fold_results_dir", type=str, default="./fold_results_labram")
+    parser.add_argument("--task", type=str, default="motor")
+    parser.add_argument("--model", type=str, default="labram")
     parser.add_argument("--n_classes", type=int, default=6)
-    parser.add_argument("--out", type=str, default="loso_results_eegpt.csv")
-    parser.add_argument("--cm_out", type=str, default="loso_confusion_matrix_eegpt.npy",
+    parser.add_argument("--out", type=str, default="loso_results_labram.csv")
+    parser.add_argument("--cm_out", type=str, default="loso_confusion_matrix_labram.npy",
                         help="where to save the confusion matrix summed across all folds")
     args = parser.parse_args()
 
@@ -116,7 +116,7 @@ def main():
         return vals.mean(), (vals.std(ddof=1) if len(vals) > 1 else 0.0)
 
     print("\n" + "=" * len(header))
-    print(f"N folds = {len(rows)}  (expected 20 for the full Motion LOSO sweep)")
+    print(f"N folds = {len(rows)}  (expected 20 for the full Motor LOSO sweep)")
     for key, label in [("accuracy", "Accuracy"), ("balanced_accuracy", "Balanced Accuracy"),
                         ("kappa", "Kappa"), ("macro_f1", "Macro F1")]:
         m, sd = mean_sd(key)

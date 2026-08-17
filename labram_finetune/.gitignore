@@ -1,3 +1,19 @@
+# --- Project data / results (never commit: too large, and not code) ---
+# Pretrained weights + per-run output checkpoints
+/checkpoints/
+/new_ckpt/
+*.pth
+*.ckpt
+# Training logs / tensorboard event files written to --log_dir
+/log/
+# Raw / preprocessed datasets referenced by review-*.sh --dataset_path
+/AllSubjects_Epochs/
+/seed_data/
+/augmented_data/
+/labram_sleep_data/
+*.pkl
+*.pickle
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

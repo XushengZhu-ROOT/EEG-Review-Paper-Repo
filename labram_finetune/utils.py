@@ -11,6 +11,7 @@
 
 import io
 import os
+import re
 import math
 import time
 import json
@@ -838,8 +839,77 @@ class KaggleERNLoader(torch.utils.data.Dataset):
         X = torch.FloatTensor(X)
         return X, Y
 
+# ===== [LOSO] 跨模型稳定的 sample_id，与 cbramod_finetune/datasets/motortask_dataset.py 的
+# compute_sample_id、biot_finetune/utils.py 的 compute_motion_sample_id、
+# eegpt_finetune/linear_probe_EEGPT_Motor.py 的 compute_sample_id 保持同一套算法。
+# epoch_id 形如 "Sub04_Walkslow_epoch009"；纯函数，只依赖字符串本身，与 shuffle /
+# batch_size / num_workers 无关。几个模型跑同一批底层 AllSubjects_Epochs pickle
+# 文件时，算出来的 sample_id 必须完全一致。 =====
+_MOTOR_SAMPLE_ID_TASK_ORDER = ['Walk', '8', 'Horizontal', 'Vertical', 'Pick', 'Stair']
+_MOTOR_SAMPLE_ID_SPEED_ORDER = ['slow', 'medium', 'fast']
+_MOTOR_SAMPLE_ID_TASK_OFFSET = 3000
+_MOTOR_SAMPLE_ID_SPEED_OFFSET = 1000
+_MOTOR_SAMPLE_ID_RE = re.compile(r'^Sub(\d+)_(.+?)_epoch(\d+)$')
+_MOTOR_SUBJECT_RE = re.compile(r'(Sub\d+)_')
+
+
+def _parse_motor_task_token(task_token):
+    for speed in _MOTOR_SAMPLE_ID_SPEED_ORDER:
+        if task_token.endswith(speed):
+            return task_token[: -len(speed)], speed
+    raise ValueError(f"Cannot parse speed suffix (slow/medium/fast) from task token: {task_token!r}")
+
+
+def compute_motor_sample_id(epoch_id):
+    """由 epoch_id（如 'Sub04_Walkslow_epoch009'）确定性地生成 sample_id，
+    格式：S{subject:02d}_ep{index:05d}（Motor 无 session 概念，不加 sess 段）。"""
+    m = _MOTOR_SAMPLE_ID_RE.match(epoch_id)
+    if not m:
+        raise ValueError(f"Cannot parse epoch_id for sample_id: {epoch_id!r}")
+    subject_num = int(m.group(1))
+    task_token = m.group(2)
+    local_idx = int(m.group(3))
+    base_task, speed = _parse_motor_task_token(task_token)
+    if base_task not in _MOTOR_SAMPLE_ID_TASK_ORDER:
+        raise ValueError(
+            f"Unknown base task {base_task!r} parsed from epoch_id {epoch_id!r}; "
+            f"expected one of {_MOTOR_SAMPLE_ID_TASK_ORDER}"
+        )
+    task_idx = _MOTOR_SAMPLE_ID_TASK_ORDER.index(base_task)
+    speed_idx = _MOTOR_SAMPLE_ID_SPEED_ORDER.index(speed)
+    global_index = task_idx * _MOTOR_SAMPLE_ID_TASK_OFFSET + speed_idx * _MOTOR_SAMPLE_ID_SPEED_OFFSET + local_idx
+    if global_index > 99999:
+        raise ValueError(f"sample_id index overflow (>99999) for epoch_id {epoch_id!r}: {global_index}")
+    return f"S{subject_num:02d}_ep{global_index:05d}"
+
+
+def extract_motor_subject_id(name):
+    """'Sub04_8fast_epoch001.pickle'（或包含它的任意路径）-> 'Sub04'。"""
+    m = _MOTOR_SUBJECT_RE.search(os.path.basename(name))
+    return m.group(1) if m else None
+
+
+def list_motor_files_by_subject(root):
+    """[LOSO] 扫描 root/{train,val,test}/*.pickle，按受试者分组（'Sub04' -> [path, ...]），
+    用于构造受试者独立（LOSO）划分。"""
+    subject_to_files = defaultdict(list)
+    for split in ("train", "val", "test"):
+        split_dir = os.path.join(root, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for fname in os.listdir(split_dir):
+            if not fname.endswith(".pickle"):
+                continue
+            sid = extract_motor_subject_id(fname)
+            if sid is None:
+                continue
+            subject_to_files[sid].append(os.path.join(split_dir, fname))
+    return subject_to_files
+
+
 class MotorLoader(torch.utils.data.Dataset):
-    def __init__(self, root, files, sampling_rate=200, data_key='X', label_key='y', expected_channels=20):
+    def __init__(self, root, files, sampling_rate=200, data_key='X', label_key='y', expected_channels=20,
+                 return_sample_id=False):
         self.root = root
         self.files = files
         self.default_rate = 200
@@ -847,6 +917,18 @@ class MotorLoader(torch.utils.data.Dataset):
         self.data_key = data_key
         self.label_key = label_key
         self.expected_channels = expected_channels
+        self.return_sample_id = return_sample_id
+
+        # [LOSO] sample_id 在数据集构造（列文件）时一次性确定，与 self.files 一一对应；
+        # 不受 shuffle / batch_size / num_workers 影响。解析失败直接报错退出（不静默跳过）。
+        if self.return_sample_id:
+            self.sample_ids = [
+                compute_motor_sample_id(os.path.splitext(os.path.basename(f))[0]) for f in self.files
+            ]
+            if len(set(self.sample_ids)) != len(self.sample_ids):
+                raise ValueError(
+                    "Duplicate sample_id detected in MotorLoader; check for duplicate/conflicting epoch files."
+                )
 
     def __len__(self):
         return len(self.files)
@@ -869,9 +951,15 @@ class MotorLoader(torch.utils.data.Dataset):
         else:
             Y = int(Y)
 
+        # 确保标签在 0-5 范围内（6 分类：0,1,2,3,4,5）
+        if Y < 0 or Y > 5:
+            raise ValueError(f"Invalid label {Y} in {sample_path}, expected 0-5")
+
         if self.sampling_rate != self.default_rate:
             X = resample(X, 10 * self.sampling_rate, axis=-1)
 
+        if self.return_sample_id:
+            return torch.FloatTensor(X), Y, self.sample_ids[index]
         return torch.FloatTensor(X), Y
 
 class SleepLoader(torch.utils.data.Dataset):
@@ -1069,6 +1157,57 @@ def prepare_Motor_dataset(root, data_key='signal', label_key='label'):
     val_dataset = MotorLoader(os.path.join(root, "val"), val_files, data_key=data_key, label_key=label_key)
     print(len(train_files), len(val_files), len(test_files))
     return train_dataset, test_dataset, val_dataset
+
+
+def prepare_Motor_dataset_subject_independent(root, test_subject, val_subject, data_key='signal', label_key='label'):
+    """[LOSO] 20折 subject-independent 划分：test = test_subject, val = val_subject,
+    train = 其余全部受试者。与 cbramod_finetune/datasets/motortask_dataset.py、
+    biot_finetune 的 Motion 划分使用同一批底层 AllSubjects_Epochs pickle 文件、
+    同一套受试者提取规则，保证同一折在不同模型间的 train/val/test 受试者集合完全一致。
+    """
+    subject_to_files = list_motor_files_by_subject(root)
+    subjects = sorted(subject_to_files.keys(), key=lambda s: int(s[3:]))
+    if len(subjects) < 3:
+        raise ValueError(f"Need at least 3 subjects for subject-independent split, got {len(subjects)}: {subjects}")
+    for s in (test_subject, val_subject):
+        if s not in subject_to_files:
+            raise ValueError(f"Subject {s!r} not found among {subjects}")
+    if test_subject == val_subject:
+        raise ValueError("test_subject and val_subject must be different")
+
+    train_subjects = [s for s in subjects if s not in (test_subject, val_subject)]
+    val_subjects = [val_subject]
+    test_subjects = [test_subject]
+
+    def gather(subj_list):
+        files = []
+        for s in subj_list:
+            files.extend(subject_to_files[s])
+        return files
+
+    train_files = gather(train_subjects)
+    val_files = gather(val_subjects)
+    test_files = gather(test_subjects)
+
+    seed = 12345
+    np.random.seed(seed)
+    np.random.shuffle(train_files)
+
+    print("=" * 70)
+    print(f"[split_mode=subject_independent] test={test_subject} val={val_subject} "
+          f"train={len(train_subjects)} subjects")
+    print(f"  All subjects ({len(subjects)}): {subjects}")
+    print(f"  file counts: train={len(train_files)} val={len(val_files)} test={len(test_files)}")
+    print("=" * 70)
+
+    # files 已经是相对 cwd 的完整路径（list_motor_files_by_subject 已经拼过 split 目录），
+    # 所以这里 root 传空字符串，os.path.join("", full_path) 等价于 full_path 本身。
+    train_dataset = MotorLoader("", train_files, data_key=data_key, label_key=label_key)
+    test_dataset = MotorLoader("", test_files, data_key=data_key, label_key=label_key)
+    val_dataset = MotorLoader("", val_files, data_key=data_key, label_key=label_key)
+    print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    return train_dataset, test_dataset, val_dataset
+
 
 def _collect_pickle_files(root_dir):
     """

@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-Aggregate results across the 20 LOSO folds produced by
-scripts/review-finetune-Motion-LOSO.sh (see save_eegpt_fold_results() in
-linear_probe_EEGPT_Motor.py).
+Aggregate results across the 20 LOSO folds produced by neurolm's LOSO sweep.
 
-Reads directly from the {task}_{model}_fold{i:02d}.json / .npz pair written
-by save_eegpt_fold_results() -- everything needed (test_subject, val_subject,
-best_epoch, balanced_accuracy) is already in the json, and accuracy/kappa/
-macro_f1 are recomputed fresh from the sibling .npz so the printed table
-isn't just repeating the json's one saved number. Recomputed
-balanced_accuracy is checked against the json's saved value (same
-self-consistency check as compute_metrics_from_npz.py) and raises if they
-disagree.
+Reads directly from the {task}_{model}_fold{i:02d}.json / .npz pair --
+everything needed (test_subject, val_subject, best_epoch, balanced_accuracy)
+is already in the json, and accuracy/kappa/macro_f1 are recomputed fresh
+from the sibling .npz so the printed table isn't just repeating the json's
+one saved number. Recomputed balanced_accuracy is checked against the
+json's saved value (same self-consistency check as compute_metrics_from_npz.py)
+and raises if they disagree.
 
-Ported from biot_finetune/aggregate_loso_results.py (same npz/json schema,
-same logic) with defaults switched to the eegpt fold_results directory/model
-name.
+Ported from labram_finetune/aggregate_loso_results.py (same npz/json schema,
+same logic) with defaults switched to neurolm's fold_results directory/model name.
 
 Usage:
   python3 aggregate_loso_results.py
-  python3 aggregate_loso_results.py --fold_results_dir ./fold_results_eegpt --task motion --model eegpt --out loso_results_eegpt.csv
+  python3 aggregate_loso_results.py --fold_results_dir results/MOTOR/loso_lr5e-4_wd0.1 --task motor --model NeuroLM --out loso_results_neurolm.csv
 """
 import argparse
 import glob
@@ -83,12 +79,12 @@ def load_fold(json_path, n_classes):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fold_results_dir", type=str, default="./fold_results_eegpt")
-    parser.add_argument("--task", type=str, default="motion")
-    parser.add_argument("--model", type=str, default="eegpt")
+    parser.add_argument("--fold_results_dir", type=str, default="results/MOTOR/loso_lr5e-4_wd0.1")
+    parser.add_argument("--task", type=str, default="motor")
+    parser.add_argument("--model", type=str, default="NeuroLM")
     parser.add_argument("--n_classes", type=int, default=6)
-    parser.add_argument("--out", type=str, default="loso_results_eegpt.csv")
-    parser.add_argument("--cm_out", type=str, default="loso_confusion_matrix_eegpt.npy",
+    parser.add_argument("--out", type=str, default="loso_results_neurolm.csv")
+    parser.add_argument("--cm_out", type=str, default="loso_confusion_matrix_neurolm.npy",
                         help="where to save the confusion matrix summed across all folds")
     args = parser.parse_args()
 
@@ -104,10 +100,11 @@ def main():
     print(header)
     print("-" * len(header))
     for r in rows:
-        val_label = r["val_subject"] if r["val_subject"] else "-"
+        val_label = str(r["val_subject"]) if r["val_subject"] is not None else "-"
+        test_label = str(r["test_subject"])
         time_min = f"{r['train_time_sec']/60:.1f}" if r["train_time_sec"] is not None else "-"
         mem_mb = f"{r['peak_gpu_mem_mb']:.0f}" if r["peak_gpu_mem_mb"] is not None else "-"
-        print(f"{r['fold']:4d} {val_label:7s} {r['test_subject']:7s} {r['best_epoch']:3d} "
+        print(f"{r['fold']:4d} {val_label:7s} {test_label:7s} {r['best_epoch']:3d} "
               f"{r['n_samples']:5d} {r['accuracy']:7.4f} {r['balanced_accuracy']:7.4f} "
               f"{r['kappa']:7.4f} {r['macro_f1']:7.4f} {time_min:>9s} {mem_mb:>11s}")
 
@@ -116,7 +113,7 @@ def main():
         return vals.mean(), (vals.std(ddof=1) if len(vals) > 1 else 0.0)
 
     print("\n" + "=" * len(header))
-    print(f"N folds = {len(rows)}  (expected 20 for the full Motion LOSO sweep)")
+    print(f"N folds = {len(rows)}  (expected 20 for the full Motor LOSO sweep)")
     for key, label in [("accuracy", "Accuracy"), ("balanced_accuracy", "Balanced Accuracy"),
                         ("kappa", "Kappa"), ("macro_f1", "Macro F1")]:
         m, sd = mean_sd(key)
