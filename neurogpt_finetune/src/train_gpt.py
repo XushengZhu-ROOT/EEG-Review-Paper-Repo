@@ -79,6 +79,7 @@ os.environ["WANDB_DISABLED"] = "true"
 
 def prepare_motor6class_dataset_subject_independent(
     downstream_path, test_subject, val_subject, matrix_p_path, chunk_len, num_chunks, ovlp, gpt_only,
+    normalization=True,
 ):
     """[LOSO] 20折 subject-independent 划分：test = test_subject, val = val_subject,
     train = 其余全部受试者。与 cbramod_finetune/datasets/motortask_dataset.py、
@@ -122,16 +123,18 @@ def prepare_motor6class_dataset_subject_independent(
     train_dataset = Motor6ClassDataset(
         train_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
         ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
+        normalization=normalization,
     )
     validation_dataset = Motor6ClassDataset(
         val_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
         ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
+        normalization=normalization,
     )
     # test_dataset 需要 sample_id/subject_id 才能事后从保存的 npz 重新算所有指标。
     test_dataset = Motor6ClassDataset(
         test_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
         ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
-        return_sample_id=True,
+        return_sample_id=True, normalization=normalization,
     )
     return train_dataset, validation_dataset, test_dataset
 
@@ -465,6 +468,7 @@ def train(config: Dict = None) -> Trainer:
                     num_chunks=config["num_chunks"],
                     ovlp=config["chunk_ovlp"],
                     gpt_only=not config["use_encoder"],
+                    normalization=config["do_normalization"],
                 )
             else:
                 file_extension = "*.pickle"
@@ -504,6 +508,7 @@ def train(config: Dict = None) -> Trainer:
                     root_path=train_path,
                     matrix_p_path=matrix_p_path,
                     gpt_only=not config["use_encoder"],
+                    normalization=config["do_normalization"],
                 )
 
                 validation_dataset = Motor6ClassDataset(
@@ -515,6 +520,7 @@ def train(config: Dict = None) -> Trainer:
                     root_path=val_path,
                     matrix_p_path=matrix_p_path,
                     gpt_only=not config["use_encoder"],
+                    normalization=config["do_normalization"],
                 )
 
                 test_dataset = Motor6ClassDataset(
@@ -526,6 +532,7 @@ def train(config: Dict = None) -> Trainer:
                     root_path=test_path,
                     matrix_p_path=matrix_p_path,
                     gpt_only=not config["use_encoder"],
+                    normalization=config["do_normalization"],
                 )
 
         elif dataset_name == "emotion7class":

@@ -145,6 +145,7 @@ class Motor6ClassDataset(EEGDataset):
         matrix_p_path=None,
         gpt_only=True,
         return_sample_id=False,
+        normalization=True,
     ):
         super().__init__(
             filenames,
@@ -154,6 +155,7 @@ class Motor6ClassDataset(EEGDataset):
             ovlp,
             root_path=root_path,
             gpt_only=gpt_only,
+            normalization=normalization,
         )
 
         # [LOSO] 是否在 __getitem__ 中额外返回 sample_id；默认 False，
@@ -290,9 +292,11 @@ class Motor6ClassDataset(EEGDataset):
 
         # Stack所有trial: (Total_Trials, 22, 500)
         trials_all_arr = np.stack(trials_all, axis=0)
+        if self.do_normalization:
+            trials_all_arr = self.normalize(trials_all_arr)
 
         return (
-            self.normalize(trials_all_arr),
+            trials_all_arr,
             np.array(labels_all).flatten(),
             sample_ids_all,
             subject_ids_all,
