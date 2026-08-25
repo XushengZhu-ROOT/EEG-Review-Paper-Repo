@@ -491,8 +491,17 @@ class Trainer(object):
             print(f"Model saved to {model_path}")
         else:
             print("Warning: no best model state was recorded (best_model_states is None); skipping checkpoint save.")
-        
+
         self.save_training_logs(final_results)
+
+        # ===== LOSO 事后可复现指标：把 test 集逐样本预测 + 元信息落盘 =====
+        # 只在 CustomStress 且 split_mode=subject_independent 时触发（此时
+        # datasets/custom_stress_dataset.py 的 test_set 才是 return_sample_id=True
+        # 构造的，legacy 的 random_epoch 数据没有 subject id，不受影响）。
+        if (self.params.downstream_dataset == 'CustomStress'
+                and getattr(self.params, 'split_mode', 'random_epoch') == 'subject_independent'
+                and self.best_model_states is not None):
+            self.save_fold_results(best_metrics, has_val=True)
 
     def train_for_regression(self):
         """迴歸訓練"""

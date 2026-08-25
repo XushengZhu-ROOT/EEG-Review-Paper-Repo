@@ -107,6 +107,14 @@ class Evaluator:
         model.eval()
         sample_ids, y_true, y_pred, y_prob, subject_ids = [], [], [], [], []
         subj_re = re.compile(r'^S(\d+)_')
+        # 二分类任务（CustomStress/KaggleERN）的模型输出是每个样本一个标量 logit
+        # （给 BCEWithLogitsLoss 用，形状 (batch,)），不是多分类的 (batch, n_classes)。
+        # 直接对标量 logits 做 softmax(dim=-1)/argmax(dim=-1) 会退化成对整个 batch
+        # 求一个 0-dim 结果，而不是逐样本的预测——这里按 downstream_dataset 分支，
+        # 二分类走 sigmoid+0.5 阈值（跟 get_metrics_for_binaryclass 一致），并把
+        # y_prob 拼成 (N, 2) 的 [P(class0), P(class1)]，这样 compute_metrics_from_npz.py
+        # 里 y_prob.argmax(axis=1) == y_pred 的自洽性检查不用改，两种任务共用同一套 npz schema。
+        is_binary = self.params.downstream_dataset in ('CustomStress', 'KaggleERN')
         with torch.no_grad():
             for batch in tqdm(self.data_loader, mininterval=1, desc="save_fold_predictions_npz"):
                 if len(batch) < 4:
@@ -117,8 +125,13 @@ class Evaluator:
                 x, y, epoch_ids, batch_sample_ids = batch[0], batch[1], batch[2], batch[3]
                 x = x.cuda()
                 logits = model(x)
-                probs = torch.softmax(logits, dim=-1)
-                preds = torch.argmax(logits, dim=-1)
+                if is_binary:
+                    prob_pos = torch.sigmoid(logits)
+                    preds = (prob_pos > 0.5).long()
+                    probs = torch.stack([1 - prob_pos, prob_pos], dim=-1)
+                else:
+                    probs = torch.softmax(logits, dim=-1)
+                    preds = torch.argmax(logits, dim=-1)
                 for i, sid in enumerate(batch_sample_ids):
                     m = subj_re.match(sid)
                     if not m:
@@ -169,7 +182,9 @@ class Evaluator:
         truths = []
         preds = []
         scores = []
-        for x, y in tqdm(self.data_loader, mininterval=1):
+        for batch in tqdm(self.data_loader, mininterval=1):
+            # 兼容处理：batch 可能是 (x,y) / (x,y,epoch_ids,sample_ids)（LOSO test set）
+            x, y = batch[0], batch[1]
             x = x.cuda()
             y = y.cuda()
             pred = model(x)
@@ -184,10 +199,20 @@ class Evaluator:
         scores = np.array(scores)
         acc = accuracy_score(truths, preds)
         bacc = balanced_accuracy_score(truths, preds)
-        roc_auc = roc_auc_score(truths, scores)
-        precision, recall, thresholds = precision_recall_curve(truths, scores, pos_label=1)
-        pr_auc = auc(recall, precision)
-        cm = confusion_matrix(truths, preds)
+        # LOSO 场景下某一折的 val/test 受试者可能只有单一类别（stress 数据里
+        # 17 个受试者中有 11 个只做过 increase 或只做过 normal），roc_auc_score
+        # 在 y_true 只有一个类别时会直接抛异常；bacc 的模型选择逻辑不受影响，
+        # 这里只对不可定义的 roc_auc/pr_auc 返回 NaN，不让训练崩溃。
+        if len(np.unique(truths)) < 2:
+            roc_auc = float('nan')
+            pr_auc = float('nan')
+        else:
+            roc_auc = roc_auc_score(truths, scores)
+            precision, recall, thresholds = precision_recall_curve(truths, scores, pos_label=1)
+            pr_auc = auc(recall, precision)
+        # 显式传 labels=[0,1]：否则当 truths/preds 恰好都只出现一个类别时，
+        # confusion_matrix 会退化成 1x1，跟其它折的 2x2 形状对不上。
+        cm = confusion_matrix(truths, preds, labels=[0, 1])
         return acc, bacc, pr_auc, roc_auc, cm
 
     def get_metrics_for_regression(self, model):

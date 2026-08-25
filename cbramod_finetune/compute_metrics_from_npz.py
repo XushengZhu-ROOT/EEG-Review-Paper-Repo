@@ -20,6 +20,7 @@ import numpy as np
 from sklearn.metrics import (
     accuracy_score, balanced_accuracy_score, f1_score,
     cohen_kappa_score, confusion_matrix, recall_score,
+    roc_auc_score, precision_recall_curve, auc,
 )
 
 
@@ -72,6 +73,22 @@ def compute_metrics(npz_path, n_classes):
         "per_class_recall": recall_score(y_true, y_pred, labels=labels, average=None, zero_division=0).tolist(),
         "confusion_matrix": confusion_matrix(y_true, y_pred, labels=labels).tolist(),
     }
+
+    # AUROC/AUPRC 只对二分类任务（n_classes==2，如 CustomStress/KaggleERN）算：
+    # y_prob 存的是 (N, 2) 的 [P(class0), P(class1)]，用正类概率 y_prob[:,1] 算。
+    # 某一折的 y_true 只有单一类别时（stress 数据里很常见），roc_auc_score 无定义，
+    # 返回 NaN 而不是抛异常——跟 finetune_evaluator.py 里训练时的处理方式一致。
+    if n_classes == 2:
+        if len(labels_present) < 2:
+            roc_auc = float('nan')
+            pr_auc = float('nan')
+        else:
+            roc_auc = float(roc_auc_score(y_true, y_prob[:, 1]))
+            precision, recall, _ = precision_recall_curve(y_true, y_prob[:, 1], pos_label=1)
+            pr_auc = float(auc(recall, precision))
+        metrics["roc_auc"] = roc_auc
+        metrics["pr_auc"] = pr_auc
+
     return metrics
 
 
@@ -101,6 +118,8 @@ def main():
         print(f"  accuracy={m['accuracy']:.4f}  balanced_accuracy={m['balanced_accuracy']:.4f}  "
               f"kappa={m['kappa']:.4f}  macro_f1={m['macro_f1']:.4f}")
         print(f"  per_class_recall={['%.4f' % r for r in m['per_class_recall']]}")
+        if 'roc_auc' in m:
+            print(f"  roc_auc={m['roc_auc']:.4f}  pr_auc={m['pr_auc']:.4f}")
 
         json_path = os.path.splitext(npz_path)[0] + ".json"
         if os.path.exists(json_path):
