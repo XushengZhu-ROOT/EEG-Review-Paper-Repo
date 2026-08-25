@@ -62,7 +62,7 @@ if not hasattr(torch, '_six'):
     # This is necessary because deepspeed does 'from torch._six import inf' at module level
     sys.modules['torch._six'] = torch._six
 
-from utils import read_threshold_sub, list_motor_files_by_subject
+from utils import read_threshold_sub, list_motor_files_by_subject, list_stress_files_by_subject
 
 script_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(script_path, "../"))
@@ -135,6 +135,64 @@ def prepare_motor6class_dataset_subject_independent(
         test_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
         ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
         return_sample_id=True, normalization=normalization,
+    )
+    return train_dataset, validation_dataset, test_dataset
+
+
+def prepare_stress_dataset_subject_independent(
+    downstream_path, test_subject, val_subject, matrix_p_path, chunk_len, num_chunks, ovlp, gpt_only,
+):
+    """[LOSO] Stress 任务的 subject-independent 划分：test = test_subject, val = val_subject,
+    train = 其余全部受试者。与 cbramod_finetune/datasets/custom_stress_dataset.py、
+    labram_finetune/neurolm_finetune/eegpt_finetune 的 Stress LOSO 划分使用同一批底层
+    stress_data 预处理生成的 pickle 文件（'SubNN_{increase,normal}_edfNN_chunkNNNN.pickle'）、
+    同一套受试者提取规则，保证同一折在不同模型间的 train/val/test 受试者集合完全一致。
+    """
+    subject_to_files = list_stress_files_by_subject(downstream_path)
+    subjects = sorted(subject_to_files.keys(), key=lambda s: int(s[3:]))
+    if len(subjects) < 3:
+        raise ValueError(f"Need at least 3 subjects for subject-independent split, got {len(subjects)}: {subjects}")
+    for s in (test_subject, val_subject):
+        if s not in subject_to_files:
+            raise ValueError(f"Subject {s!r} not found among {subjects}")
+    if test_subject == val_subject:
+        raise ValueError("test_subject and val_subject must be different")
+
+    train_subjects = [s for s in subjects if s not in (test_subject, val_subject)]
+
+    def gather(subj_list):
+        files = []
+        for s in subj_list:
+            files.extend(subject_to_files[s])
+        return files
+
+    train_files = gather(train_subjects)
+    val_files = gather([val_subject])
+    test_files = gather([test_subject])
+
+    print("=" * 70)
+    print(f"[split_mode=subject_independent] test={test_subject} val={val_subject} "
+          f"train={len(train_subjects)} subjects")
+    print(f"  All subjects ({len(subjects)}): {subjects}")
+    print(f"  file counts: train={len(train_files)} val={len(val_files)} test={len(test_files)}")
+    print("=" * 70)
+
+    # list_stress_files_by_subject 已经返回绝对路径；root_path 传 downstream_path
+    # 只是为了满足 EEGDataset.__init__ 里 root_path != "" 的分支，绝对路径本身
+    # 会让 os.path.join(root_path, abs_path) 直接忽略 root_path（no-op）。
+    train_dataset = KaggleERNDataset(
+        train_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
+        ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
+    )
+    validation_dataset = KaggleERNDataset(
+        val_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
+        ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
+    )
+    # test_dataset 需要 sample_id/subject_id 才能事后从保存的 npz 重新算所有指标。
+    test_dataset = KaggleERNDataset(
+        test_files, sample_keys=["inputs", "attention_mask"], chunk_len=chunk_len, num_chunks=num_chunks,
+        ovlp=ovlp, root_path=downstream_path, matrix_p_path=matrix_p_path, gpt_only=gpt_only,
+        return_sample_id=True,
     )
     return train_dataset, validation_dataset, test_dataset
 
@@ -354,16 +412,40 @@ def train(config: Dict = None) -> Trainer:
 
         print(f"INFO: Using {dataset_name} for downstream task.")
 
-        # [LOSO] 目前仅 motor6class 支持 20 折 subject-independent 划分；
+        # [LOSO] 目前 motor6class（20折）和 stress（17折）支持 subject-independent 划分；
         # 不传 --split-mode（默认 random_epoch）时，其余分支行为完全不变。
         split_mode = config.get("split_mode", "random_epoch")
-        if split_mode == "subject_independent" and dataset_name != "motor6class":
+        if split_mode == "subject_independent" and dataset_name not in ("motor6class", "stress"):
             raise ValueError(
                 f"--split-mode subject_independent is only supported for "
-                f"--dataset-name motor6class, got {dataset_name!r}"
+                f"--dataset-name motor6class/stress, got {dataset_name!r}"
             )
 
-        if dataset_name in ["KaggleERN", "stress"]:
+        if dataset_name == "stress" and split_mode == "subject_independent":
+            # [LOSO] 17折 subject-independent 划分，从 downstream_path 下的
+            # train/val/test 子目录里按受试者（chunk 文件名里的 SubNN）重新分组，
+            # 不使用原来固定的 random_epoch train/val/test 划分。
+            if not config.get("test_subject") or not config.get("val_subject"):
+                raise ValueError(
+                    "--split-mode subject_independent requires --test-subject and --val-subject"
+                )
+            matrix_p_path = config.get("matrix_p_path") or "tMatrix_22x30_stress.npy"
+            if not os.path.isabs(matrix_p_path) and not os.path.exists(matrix_p_path):
+                script_dir = os.path.dirname(os.path.realpath(__file__))
+                script_dir = os.path.dirname(script_dir)  # 回到 neurogpt_finetune 目录
+                matrix_p_path = os.path.join(script_dir, matrix_p_path.lstrip('./'))
+            train_dataset, validation_dataset, test_dataset = prepare_stress_dataset_subject_independent(
+                downstream_path,
+                config["test_subject"],
+                config["val_subject"],
+                matrix_p_path=matrix_p_path,
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                gpt_only=not config["use_encoder"],
+            )
+
+        elif dataset_name in ["KaggleERN", "stress"]:
 
             file_extension = "*.pickle"
             train_path = os.path.join(downstream_path, "train")
@@ -1930,7 +2012,7 @@ def get_args() -> argparse.ArgumentParser:
         help="record metric for saving trained model",
     )
 
-    # ===== [LOSO] 20-fold subject-independent LOSO（目前仅 --dataset-name motor6class 支持）=====
+    # ===== [LOSO] subject-independent LOSO（--dataset-name motor6class 支持20折，stress 支持17折）=====
     # 不传 --split-mode（默认 random_epoch）时，行为与之前完全一致。
     parser.add_argument(
         "--split-mode",
@@ -1939,8 +2021,8 @@ def get_args() -> argparse.ArgumentParser:
         choices=("random_epoch", "subject_independent"),
         type=str,
         help="random_epoch(默认)=旧的固定 train/val/test 目录划分; "
-        "subject_independent=20折 LOSO 单折训练，需要 --test-subject/--val-subject "
-        "（目前仅 --dataset-name motor6class 支持）。",
+        "subject_independent=LOSO 单折训练，需要 --test-subject/--val-subject "
+        "（--dataset-name motor6class/stress 支持）。",
     )
     parser.add_argument(
         "--test-subject",

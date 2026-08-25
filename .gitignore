@@ -10,6 +10,9 @@
 !cbramod_finetune/datasets/
 !neurolm_finetune/text_dataset_maker/
 
+# Claude Code local project settings -- machine-local, not shared via GitHub
+.claude/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

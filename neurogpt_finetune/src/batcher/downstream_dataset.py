@@ -8,7 +8,12 @@ from typing import Tuple, List, Dict
 from batcher.base import EEGDataset
 from scipy.io import loadmat
 from scipy.signal import butter, filtfilt
-from utils import compute_motor_sample_id, extract_motor_subject_id
+from utils import (
+    compute_motor_sample_id,
+    extract_motor_subject_id,
+    compute_stress_sample_id,
+    extract_stress_subject_id,
+)
 
 
 
@@ -24,6 +29,11 @@ class KaggleERNDataset(EEGDataset):
         root_path="",
         matrix_p_path=None,
         gpt_only=True,
+        # [LOSO] 是否在 __getitem__ 中额外返回 sample_id（仅 Stress 任务 subject_independent
+        # 划分使用）。默认 False，与现有 KaggleERN / stress random_epoch 调用点行为完全一致。
+        # Stress 的 chunk 文件名（'SubNN_increase_edfNN_chunkNNNN'）才能被
+        # compute_stress_sample_id/extract_stress_subject_id 解析；KaggleERN 不支持置 True。
+        return_sample_id=False,
     ):
         super().__init__(
             filenames,
@@ -34,6 +44,8 @@ class KaggleERNDataset(EEGDataset):
             root_path=root_path,
             gpt_only=gpt_only,
         )
+
+        self.return_sample_id = return_sample_id
 
         # Load the channel transformation matrix P
         # The P matrix should be (22, N_your_channels)
@@ -50,7 +62,7 @@ class KaggleERNDataset(EEGDataset):
             )
             self.P = None
 
-        self.trials, self.labels, self.num_trials_per_file = self.get_trials_all()
+        self.trials, self.labels, self.sample_ids, self.subject_ids, self.num_trials_per_file = self.get_trials_all()
 
     def __len__(self):
         return self.num_trials_per_file
@@ -73,9 +85,11 @@ class KaggleERNDataset(EEGDataset):
         # matrix multiplication
         return np.matmul(self.P, data)  # Output shape: (22, N_samples)
 
-    def get_trials_all(self) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    def get_trials_all(self) -> Tuple[np.ndarray, np.ndarray, List[str], List[int], int]:
         trials_all = []
         labels_all = []
+        sample_ids_all = []
+        subject_ids_all = []
         total_num = 0
 
         for file_path in self.filenames:
@@ -106,12 +120,32 @@ class KaggleERNDataset(EEGDataset):
             trials_all.append(mapped_data)
             labels_all.append(label)
 
+            if self.return_sample_id:
+                chunk_id = os.path.splitext(os.path.basename(file_path))[0]
+                sample_ids_all.append(compute_stress_sample_id(chunk_id))
+                subj = extract_stress_subject_id(file_path)
+                if subj is None:
+                    raise ValueError(f"Cannot extract subject id from {file_path}")
+                subject_ids_all.append(int(subj[3:]))
+
         total_num = len(trials_all)
+
+        if self.return_sample_id and len(set(sample_ids_all)) != len(sample_ids_all):
+            raise ValueError(
+                "Duplicate sample_id detected in KaggleERNDataset; "
+                "check for duplicate/conflicting chunk files."
+            )
 
         # (Total_Trials, channel_size, chunk_len*sample_rate)
         trials_all_arr = np.stack(trials_all, axis=0)
 
-        return self.normalize(trials_all_arr), np.array(labels_all).flatten(), total_num
+        return (
+            self.normalize(trials_all_arr),
+            np.array(labels_all).flatten(),
+            sample_ids_all,
+            subject_ids_all,
+            total_num,
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -120,11 +154,14 @@ class KaggleERNDataset(EEGDataset):
         trial_data_normalized_once = self.trials[idx]
         label = self.labels[idx]
 
-        return self.preprocess_sample(
+        result = self.preprocess_sample(
             sample=trial_data_normalized_once,
             seq_len=self.num_chunks,  # self.num_chunks is the 'seq_len' argument in preprocess_sample
             labels=label,  # Pass label as a numpy array for consistent handling
         )
+        if self.return_sample_id:
+            result["sample_id"] = self.sample_ids[idx]
+        return result
 
 
 class Motor6ClassDataset(EEGDataset):

@@ -152,6 +152,51 @@ def extract_motor_subject_id(name):
     return m.group(1) if m else None
 
 
+# ===== [LOSO] Stress task sample_id -- ported verbatim (same regex/format) from
+# cbramod_finetune/datasets/custom_stress_dataset.py's compute_stress_sample_id
+# so that the sample_id computed here for a given underlying chunk file is
+# byte-identical to what every other already-converted model
+# (cbramod/neurolm/labram/eegpt) computes for that same file. =====
+_STRESS_SAMPLE_ID_RE = re.compile(r'^Sub(\d+)_(increase|normal)_edf(\d+)_chunk(\d+)$')
+_STRESS_SUBJECT_RE = re.compile(r'(Sub\d+)_')
+
+
+def compute_stress_sample_id(chunk_id):
+    """由 chunk_id（如 'Sub04_increase_edf27_chunk0012'）确定性地生成 sample_id，
+    格式：S{subject:02d}_edf{edf_num}_chunk{local_idx:04d}。"""
+    m = _STRESS_SAMPLE_ID_RE.match(chunk_id)
+    if not m:
+        raise ValueError(f"Cannot parse chunk_id for sample_id: {chunk_id!r}")
+    subject_num = int(m.group(1))
+    edf_num = int(m.group(3))
+    local_idx = int(m.group(4))
+    return f"S{subject_num:02d}_edf{edf_num}_chunk{local_idx:04d}"
+
+
+def extract_stress_subject_id(name):
+    """'Sub04_increase_edf27_chunk0012.pickle'（或包含它的任意路径）-> 'Sub04'。"""
+    m = _STRESS_SUBJECT_RE.search(os.path.basename(name))
+    return m.group(1) if m else None
+
+
+def list_stress_files_by_subject(root):
+    """[LOSO] 扫描 root/{train,val,test}/*.pickle，按受试者分组（'Sub04' -> [abs_path, ...]），
+    用于构造 Stress 任务的受试者独立（LOSO）划分。返回绝对路径。"""
+    subject_to_files = defaultdict(list)
+    for split in ("train", "val", "test"):
+        split_dir = os.path.join(root, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for fname in os.listdir(split_dir):
+            if not fname.endswith(".pickle"):
+                continue
+            sid = extract_stress_subject_id(fname)
+            if sid is None:
+                continue
+            subject_to_files[sid].append(os.path.abspath(os.path.join(split_dir, fname)))
+    return subject_to_files
+
+
 def list_motor_files_by_subject(root):
     """[LOSO] 扫描 root/{train,val,test}/*.pickle，按受试者分组（'Sub04' -> [abs_path, ...]），
     用于构造受试者独立（LOSO）划分。返回绝对路径，方便直接喂给 EEGDataset
