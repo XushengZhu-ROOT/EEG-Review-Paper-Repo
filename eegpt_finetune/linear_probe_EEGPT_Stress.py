@@ -1,6 +1,9 @@
-import random 
+import random
 import os
 import math
+import re
+import time
+import argparse
 import torch
 from torch import nn
 import pytorch_lightning as pl
@@ -8,6 +11,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pathlib import Path
 import json
 from datetime import datetime
+from collections import defaultdict
 
 from functools import partial
 import numpy as np
@@ -38,7 +42,7 @@ from Modules.models.EEGPT_mcae import EEGTransformer
 from Modules.Network.utils import Conv1dWithConstraint, LinearWithConstraint
 from sklearn import metrics
 from utils_eval import get_metrics
-from einops.layers.torch import Rearrange
+from einops.layers.torch import Rearrange, Reduce
 import glob
 import pickle
 
@@ -72,6 +76,60 @@ use_channels_names = [
     'P3', 'PZ', 'P4', 'P8','O1', 'OZ',
     'O2',
 ]  # 30个通道
+
+# ===== 跨模型稳定的 sample_id，与 cbramod_finetune/datasets/custom_stress_dataset.py 的
+# compute_stress_sample_id / labram_finetune/utils.py 的同名函数保持同步。
+# chunk_id 形如 'Sub04_increase_edf27_chunk0012'（stress_data/_run_eegpt_preprocess.py 生成，
+# 与 _run_labram_preprocess.py/_run_neurolm_preprocess.py 共用同一套 process_stress_dataset()
+# 逻辑，只是 model_name="eegpt" 换了预处理函数）；纯函数，只依赖文件名本身，
+# 与 shuffle / batch_size / num_workers 无关。 =====
+_SAMPLE_ID_RE = re.compile(r'^Sub(\d+)_(increase|normal)_edf(\d+)_chunk(\d+)$')
+_STRESS_SUBJECT_RE = re.compile(r'(Sub\d+)_')
+
+
+def compute_stress_sample_id(chunk_id):
+    """由 chunk_id（如 'Sub04_increase_edf27_chunk0012'）确定性地生成 sample_id，
+    格式：S{subject:02d}_edf{edf_num}_chunk{local_idx:04d}。"""
+    m = _SAMPLE_ID_RE.match(chunk_id)
+    if not m:
+        raise ValueError(f"Cannot parse chunk_id for sample_id: {chunk_id!r}")
+    subject_num = int(m.group(1))
+    edf_num = int(m.group(3))
+    local_idx = int(m.group(4))
+    return f"S{subject_num:02d}_edf{edf_num}_chunk{local_idx:04d}"
+
+
+def extract_stress_subject_id(name):
+    """'Sub04_increase_edf27_chunk0012.pickle'（或包含它的任意路径）-> 'Sub04'。"""
+    m = _STRESS_SUBJECT_RE.search(os.path.basename(name))
+    return m.group(1) if m else None
+
+
+def list_stress_files_by_subject(root):
+    """扫描 root/{train,val,test}/*.pickle，按受试者分组（'Sub04' -> [path, ...]），
+    用于构造受试者独立（LOSO）划分。"""
+    subject_to_files = defaultdict(list)
+    for split in ("train", "val", "test"):
+        split_dir = os.path.join(root, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for fname in os.listdir(split_dir):
+            if not fname.endswith(".pickle"):
+                continue
+            sid = extract_stress_subject_id(fname)
+            if sid is None:
+                continue
+            subject_to_files[sid].append(os.path.join(split_dir, fname))
+    return subject_to_files
+
+
+def collate_fn_stress_with_sample_id(batch):
+    """配合 KaggleEEGDataset(return_sample_id=True) 使用：batch 是 (X, Y, sample_id) 三元组。"""
+    X_list, Y_list, sample_id_list = zip(*batch)
+    X_batch = torch.stack(X_list, dim=0)
+    Y_batch = torch.stack(Y_list, dim=0)
+    return X_batch, Y_batch, list(sample_id_list)
+
 
 # ==================== 用户可配置参数 ====================
 # 建议你只改这一段就能完成大部分自定义
@@ -108,10 +166,21 @@ num_workers = 4
 accelerator = "cuda"
 devices = [0]   # 根据你机器的 GPU id 修改
 
-# ====== 超参数搜索范围（可选）======
+# ====== 超参数搜索范围（可选，仅 split_mode=random_epoch 的旧网格搜索流程使用）======
 BS_LIST = [128, 64, 32]
 LR_LIST = [1e-3, 4e-4, 1e-4]
 WD_LIST = [1e-2, 1e-3]
+
+# ====== LOSO（17折 subject-independent）固定超参数：不做网格搜索 ======
+# 用户指定：lr=1e-3, weight_decay=1e-3, batch_size=64；其余（epochs/freeze_encoder/
+# encoder_lr_ratio）沿用之前 Stress 的配置（本文件顶部网格搜索默认值：
+# max_epochs=50, freeze_encoder=False 全局微调, encoder_lr_ratio=0.1）。
+LOSO_BATCH_SIZE = 64
+LOSO_LR = 1e-3
+LOSO_WEIGHT_DECAY = 1e-3
+LOSO_EPOCHS = 50
+LOSO_FREEZE_ENCODER = False       # False = 全局微调（full finetune），不是 linear probe
+LOSO_ENCODER_LR_RATIO = encoder_lr_ratio
 
 
 class KaggleEEGDataset(torch.utils.data.Dataset):
@@ -121,23 +190,29 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
         - 'X': ndarray, shape (30, 1000) - 原始数据 5秒@200Hz
         - 'y' : int, 0 或 1
     """
-    def __init__(self, root_dir: str, split: str = "train", expected_channels: int = 30, target_channels: int = 30):
+    def __init__(self, root_dir: str, split: str = "train", expected_channels: int = 30, target_channels: int = 30,
+                 file_list=None, return_sample_id: bool = False):
         super().__init__()
         self.root_dir = root_dir
         self.split = split
-        self.split_dir = os.path.join(root_dir, split)
-        assert os.path.isdir(self.split_dir), f"{self.split_dir} 不存在"
-        
         self.expected_channels = expected_channels
         self.target_channels = target_channels
+        self.return_sample_id = return_sample_id
+
+        # ===== [LOSO 新增] 若传入 file_list，直接用该文件列表（用于受试者独立划分），
+        # 忽略 root_dir/split 目录扫描；旧调用方式（file_list=None）行为完全不变。=====
+        if file_list is not None:
+            all_files = list(file_list)
+        else:
+            self.split_dir = os.path.join(root_dir, split)
+            assert os.path.isdir(self.split_dir), f"{self.split_dir} 不存在"
+            all_files = [
+                os.path.join(self.split_dir, f)
+                for f in os.listdir(self.split_dir)
+                if f.endswith(".pickle")
+            ]
 
         # 过滤：只保留expected_channels通道的文件
-        all_files = [
-            os.path.join(self.split_dir, f)
-            for f in os.listdir(self.split_dir)
-            if f.endswith(".pickle")
-        ]
-        
         self.files = []
         skipped = 0
         for f in all_files:
@@ -152,21 +227,32 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
             except Exception:
                 skipped += 1
                 continue
-        
+
         self.files.sort()
-        
+
         if len(self.files) == 0:
-            raise RuntimeError(f"{self.split_dir} 下没有找到任何 {expected_channels} 通道的 .pickle 文件")
-        
+            raise RuntimeError(f"split={split}: 没有找到任何 {expected_channels} 通道的 .pickle 文件")
+
         if skipped > 0:
             print(f"[KaggleEEGDataset] split={split}, 跳过 {skipped} 个通道数不匹配的文件")
         print(f"[KaggleEEGDataset] split={split}, 样本数={len(self.files)}")
+
+        # ===== [LOSO 新增] sample_id 在数据集构造（列文件）时一次性确定，
+        # 与 self.files 一一对应；不受 shuffle / batch_size / num_workers 影响。
+        # 解析失败直接报错退出（不静默跳过）。=====
+        self.sample_ids = [
+            compute_stress_sample_id(os.path.splitext(os.path.basename(f))[0]) for f in self.files
+        ]
+        if len(set(self.sample_ids)) != len(self.sample_ids):
+            raise ValueError(f"[{split}] Duplicate sample_id detected after computing sample_ids; "
+                              f"check for duplicate/conflicting chunk files.")
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         path = self.files[idx]
+        sample_id = self.sample_ids[idx]
         with open(path, "rb") as f:
             obj = pickle.load(f)
 
@@ -176,16 +262,18 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
         # 检查通道数
         if x.shape[0] != self.expected_channels:
             raise ValueError(f"Expected {self.expected_channels} channels, got {x.shape[0]}")
-        
+
         # Stress数据使用全部30个通道，不需要丢弃
         x = x[:self.target_channels, :]  # (30, 1000)
-        
+
         # 数据清理：NaN/Inf处理
         x = np.nan_to_num(x, posinf=0.0, neginf=0.0)
-        
+
         x = torch.tensor(x, dtype=torch.float32)  # (C, T)
         y = torch.tensor(y, dtype=torch.long)
 
+        if self.return_sample_id:
+            return x, y, sample_id
         return x, y
 
 
@@ -274,22 +362,45 @@ class LitEEGPTCausal(pl.LightningModule):
         embed_num = 4
         embed_dim = 512
         
-        # 分类头：直接展平所有维度，然后通过Linear层
-        # Layer 1: (N * embed_num * embed_dim) -> (N * embed_dim)
-        # Layer 2: (N * embed_dim) -> embed_dim
-        # Layer 3: embed_dim -> num_classes
+        # ===== [LOSO OOM 修复] 原来的分类头直接展平 (B, N, embed_num, embed_dim)，
+        # Layer 1 是 Linear(N*embed_num*embed_dim, N*embed_dim)。Stress 的 N=20
+        # （5s@256Hz/patch_size=64），Layer 1 单层就有 419M 参数——比 target_encoder
+        # 本身（25.3M）还大 17 倍，AdamW 全微调时这一层的权重+梯度+两组动量缓冲区
+        # 光是 fp32 就要吃掉 ~6.8GB，是 LOSO smoke test 在 10.91GiB 卡上无论怎么调
+        # batch_size/precision/数据量都会 OOM 的真正根因（不是这几个改动导致的，
+        # 这个分类头结构在加 LOSO 之前就是这样，Motor 的 N=4 所以没暴露出这个问题）。
+        # 保留原实现在下面注释里，方便以后需要时找回：
+        #
+        # self.classifier = nn.Sequential(
+        #     # Reshape: (B, N, embed_num, embed_dim) -> (B, N * embed_num * embed_dim)
+        #     Rearrange('b n e d -> b (n e d)'),
+        #     # Layer 1: (N * embed_num * embed_dim) -> (N * embed_dim)
+        #     nn.Linear(self.N * embed_num * embed_dim, self.N * embed_dim),
+        #     nn.ELU(),
+        #     nn.Dropout(0.1),
+        #     # Layer 2: (N * embed_dim) -> embed_dim
+        #     nn.Linear(self.N * embed_dim, embed_dim),
+        #     nn.ELU(),
+        #     nn.Dropout(0.1),
+        #     # Layer 3: embed_dim -> num_classes
+        #     nn.Linear(embed_dim, self.num_class),
+        # )
+        #
+        # Stress 本来就应该用 1 层分类头，不是 3 层——跟 labram/cbramod/neurolm 的
+        # Stress "1ly" 配置对齐：labram_finetune/modeling_finetune.py 默认
+        # NeuralTransformer 头就是 fc_norm(LayerNorm) + nn.Linear(embed_dim,
+        # num_classes) 一层（pool 用 t.mean(1)），labram_finetune/param_report.py
+        # 明确写了 "Stress (1ly): 一层分类头"，KaggleERN/Seed 才是 3ly。eegpt 的
+        # Motor/KaggleERN/Seed/Sleep 脚本用同一份 3 层模板是对的（跟这些任务的 3ly
+        # 约定一致，不要改），只有 Stress 从一开始就该单独用 1 层，之前直接照抄了
+        # 同一份 3 层模板，没有跟着任务区分——这是导致上面那个 419M 参数 Layer 1
+        # 的根本原因，不只是"要不要 pool"的问题。
         self.classifier = nn.Sequential(
-            # Reshape: (B, N, embed_num, embed_dim) -> (B, N * embed_num * embed_dim)
-            Rearrange('b n e d -> b (n e d)'),
-            # Layer 1: (N * embed_num * embed_dim) -> (N * embed_dim)
-            nn.Linear(self.N * embed_num * embed_dim, self.N * embed_dim),
-            nn.ELU(),
-            nn.Dropout(0.1),
-            # Layer 2: (N * embed_dim) -> embed_dim
-            nn.Linear(self.N * embed_dim, embed_dim),
-            nn.ELU(),
-            nn.Dropout(0.1),
-            # Layer 3: embed_dim -> num_classes
+            # Mean pool over N 和 embed_num（对齐 labram 1ly 头的 t.mean(1) 池化方式）：
+            # (B, N, embed_num, embed_dim) -> (B, embed_dim)
+            Reduce('b n e d -> b d', 'mean'),
+            nn.LayerNorm(embed_dim),
+            # 单层 Linear: embed_dim -> num_classes
             nn.Linear(embed_dim, self.num_class),
         )
        
@@ -577,10 +688,8 @@ class LitEEGPTCausal(pl.LightningModule):
             {'optimizer': optimizer, 'lr_scheduler': lr_dict},
         )
         
-def class_stats(folder: str, num_classes: int = 2, expected_channels: int = 30):
-    """计算类别分布，用于计算类别权重（只统计expected_channels通道的文件）"""
-    paths = [p for ext in ("*.pickle", "*.pkl", "*.pql")
-             for p in glob.glob(os.path.join(folder, ext))]
+def _count_classes(paths, num_classes: int = 2, expected_channels: int = 30):
+    """对一批文件路径统计类别分布（只统计expected_channels通道的文件）"""
     class_counts = [0] * num_classes
     n_tot = 0
     for p in paths:
@@ -588,7 +697,6 @@ def class_stats(folder: str, num_classes: int = 2, expected_channels: int = 30):
             with open(p, "rb") as f:
                 obj = pickle.load(f)
             X = np.asarray(obj["X"], dtype=np.float32)
-            # 只统计expected_channels通道的文件
             if X.shape[0] == expected_channels:
                 y = int(obj["y"])
                 if 0 <= y < num_classes:
@@ -597,6 +705,13 @@ def class_stats(folder: str, num_classes: int = 2, expected_channels: int = 30):
         except Exception:
             continue
     return class_counts, n_tot
+
+
+def class_stats(folder: str, num_classes: int = 2, expected_channels: int = 30):
+    """计算类别分布，用于计算类别权重（只统计expected_channels通道的文件）"""
+    paths = [p for ext in ("*.pickle", "*.pkl", "*.pql")
+             for p in glob.glob(os.path.join(folder, ext))]
+    return _count_classes(paths, num_classes=num_classes, expected_channels=expected_channels)
 
 
 def check_experiment_complete(batch_size, max_lr, weight_decay, freeze_encoder, 
@@ -763,48 +878,391 @@ def main():
     print("\n训练完成！结果保存在:", output_dir.absolute())
 
 
+class BestEpochTracker(pl.Callback):
+    """[LOSO 新增] 纯观察者：记录验证集 valid_balanced_accuracy 最好的那个 epoch
+    （1-indexed），不修改 LitEEGPTCausal 的任何训练/验证逻辑，只读
+    trainer.callback_metrics。仅在 subject_independent 17折路径下挂载。"""
+
+    def __init__(self, monitor="valid_balanced_accuracy"):
+        self.monitor = monitor
+        self.best_score = float("-inf")
+        self.best_epoch = 0
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        score = trainer.callback_metrics.get(self.monitor)
+        if score is None:
+            return
+        score = float(score)
+        if score > self.best_score:
+            self.best_score = score
+            self.best_epoch = trainer.current_epoch + 1
+
+
+def save_eegpt_stress_fold_results(args, lightning_model, checkpoint_callback, test_files,
+                                    best_epoch, train_time_sec, save_dir):
+    """[LOSO 新增] 用被选中的最佳 epoch 权重（ModelCheckpoint 按 valid_balanced_accuracy
+    选出的那个 checkpoint，不是训练循环结束时的最后一轮权重）对 test 集重新推理一次，保存：
+      {task}_{model}_fold{i:02d}.npz  -- sample_id / y_true / y_pred / y_prob / subject_id
+      {task}_{model}_fold{i:02d}.json -- fold / test_subject / val_subject / balanced_accuracy /
+                                          best_epoch / hyperparams / train_time_sec /
+                                          peak_gpu_mem_mb / gpu_name
+    Stress 模型头本身就是 2 类 softmax 输出（跟 Motor 一样，不是 cbramod/labram/neurolm
+    那种单个 logit + sigmoid 的二分类头），所以 y_prob 直接是 softmax((N,2))，不需要
+    像那几个模型的 evaluator 那样单独走 sigmoid+0.5 分支。
+    17 个受试者里有 11 个只做过 increase 或只做过 normal（单一类别），某折的 test 受试者
+    可能只有一个类别；balanced_accuracy_score 对单类别 y_true 不会报错（退化为该类的
+    recall），所以这里不需要特殊处理，跟 cbramod/labram 的 finetune_evaluator.py 一致——
+    真正需要 NaN 保护的是 roc_auc/pr_auc，这两个指标不在这里算，留给
+    compute_metrics_from_npz.py / aggregate_loso_results_stress.py 事后从 npz 里算，
+    那两个脚本里对单类别 fold 会返回 NaN 而不是抛异常。
+    失败直接抛异常，不静默跳过；已存在的旧结果先改名备份，不会被静默覆盖。"""
+    best_ckpt_path = checkpoint_callback.best_model_path
+    if not best_ckpt_path or not os.path.exists(best_ckpt_path):
+        raise RuntimeError(
+            f"save_eegpt_stress_fold_results: no best checkpoint found (best_model_path={best_ckpt_path!r})"
+        )
+    state = torch.load(best_ckpt_path, map_location="cpu")
+    lightning_model.load_state_dict(state["state_dict"])
+
+    device = next(lightning_model.parameters()).device
+    lightning_model.eval()
+
+    sid_test_dataset = KaggleEEGDataset(data_root, split="test", file_list=test_files, return_sample_id=True)
+    sid_test_loader = torch.utils.data.DataLoader(
+        sid_test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn_stress_with_sample_id,
+    )
+
+    subj_re = re.compile(r'^S(\d+)_')
+    sample_ids, y_true, y_pred, y_prob, subject_ids = [], [], [], [], []
+    with torch.no_grad():
+        for X, Y, batch_sample_ids in sid_test_loader:
+            X = X.to(device)
+            _, logits = lightning_model(X)
+            probs = torch.softmax(logits, dim=-1)
+            preds = torch.argmax(logits, dim=-1)
+            for i, sid in enumerate(batch_sample_ids):
+                m = subj_re.match(sid)
+                if not m:
+                    raise ValueError(f"Cannot parse subject_id from sample_id: {sid!r}")
+                sample_ids.append(sid)
+                y_true.append(int(Y[i].item()))
+                y_pred.append(int(preds[i].cpu().item()))
+                y_prob.append(probs[i].cpu().numpy())
+                subject_ids.append(int(m.group(1)))
+
+    if len(sample_ids) == 0:
+        raise RuntimeError("save_eegpt_stress_fold_results: no samples collected, refusing to save an empty file.")
+
+    sample_ids_arr = np.array(sample_ids)
+    order = np.argsort(sample_ids_arr)
+    sample_ids_arr = sample_ids_arr[order]
+    y_true_arr = np.array(y_true, dtype=np.int64)[order]
+    y_pred_arr = np.array(y_pred, dtype=np.int64)[order]
+    y_prob_arr = np.array(y_prob, dtype=np.float32)[order]
+    subject_id_arr = np.array(subject_ids, dtype=np.int64)[order]
+
+    task = args.task_name or "stress"
+    model_name = args.model_name or "eegpt"
+    os.makedirs(save_dir, exist_ok=True)
+    npz_path = os.path.join(save_dir, f"{task}_{model_name}_fold{args.fold_idx:02d}.npz")
+    json_path = os.path.join(save_dir, f"{task}_{model_name}_fold{args.fold_idx:02d}.json")
+
+    # 已有旧结果先改名备份，绝不静默覆盖
+    for path in (npz_path, json_path):
+        if os.path.exists(path):
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            backup_path = f"{path}.bak-{ts}"
+            os.rename(path, backup_path)
+            print(f"[warn] existing fold result found, backed up to {backup_path}")
+
+    np.savez(
+        npz_path,
+        sample_id=sample_ids_arr,
+        y_true=y_true_arr,
+        y_pred=y_pred_arr,
+        y_prob=y_prob_arr,
+        subject_id=subject_id_arr,
+    )
+    if not os.path.exists(npz_path):
+        raise RuntimeError(f"save_eegpt_stress_fold_results: failed to write {npz_path}")
+    _reload = np.load(npz_path)
+    for key in ("sample_id", "y_true", "y_pred", "y_prob", "subject_id"):
+        if key not in _reload:
+            raise RuntimeError(f"save_eegpt_stress_fold_results: {npz_path} missing key {key!r} after write")
+        if len(_reload[key]) != len(sample_ids_arr):
+            raise RuntimeError(f"save_eegpt_stress_fold_results: {npz_path} key {key!r} length mismatch after write")
+
+    balanced_accuracy = float(balanced_accuracy_score(y_true_arr, y_pred_arr))
+
+    hyperparams = {
+        "lr": max_lr,
+        "weight_decay": weight_decay,
+        "batch_size": batch_size,
+        "epochs": max_epochs,
+        "optimizer": "AdamW",
+        "seed": 9,
+        "freeze_encoder": bool(freeze_encoder),
+        "encoder_lr_ratio": encoder_lr_ratio,
+        "channels": len(use_channels_names),
+        "num_classes": num_classes,
+    }
+
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    peak_gpu_mem_mb = (torch.cuda.max_memory_allocated(0) / (1024 ** 2)) if torch.cuda.is_available() else None
+
+    meta = {
+        "fold": args.fold_idx,
+        "test_subject": args.test_subject,
+        "val_subject": args.val_subject,
+        "balanced_accuracy": balanced_accuracy,
+        "best_epoch": best_epoch,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": hyperparams,
+        "train_time_sec": train_time_sec,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "gpu_name": gpu_name,
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"save_eegpt_stress_fold_results: failed to write {json_path}")
+    with open(json_path) as f:
+        json.load(f)  # 回读校验 JSON 没写坏
+
+    print(f"Saved fold predictions to {npz_path}")
+    print(f"Saved fold metadata to {json_path}")
+    print(f"  fold={args.fold_idx} test={args.test_subject} val={args.val_subject} "
+          f"best_epoch={best_epoch} balanced_accuracy={balanced_accuracy:.5f}")
+
+
+def run_loso_fold(args):
+    """[LOSO 新增] 17折 subject-independent LOSO 单折训练入口（Stress 只有 17 个受试者，
+    不是 Motor 的 20 个）：test = args.test_subject, val = args.val_subject, train = 其余受试者。
+    固定超参数（不做HPO）：lr/weight_decay/batch_size/epochs 见 LOSO_* 常量，
+    freeze_encoder=False（全局微调，非 linear probe）。
+    不改动 LitEEGPTCausal 的模型定义/训练逻辑/优化器逻辑，只是复用它们并额外
+    挂载按 valid_balanced_accuracy 选模的 checkpoint + 事后保存 npz/json。"""
+    global batch_size, max_lr, weight_decay, max_epochs, freeze_encoder, encoder_lr_ratio, steps_per_epoch
+
+    if not args.test_subject or not args.val_subject:
+        raise ValueError("split_mode=subject_independent requires --test_subject and --val_subject")
+    if args.test_subject == args.val_subject:
+        raise ValueError("--test_subject and --val_subject must be different")
+
+    seed_torch(9)
+
+    subject_to_files = list_stress_files_by_subject(data_root)
+    subjects = sorted(subject_to_files.keys(), key=lambda s: int(s[3:]))
+    for s in (args.test_subject, args.val_subject):
+        if s not in subject_to_files:
+            raise ValueError(f"Subject {s!r} not found among {subjects}")
+
+    train_subjects = [s for s in subjects if s not in (args.test_subject, args.val_subject)]
+    val_subjects = [args.val_subject]
+    test_subjects = [args.test_subject]
+
+    def gather(subj_list):
+        files = []
+        for s in subj_list:
+            files.extend(subject_to_files[s])
+        return files
+
+    train_files = gather(train_subjects)
+    val_files = gather(val_subjects)
+    test_files = gather(test_subjects)
+
+    print("=" * 70)
+    print(f"[split_mode=subject_independent] fold={args.fold_idx}  "
+          f"test={args.test_subject}  val={args.val_subject}  train={len(train_subjects)} subjects")
+    print(f"  All subjects ({len(subjects)}): {subjects}")
+    print(f"  file counts: train={len(train_files)} val={len(val_files)} test={len(test_files)}")
+    print("=" * 70)
+
+    # 固定超参数：不做HPO，全局微调（full finetune）
+    batch_size = LOSO_BATCH_SIZE
+    max_lr = LOSO_LR
+    weight_decay = LOSO_WEIGHT_DECAY
+    max_epochs = LOSO_EPOCHS
+    freeze_encoder = LOSO_FREEZE_ENCODER
+    encoder_lr_ratio = LOSO_ENCODER_LR_RATIO
+
+    run_tag = f"fold{args.fold_idx:02d}_test{args.test_subject}"
+    output_dir = Path("output") / "EEGPT_Stress_LOSO" / run_tag
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"输出文件夹: {output_dir.absolute()}")
+
+    config = {
+        "task_name": TASK_NAME,
+        "run_name": run_tag,
+        "split_mode": "subject_independent",
+        "fold_idx": args.fold_idx,
+        "test_subject": args.test_subject,
+        "val_subject": args.val_subject,
+        "batch_size": batch_size,
+        "max_epochs": max_epochs,
+        "max_lr": max_lr,
+        "weight_decay": weight_decay,
+        "freeze_encoder": freeze_encoder,
+        "encoder_lr_ratio": encoder_lr_ratio,
+        "channels": len(use_channels_names),
+        "num_classes": num_classes,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(output_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+    class_counts, n_tot = _count_classes(train_files, num_classes=num_classes, expected_channels=30)
+    class_weights = torch.tensor(
+        [n_tot / (num_classes * c) if c > 0 else 1.0 for c in class_counts],
+        dtype=torch.float32,
+    )
+    print(f"[data] fold={args.fold_idx} train samples={n_tot}, class_counts={class_counts}")
+    print(f"[data] class_weights={class_weights.tolist()}")
+
+    train_dataset = KaggleEEGDataset(data_root, split="train", file_list=train_files)
+    valid_dataset = KaggleEEGDataset(data_root, split="val", file_list=val_files)
+    test_dataset = KaggleEEGDataset(data_root, split="test", file_list=test_files)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=True,
+    )
+    valid_loader = torch.utils.data.DataLoader(
+        valid_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, pin_memory=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, pin_memory=True,
+    )
+
+    model = LitEEGPTCausal(
+        freeze_encoder=freeze_encoder,
+        encoder_lr_ratio=encoder_lr_ratio,
+    )
+    model.output_dir = output_dir
+
+    device = next(model.parameters()).device
+    class_weights_device = class_weights.to(device)
+    model.class_weights = class_weights_device
+    model.loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights_device)
+    model.test_loader = test_loader
+
+    steps_per_epoch = math.ceil(len(train_loader))
+
+    # [LOSO 新增] 仅这条路径打开 checkpointing，按 valid_balanced_accuracy 选模；
+    # 旧的网格搜索路径（main()）保持 enable_checkpointing=False 不变。
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=str(output_dir / "checkpoints"),
+        monitor="valid_balanced_accuracy",
+        mode="max",
+        save_top_k=1,
+        filename="best-{epoch:02d}-{valid_balanced_accuracy:.5f}",
+        auto_insert_metric_name=False,
+    )
+    best_epoch_tracker = BestEpochTracker(monitor="valid_balanced_accuracy")
+
+    trainer_kwargs = dict(
+        accelerator=accelerator,
+        max_epochs=max_epochs,
+        callbacks=[checkpoint_callback, best_epoch_tracker],
+        enable_checkpointing=True,
+        logger=False,
+        enable_progress_bar=True,
+    )
+    if devices is not None:
+        trainer_kwargs["devices"] = devices
+
+    trainer = pl.Trainer(**trainer_kwargs)
+
+    print(f"\n开始训练: {run_tag}")
+    print(f"模式: {'线性探测' if freeze_encoder else '全局微调'}")
+    print(f"Epochs: {max_epochs}, Batch size: {batch_size}, LR: {max_lr}, WD: {weight_decay}\n")
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    train_start_time = time.time()
+    trainer.fit(model, train_loader, valid_loader)
+    train_time_sec = time.time() - train_start_time
+
+    print(f"\n训练完成，最佳 epoch={best_epoch_tracker.best_epoch}（valid_balanced_accuracy={best_epoch_tracker.best_score:.5f}）")
+
+    fold_results_dir = args.fold_results_dir or "./fold_results_eegpt_stress"
+    save_eegpt_stress_fold_results(
+        args, model, checkpoint_callback, test_files,
+        best_epoch_tracker.best_epoch, train_time_sec, save_dir=fold_results_dir,
+    )
+
+
 if __name__ == "__main__":
-    # 网格搜索：遍历所有 (batch_size, lr, weight_decay) 组合
-    for bs in BS_LIST:
-        for lr in LR_LIST:
-            for wd in WD_LIST:
-                print("\n" + "=" * 80)
-                print(f"检查实验: bs={bs}, lr={lr}, wd={wd}, freeze_encoder={freeze_encoder}")
-                print("=" * 80)
-                
-                # 检查实验是否已经完整训练（0-40 epoch）
-                is_complete, output_dir = check_experiment_complete(
-                    bs, lr, wd, freeze_encoder, required_epochs=40
-                )
-                
-                if is_complete:
-                    print(f"✓ 实验已完成（0-40 epoch），跳过: {output_dir.name}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--split_mode", type=str, default="random_epoch",
+        choices=["random_epoch", "subject_independent"],
+        help="random_epoch(默认) = 旧的网格搜索流程，读取 Stress_data/{train,val,test} 固定划分；"
+             "subject_independent = 17折 LOSO 单折训练，需要 --test_subject/--val_subject。"
+             "不传本参数时行为与之前完全一致。"
+    )
+    parser.add_argument("--test_subject", type=str, default=None,
+                        help="e.g. Sub04；split_mode=subject_independent 时必填")
+    parser.add_argument("--val_subject", type=str, default=None,
+                        help="e.g. Sub05；split_mode=subject_independent 时必填")
+    parser.add_argument("--fold_idx", type=int, default=0,
+                        help="LOSO fold 序号（0-based），用于输出目录名/保存文件名")
+    parser.add_argument("--model_name", type=str, default="eegpt",
+                        help="保存 {task}_{model}_fold{i}.npz/json 时使用的模型名")
+    parser.add_argument("--task_name", type=str, default="stress",
+                        help="保存 {task}_{model}_fold{i}.npz/json 时使用的任务名")
+    parser.add_argument("--fold_results_dir", type=str, default=None,
+                        help="npz/json 保存目录；默认 ./fold_results_eegpt_stress")
+    cli_args = parser.parse_args()
+
+    if cli_args.split_mode == "subject_independent":
+        run_loso_fold(cli_args)
+    else:
+        # ===== [保留原逻辑] 网格搜索：遍历所有 (batch_size, lr, weight_decay) 组合 =====
+        for bs in BS_LIST:
+            for lr in LR_LIST:
+                for wd in WD_LIST:
+                    print("\n" + "=" * 80)
+                    print(f"检查实验: bs={bs}, lr={lr}, wd={wd}, freeze_encoder={freeze_encoder}")
                     print("=" * 80)
-                    continue
-                
-                # 检查是否有部分结果
-                if output_dir.exists():
-                    existing_epochs = []
-                    for epoch_file in sorted(output_dir.glob("epoch_*_valid.json")):
-                        try:
-                            epoch_num = int(epoch_file.stem.split("_")[1])
-                            existing_epochs.append(epoch_num)
-                        except:
-                            pass
-                    if existing_epochs:
-                        max_epoch = max(existing_epochs)
-                        print(f"⚠ 检测到已有部分结果（最高到 epoch {max_epoch}），将重新训练并覆盖")
+
+                    # 检查实验是否已经完整训练（0-40 epoch）
+                    is_complete, output_dir = check_experiment_complete(
+                        bs, lr, wd, freeze_encoder, required_epochs=40
+                    )
+
+                    if is_complete:
+                        print(f"✓ 实验已完成（0-40 epoch），跳过: {output_dir.name}")
+                        print("=" * 80)
+                        continue
+
+                    # 检查是否有部分结果
+                    if output_dir.exists():
+                        existing_epochs = []
+                        for epoch_file in sorted(output_dir.glob("epoch_*_valid.json")):
+                            try:
+                                epoch_num = int(epoch_file.stem.split("_")[1])
+                                existing_epochs.append(epoch_num)
+                            except:
+                                pass
+                        if existing_epochs:
+                            max_epoch = max(existing_epochs)
+                            print(f"⚠ 检测到已有部分结果（最高到 epoch {max_epoch}），将重新训练并覆盖")
+                        else:
+                            print(f"→ 实验目录存在但无结果文件，开始训练...")
                     else:
-                        print(f"→ 实验目录存在但无结果文件，开始训练...")
-                else:
-                    print(f"→ 实验不存在，开始新训练...")
-                print("=" * 80)
+                        print(f"→ 实验不存在，开始新训练...")
+                    print("=" * 80)
 
-                # 更新全局超参数
-                batch_size = bs
-                max_lr = lr
-                weight_decay = wd
+                    # 更新全局超参数
+                    batch_size = bs
+                    max_lr = lr
+                    weight_decay = wd
 
-                # 运行一次完整实验（会自动创建带超参信息的输出文件夹，如果已存在会覆盖）
-                main()
+                    # 运行一次完整实验（会自动创建带超参信息的输出文件夹，如果已存在会覆盖）
+                    main()
 
