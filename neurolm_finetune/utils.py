@@ -75,6 +75,122 @@ def prepare_STRESS_dataset(root, chan_size, is_instruct=False, eeg_max_len=-1, t
     return train_dataset, test_dataset, val_dataset
 
 
+def _gather_stress_files_by_subject(root, expected_channels=None, valid_labels=None):
+    """把 root 下 train/val/test 里所有 .pickle 汇总（忽略原始划分），过滤后按 subject 分组。
+    返回 {subject_id: [abs_path, ...]}（每组已按 basename 排序）。
+
+    这样 leave-one-subject-out 的划分完全由 subject 决定，与原始 train/val/test 无关。
+    与 _gather_motor_files_by_subject 同构，只是 pickle 的键是 'X'/'y'（stress_preprocess.ipynb
+    生成），不是 motor 用的 'signal'/'label'。
+    """
+    subdirs = [d for d in ["train", "val", "test"] if os.path.isdir(os.path.join(root, d))]
+    if not subdirs:
+        subdirs = ["."]
+
+    seen_basenames = set()
+    subj_to_paths = defaultdict(list)
+    total = 0
+    kept = 0
+    skipped = 0
+    label_skipped = 0
+    for d in subdirs:
+        folder = os.path.join(root, d)
+        for f in sorted(os.listdir(folder)):
+            if not f.endswith(".pickle"):
+                continue
+            total += 1
+            if f in seen_basenames:  # 去重（同名文件只保留一次）
+                continue
+            file_path = os.path.join(folder, f)
+            try:
+                sample = pickle.load(open(file_path, "rb"))
+                if "X" not in sample or "y" not in sample:
+                    skipped += 1
+                    continue
+                if expected_channels is not None and sample["X"].shape[0] != expected_channels:
+                    skipped += 1
+                    continue
+                if valid_labels is not None:
+                    try:
+                        lbl_int = int(sample["y"])
+                    except (TypeError, ValueError):
+                        lbl_int = None
+                    if lbl_int not in valid_labels:
+                        label_skipped += 1
+                        continue
+            except Exception:
+                skipped += 1
+                continue
+            subj = _parse_subject_id(f)
+            if subj < 0:
+                skipped += 1
+                continue
+            seen_basenames.add(f)
+            subj_to_paths[subj].append(os.path.abspath(file_path))
+            kept += 1
+
+    for subj in subj_to_paths:
+        subj_to_paths[subj] = sorted(subj_to_paths[subj], key=lambda p: os.path.basename(p))
+
+    print(f"Stress LOSO - scanned {total} files across {subdirs}: kept {kept}, "
+          f"skipped {skipped} (bad channel/missing), label_skipped {label_skipped}, "
+          f"subjects found: {sorted(subj_to_paths.keys())}")
+    return subj_to_paths
+
+
+def prepare_STRESS_dataset_loso(root, fold, chan_size, is_instruct=False, eeg_max_len=-1, text_max_len=-1,
+                                 n_folds=None, num_classes=2):
+    """Leave-one-subject-out 划分（第 fold 折），与 prepare_motor_dataset_loso 同构。
+
+    N = 被试数（stress 目前是 17 个，subject_edf_mapping.csv 里没有 Patient_ID=15）。
+    test = subjects[fold]，val = subjects[(fold+1) % N]，train = 其余被试。
+    只保留 label 在 [0, num_classes) 内的样本（Stress 为二分类：0=normal, 1=increase）。
+    返回 (train_dataset, test_dataset, val_dataset, meta)。
+    """
+    valid_labels = set(range(num_classes))
+    subj_to_paths = _gather_stress_files_by_subject(root, expected_channels=chan_size, valid_labels=valid_labels)
+    subjects = sorted(subj_to_paths.keys())
+    N = len(subjects)
+    if N < 3:
+        raise ValueError(f"LOSO 需要至少 3 个被试，实际只有 {N} 个: {subjects}")
+
+    total_folds = N if n_folds is None else min(int(n_folds), N)
+    if not (0 <= fold < total_folds):
+        raise ValueError(f"fold={fold} 超出范围 [0, {total_folds})")
+
+    test_subject = subjects[fold]
+    val_subject = subjects[(fold + 1) % N]
+    train_subjects = [s for s in subjects if s != test_subject and s != val_subject]
+
+    train_files, val_files, test_files = [], [], []
+    for s in train_subjects:
+        train_files.extend(subj_to_paths[s])
+    val_files.extend(subj_to_paths[val_subject])
+    test_files.extend(subj_to_paths[test_subject])
+
+    print(f"Stress LOSO fold {fold}/{total_folds} | N={N} | "
+          f"test=S{test_subject} ({len(test_files)}), val=S{val_subject} ({len(val_files)}), "
+          f"train={train_subjects} ({len(train_files)})")
+
+    # root=None -> files 视为绝对路径（见 CustomStressLoader._resolve_path）
+    train_dataset = CustomStressLoader(None, train_files, chan_size=chan_size, is_instruct=is_instruct,
+                                        eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+    test_dataset = CustomStressLoader(None, test_files, chan_size=chan_size, is_instruct=is_instruct, is_val=True,
+                                       eeg_max_len=eeg_max_len, text_max_len=text_max_len, return_sample_id=True)
+    val_dataset = CustomStressLoader(None, val_files, chan_size=chan_size, is_instruct=is_instruct, is_val=True,
+                                      eeg_max_len=eeg_max_len, text_max_len=text_max_len, return_sample_id=True)
+
+    meta = {
+        'test_subject': int(test_subject),
+        'val_subject': int(val_subject),
+        'train_subjects': [int(s) for s in train_subjects],
+        'n_folds': int(total_folds),
+        'num_subjects': int(N),
+        'subjects': [int(s) for s in subjects],
+    }
+    return train_dataset, test_dataset, val_dataset, meta
+
+
 def prepare_SEED7_dataset(root, chan_size, is_instruct=False, eeg_max_len=-1, text_max_len=-1):
     # SEED7 data structure: seed_data/train/subject_X/, seed_data/val/subject_X/, seed_data/test/subject_X/
     # Each subject folder contains pickle files

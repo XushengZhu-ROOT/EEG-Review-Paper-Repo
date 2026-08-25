@@ -171,7 +171,15 @@ class KaggleERNLoader(Dataset):
 class CustomStressLoader(Dataset):
     # increase: 1
     # normal: 0
-    def __init__(self, root, files, chan_size, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False):
+    #
+    # root 可以是一个目录（files 为相对文件名），也可以为 None（files 为绝对路径，
+    # 用于 leave-one-subject-out：同一 split 的文件可能来自 train/val/test 多个物理目录）
+    # —— 与 MotorLoader 的约定一致，见 _resolve_path。
+    def __init__(self, root, files, chan_size, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False,
+                 # 是否额外返回 (sample_id, subject_id)（仅 is_val=True 时生效）。默认 False，
+                 # 保持旧调用点（prepare_STRESS_dataset 的 random_epoch 划分）字节不变；
+                 # 只有 prepare_STRESS_dataset_loso 会传 True。
+                 return_sample_id=False):
         self.root = root
         self.files = files
         self.chan_size = chan_size
@@ -181,6 +189,12 @@ class CustomStressLoader(Dataset):
         self.is_val = is_val
         self.eeg_max_len = eeg_max_len
         self.text_max_len = text_max_len
+        self.return_sample_id = return_sample_id
+
+        if self.return_sample_id:
+            # 稳定的 sample_id / subject_id（构造时确定，随 __getitem__ 返回，不受 shuffle 影响）
+            # Stress 数据集无 session，故 sample_id 形如 S{subject:02d}_ep{index:05d}
+            self.sample_ids, self.subject_ids = _build_stable_sample_ids(files, session_of=None)
 
         subset_channels_11 = ['FP1','FP2','F3','FZ','F4','FC3','FCZ','FC4','C3','CZ','C4'] # 11 channels
         subset_channels_20 =['FP1','F7','F3','F8','FZ','FC4', 'FT8', 'T3', 'C3', 'CZ', 'T4', 'TP7', 'CP3', 'CPZ', 'CP4','T5', 'P3', 'PZ', 'P4', 'T6'] # 20 channels
@@ -209,8 +223,14 @@ class CustomStressLoader(Dataset):
     def __len__(self):
         return len(self.files)
 
+    def _resolve_path(self, index):
+        f = self.files[index]
+        if self.root is None or os.path.isabs(f):
+            return f
+        return os.path.join(self.root, f)
+
     def __getitem__(self, index):
-        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        sample = pickle.load(open(self._resolve_path(index), "rb"))
         X = sample["X"]
         Y = sample["y"]
 
@@ -232,7 +252,7 @@ class CustomStressLoader(Dataset):
             for i in range(time):
                 gpt_mask[:, i * num_chans:(i + 1) * num_chans,  i * num_chans:(i + 1) * num_chans] = 1
             return data, Y, input_chans, input_time, gpt_mask.bool()
-        
+
         if self.is_val:
             text = self.prompt
         else:
@@ -267,15 +287,19 @@ class CustomStressLoader(Dataset):
         for i in range(time):
             gpt_mask[:, i * num_chans:(i + 1) * num_chans,  i * num_chans:(i + 1) * num_chans] = 1
         gpt_mask[:, :, valid_eeg_len:X_eeg.size(0)] = 0
-        
+
         if self.is_val:
+            if self.return_sample_id:
+                # LOSO 评估：额外返回稳定的 sample_id 与 subject_id，供事后计算所有下游指标
+                return (X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool(),
+                        self.sample_ids[index], self.subject_ids[index])
             return X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
-        
+
         Y_text = torch.full_like(text, fill_value=-1)
         prompt_len = self.prompt.size(0)
         Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
         return X_eeg, text, Y_text, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
-    
+
 
 
 

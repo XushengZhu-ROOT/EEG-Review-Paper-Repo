@@ -22,7 +22,7 @@ from model.model import GPTConfig
 from pathlib import Path
 import tiktoken
 from utils import prepare_KaggleERN_dataset, prepare_STRESS_dataset, prepare_SEED7_dataset, prepare_motor_dataset, prepare_sleep_dataset, cosine_scheduler, get_metrics
-from utils import prepare_motor_dataset_loso
+from utils import prepare_motor_dataset_loso, prepare_STRESS_dataset_loso
 from torch.utils.data.dataset import ConcatDataset
 
 
@@ -169,11 +169,19 @@ def get_instruct_datasets(args, downstream_dataset: str, eeg_max_len=-1, text_ma
             dataset_info['result_idx'] = 9
             dataset_info['label_dic'] = {'Yes': 1, 'No': 0}
         elif downstream_dataset == 'Stress':
-            dataset_train, dataset_test, dataset_val = prepare_STRESS_dataset(Path(args.dataset_dir), chan_size=args.chan_size, is_instruct=True, 
-                                                                            eeg_max_len=eeg_max_len, text_max_len=text_max_len)
+            if fold is not None:
+                # leave-one-subject-out: 忽略原始 train/val/test 划分，按被试重新分折
+                dataset_train, dataset_test, dataset_val, loso_meta = prepare_STRESS_dataset_loso(
+                    Path(args.dataset_dir), fold=fold, chan_size=args.chan_size, is_instruct=True,
+                    eeg_max_len=eeg_max_len, text_max_len=text_max_len, n_folds=args.n_folds)
+                dataset_info['loso_meta'] = loso_meta
+            else:
+                dataset_train, dataset_test, dataset_val = prepare_STRESS_dataset(Path(args.dataset_dir), chan_size=args.chan_size, is_instruct=True,
+                                                                                eeg_max_len=eeg_max_len, text_max_len=text_max_len)
 
             dataset_info['metrics'] = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
             dataset_info['is_binary'] = True
+            dataset_info['num_classes'] = 2
             dataset_info['result_idx'] = 9
             dataset_info['label_dic'] = {'Yes': 1, 'No': 0}
         elif downstream_dataset == 'SEED7':
