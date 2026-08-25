@@ -227,8 +227,26 @@ def save_loso_fold_results(config: Dict, trainer: Trainer, test_dataset, test_pr
             f"(predictions={len(preds_logits)}, labels={len(y_true_raw)}, expected {n} from test_dataset)"
         )
 
-    y_prob_all = torch.nn.functional.softmax(torch.from_numpy(preds_logits).float(), dim=-1).numpy()
-    y_pred_all = preds_logits.argmax(axis=-1)
+    # encoder/base.py's EEGModuleMixin.__init__ collapses n_outputs<=2 to a single
+    # logit ("Use BCEWithLogitLoss for Binary calssification") whenever
+    # --ft-only-encoder=True (as this LOSO launcher always uses) -- so a binary task
+    # like Stress (--num-decoding-classes=2) actually gets a (N,1)-shaped single-logit
+    # sigmoid output here, not (N,2) softmax logits. Blindly doing softmax(dim=-1) on a
+    # (N,1) array is a no-op (always 1.0) and argmax(axis=-1) is always 0 regardless of
+    # the true label -- detect this the same way make_decoding_accuracy_metrics() in
+    # trainer/make.py already does (shape[-1]==1), and branch to sigmoid+threshold,
+    # matching the (N,2) [P(class0), P(class1)] npz schema every sibling model
+    # (cbramod/labram/neurolm's single-logit heads) already uses so
+    # compute_metrics_from_npz.py's y_prob.argmax(axis=1)==y_pred check still holds.
+    is_binary_logit_output = preds_logits.shape[-1] == 1 or preds_logits.ndim == 1
+    if is_binary_logit_output:
+        logits_1d = preds_logits.reshape(-1).astype(np.float32)
+        prob_pos = torch.sigmoid(torch.from_numpy(logits_1d)).numpy()
+        y_pred_all = (logits_1d > 0).astype(np.int64)
+        y_prob_all = np.stack([1.0 - prob_pos, prob_pos], axis=-1)
+    else:
+        y_prob_all = torch.nn.functional.softmax(torch.from_numpy(preds_logits).float(), dim=-1).numpy()
+        y_pred_all = preds_logits.argmax(axis=-1)
 
     sample_ids_arr = np.array(sample_ids)
     order = np.argsort(sample_ids_arr)

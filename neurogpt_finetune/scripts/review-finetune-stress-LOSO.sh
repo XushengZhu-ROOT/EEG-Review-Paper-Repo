@@ -19,17 +19,20 @@
 #   are written under fold_results_dir so every downstream metric can be
 #   recomputed later without retraining.
 #
-# Stress's decoding head outputs 2 logits (num-decoding-classes=2, softmax +
-# CrossEntropyLoss via decoder/gpt.py's add_decoding_head -- same shape as
-# eegpt's Stress head, NOT the single-logit+sigmoid shape used by
-# cbramod/labram/neurolm), so val/test balanced_accuracy is well-defined even
-# for a single-class val/test subject (11/17 stress subjects only ever
-# recorded one condition -- see stress_data/subject_edf_mapping.csv). The
-# existing make_decoding_accuracy_metrics() in src/trainer/make.py already
-# guards roc_auc (try/except -> NaN on single-class truths) for the binary
-# branch, so no metrics-code change was needed for this -- same handling as
-# cbramod's finetune_evaluator.py NaN-guard for roc_auc/pr_auc on single-class
-# folds.
+# Stress's decoding head is a SINGLE logit (encoder/base.py's EEGModuleMixin
+# collapses n_outputs<=2 -> 1 "Use BCEWithLogitLoss for Binary calssification"
+# whenever --ft-only-encoder=True, which this launcher always uses) -- same
+# single-logit+sigmoid convention as cbramod/labram/neurolm's Stress heads,
+# NOT eegpt's genuine 2-class softmax head. val/test balanced_accuracy is
+# still well-defined even for a single-class val/test subject (11/17 stress
+# subjects only ever recorded one condition -- see
+# stress_data/subject_edf_mapping.csv). make_decoding_accuracy_metrics() in
+# src/trainer/make.py already auto-detects this single-logit shape and
+# guards roc_auc (try/except -> NaN on single-class truths); save_loso_fold_results()
+# in src/train_gpt.py was fixed to do the same shape-detection + sigmoid/threshold
+# branch (it originally assumed multi-column softmax logits unconditionally,
+# which silently produced all-zero y_pred/degenerate y_prob for single-logit
+# output -- caught by an actual GPU smoke test, not by inspection).
 #
 # Classification head: --cls_head_layer=1ly (NOT 3ly) -- Stress uses a single
 # Linear layer on top of the pooled encoder output (EEGConformer's built-in

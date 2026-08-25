@@ -494,8 +494,15 @@ class _FullyConnected_1ly(nn.Module):
         super().__init__()
         self.fc = nn.Identity()
 
-    def forward(self, x):
-        x = x.contiguous().view(x.size(0) // 2, -1)
+    def forward(self, x, batch_size=None, num_chunks=None):
+        # EEGConformer.forward() always calls self.fc(x, batch_size=batch, num_chunks=chunks)
+        # (added for _FullyConnected_3ly's multi-chunk-count support); mirror that reshape
+        # here instead of the old hardcoded "// 2" (which only happened to be correct because
+        # every prior 1ly caller used num_chunks=2).
+        if batch_size is not None and num_chunks is not None:
+            x = x.contiguous().view(batch_size, num_chunks * x.size(-1))
+        else:
+            x = x.contiguous().view(x.size(0) // 2, -1)
         out = self.fc(x)
         return out
 
