@@ -288,9 +288,9 @@ def get_models(args):
 
 
 def get_dataset(args):
-    if getattr(args, 'split_mode', 'random_epoch') == 'subject_independent' and args.dataset != 'Motor':
+    if getattr(args, 'split_mode', 'random_epoch') == 'subject_independent' and args.dataset not in ('Motor', 'Stress'):
         raise ValueError(
-            f"--split_mode subject_independent is only supported for --dataset Motor, got {args.dataset!r}"
+            f"--split_mode subject_independent is only supported for --dataset Motor/Stress, got {args.dataset!r}"
         )
     if args.dataset == 'KaggleERN':
         train_dataset, test_dataset, val_dataset = utils.prepare_KaggleERN_dataset(args.dataset_path)
@@ -338,7 +338,14 @@ def get_dataset(args):
         metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
     
     elif args.dataset == 'Stress':
-        train_dataset, test_dataset, val_dataset = utils.prepare_TUAB_dataset(args.dataset_path)
+        split_mode = getattr(args, 'split_mode', 'random_epoch')
+        if split_mode == 'subject_independent':
+            if not args.test_subject or not args.val_subject:
+                raise ValueError("--split_mode subject_independent requires --test_subject and --val_subject")
+            train_dataset, test_dataset, val_dataset = utils.prepare_Stress_dataset_subject_independent(
+                args.dataset_path, args.test_subject, args.val_subject)
+        else:
+            train_dataset, test_dataset, val_dataset = utils.prepare_TUAB_dataset(args.dataset_path)
         ch_names = []
         if args.channel_size == 30:
             ch_names = ['FP1', 'FP2', 'F7', 'F3', 'FZ', 'F4', 'F8', 'FT7', 'FC3', 'FCZ', 'FC4', 'FT8', 'T3', 'C3', 'CZ', 'C4', 'T4', 'TP7', 'CP3', 'CPZ', 'CP4', 'TP8', 'T5', 'P3', 'PZ', 'P4', 'T6', 'O1', 'OZ', 'O2']
@@ -360,7 +367,11 @@ def save_loso_fold_results(args, model_without_ddp, device, dataset_test, ch_nam
                             best_epoch, train_time_sec, n_parameters):
     """[LOSO] 用调用方已经载入 model_without_ddp 的最佳验证 epoch 权重，对 test 集重新做一次
     干净的推理（带 sample_id），保存：
-      {task}_{model}_fold{i:02d}.npz  -- sample_id / y_true / y_pred / y_prob(softmax) / subject_id
+      {task}_{model}_fold{i:02d}.npz  -- sample_id / y_true / y_pred / y_prob / subject_id
+                                          （y_prob 恒为 (N,2)：Motor 是 softmax 输出，
+                                          Stress 是 [1-sigmoid, sigmoid]，与 cbramod/neurolm
+                                          Stress LOSO 的 npz schema 一致，供 aggregate 脚本用
+                                          y_prob[:,1] 算 roc_auc/pr_auc）
       {task}_{model}_fold{i:02d}.json -- fold / test_subject / val_subject / balanced_accuracy /
                                           best_epoch / hyperparams / train_time_sec /
                                           peak_gpu_mem_mb / gpu_name
@@ -371,8 +382,12 @@ def save_loso_fold_results(args, model_without_ddp, device, dataset_test, ch_nam
     input_chans = utils.get_input_chans(ch_names) if ch_names is not None else None
 
     # 复用当前 fold 的 test 文件列表（dataset_test.root / .files），重新构造一个
-    # return_sample_id=True 的 MotorLoader，与训练/评估时用的是同一批底层 pickle 文件。
-    sid_dataset = utils.MotorLoader(
+    # return_sample_id=True 的 Loader，与训练/评估时用的是同一批底层 pickle 文件。
+    # Motor 是 6 分类（MotorLoader，softmax+argmax），Stress 是二分类（StressLoader，
+    # 模型输出单个 logit，sigmoid+0.5 阈值），两者的推理分支不同，其余保存/校验逻辑共用。
+    is_binary = args.dataset == 'Stress'
+    loader_cls = utils.StressLoader if is_binary else utils.MotorLoader
+    sid_dataset = loader_cls(
         dataset_test.root, dataset_test.files,
         sampling_rate=dataset_test.sampling_rate,
         data_key=dataset_test.data_key, label_key=dataset_test.label_key,
@@ -384,6 +399,9 @@ def save_loso_fold_results(args, model_without_ddp, device, dataset_test, ch_nam
         num_workers=0, collate_fn=utils.skip_failed_collate,
     )
 
+    # T 按已知任务时长动态算出 patch 数 A = T // 200（与 engine_for_finetuning.py 的
+    # evaluate() 用同一份白名单，覆盖 Motor T=200 / Stress T=1000 等）。
+    _VALID_T = {200, 600, 800, 1000, 6000}
     subj_re = re.compile(r'^S(\d+)_')
     sample_ids, y_true, y_pred, y_prob, subject_ids = [], [], [], [], []
     with torch.no_grad():
@@ -395,13 +413,18 @@ def save_loso_fold_results(args, model_without_ddp, device, dataset_test, ch_nam
             if len(X.shape) != 3:
                 raise ValueError(f"save_loso_fold_results: unexpected input shape {X.shape}")
             B, N, T = X.shape
-            if T != 200:
-                raise ValueError(f"save_loso_fold_results: expected T=200 for Motor, got {T}")
-            X = X.view(B, N, 1, 200)
+            if T not in _VALID_T:
+                raise ValueError(f"save_loso_fold_results: unexpected time dimension T={T}")
+            X = X.view(B, N, T // 200, 200)
 
             output = model_without_ddp(X, input_chans=input_chans)
-            probs = torch.softmax(output, dim=-1).cpu()
-            preds = torch.argmax(output, dim=-1).cpu()
+            if is_binary:
+                pos_prob = torch.sigmoid(output).cpu().view(-1)
+                probs = torch.stack([1.0 - pos_prob, pos_prob], dim=1)
+                preds = (pos_prob > 0.5).long()
+            else:
+                probs = torch.softmax(output, dim=-1).cpu()
+                preds = torch.argmax(output, dim=-1).cpu()
             for i, sid in enumerate(batch_sample_ids):
                 m = subj_re.match(sid)
                 if not m:

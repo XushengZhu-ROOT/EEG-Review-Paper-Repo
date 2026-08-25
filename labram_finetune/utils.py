@@ -811,6 +811,105 @@ class TUABLoader(torch.utils.data.Dataset):
         X = torch.FloatTensor(X)
         return X, Y
     
+# ===== [LOSO] Stress 任务的 sample_id / subject_id 提取，与
+# cbramod_finetune/datasets/custom_stress_dataset.py 的 compute_stress_sample_id /
+# extract_subject_id_from_name 使用同一套正则和输出格式，保证同一批底层 pickle 文件
+# （preprocessing/stress_preprocess.ipynb 生成的 Sub04_increase_edf27_chunk0012.pickle）
+# 在各模型间算出来的 sample_id 完全一致。 =====
+_STRESS_SAMPLE_ID_RE = re.compile(r'^Sub(\d+)_(increase|normal)_edf(\d+)_chunk(\d+)$')
+_STRESS_SUBJECT_RE = re.compile(r'(Sub\d+)_')
+
+
+def compute_stress_sample_id(chunk_id):
+    """'Sub04_increase_edf27_chunk0012' -> 'S04_edf27_chunk0012'。"""
+    m = _STRESS_SAMPLE_ID_RE.match(chunk_id)
+    if not m:
+        raise ValueError(f"Cannot parse chunk_id for sample_id: {chunk_id!r}")
+    subject_num = int(m.group(1))
+    edf_num = int(m.group(3))
+    local_idx = int(m.group(4))
+    return f"S{subject_num:02d}_edf{edf_num}_chunk{local_idx:04d}"
+
+
+def extract_stress_subject_id(name):
+    """'Sub04_increase_edf27_chunk0012.pickle'（或包含它的任意路径）-> 'Sub04'。"""
+    m = _STRESS_SUBJECT_RE.search(os.path.basename(name))
+    return m.group(1) if m else None
+
+
+def list_stress_files_by_subject(root):
+    """[LOSO] 扫描 root/{train,val,test}/*.pickle，按受试者分组（'Sub04' -> [path, ...]），
+    用于构造受试者独立（LOSO）划分。"""
+    subject_to_files = defaultdict(list)
+    for split in ("train", "val", "test"):
+        split_dir = os.path.join(root, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for fname in os.listdir(split_dir):
+            if not fname.endswith(".pickle"):
+                continue
+            sid = extract_stress_subject_id(fname)
+            if sid is None:
+                continue
+            subject_to_files[sid].append(os.path.join(split_dir, fname))
+    return subject_to_files
+
+
+class StressLoader(torch.utils.data.Dataset):
+    def __init__(self, root, files, sampling_rate=200, data_key='X', label_key='y', expected_channels=30,
+                 return_sample_id=False):
+        self.root = root
+        self.files = files
+        self.default_rate = 200
+        self.sampling_rate = sampling_rate
+        self.data_key = data_key
+        self.label_key = label_key
+        self.expected_channels = expected_channels
+        self.return_sample_id = return_sample_id
+
+        # [LOSO] sample_id 在数据集构造（列文件）时一次性确定，与 self.files 一一对应；
+        # 不受 shuffle / batch_size / num_workers 影响。解析失败直接报错退出（不静默跳过）。
+        if self.return_sample_id:
+            self.sample_ids = [
+                compute_stress_sample_id(os.path.splitext(os.path.basename(f))[0]) for f in self.files
+            ]
+            if len(set(self.sample_ids)) != len(self.sample_ids):
+                raise ValueError(
+                    "Duplicate sample_id detected in StressLoader; check for duplicate/conflicting chunk files."
+                )
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample_path = os.path.join(self.root, self.files[index])
+        sample = pickle.load(open(sample_path, "rb"))
+
+        X = sample[self.data_key]
+        Y = sample[self.label_key]
+
+        if X.shape[0] != self.expected_channels:
+            return None
+
+        if isinstance(Y, (list, np.ndarray)) and len(Y) > 0:
+            Y = int(Y[0])
+        elif isinstance(Y, (list, np.ndarray)) and len(Y) == 0:
+            raise ValueError(f"Empty label in {sample_path}")
+        else:
+            Y = int(Y)
+
+        # increase=1 / normal=0
+        if Y not in (0, 1):
+            raise ValueError(f"Invalid label {Y} in {sample_path}, expected 0 or 1")
+
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, 10 * self.sampling_rate, axis=-1)
+
+        if self.return_sample_id:
+            return torch.FloatTensor(X), Y, self.sample_ids[index]
+        return torch.FloatTensor(X), Y
+
+
 class KaggleERNLoader(torch.utils.data.Dataset):
     def __init__(self, root, files, sampling_rate=200, data_key='X', label_key='y'):
         self.root = root
@@ -1209,6 +1308,56 @@ def prepare_Motor_dataset_subject_independent(root, test_subject, val_subject, d
     return train_dataset, test_dataset, val_dataset
 
 
+def prepare_Stress_dataset_subject_independent(root, test_subject, val_subject, data_key='X', label_key='y'):
+    """[LOSO] 17折 subject-independent 划分：test = test_subject, val = val_subject,
+    train = 其余全部受试者。与 cbramod_finetune/neurolm_finetune 的 Stress LOSO 划分
+    使用同一批底层 preprocessing/stress_preprocess.ipynb 生成的 pickle 文件、
+    同一套受试者提取规则，保证同一折在不同模型间的 train/val/test 受试者集合完全一致。
+    """
+    subject_to_files = list_stress_files_by_subject(root)
+    subjects = sorted(subject_to_files.keys(), key=lambda s: int(s[3:]))
+    if len(subjects) < 3:
+        raise ValueError(f"Need at least 3 subjects for subject-independent split, got {len(subjects)}: {subjects}")
+    for s in (test_subject, val_subject):
+        if s not in subject_to_files:
+            raise ValueError(f"Subject {s!r} not found among {subjects}")
+    if test_subject == val_subject:
+        raise ValueError("test_subject and val_subject must be different")
+
+    train_subjects = [s for s in subjects if s not in (test_subject, val_subject)]
+    val_subjects = [val_subject]
+    test_subjects = [test_subject]
+
+    def gather(subj_list):
+        files = []
+        for s in subj_list:
+            files.extend(subject_to_files[s])
+        return files
+
+    train_files = gather(train_subjects)
+    val_files = gather(val_subjects)
+    test_files = gather(test_subjects)
+
+    seed = 12345
+    np.random.seed(seed)
+    np.random.shuffle(train_files)
+
+    print("=" * 70)
+    print(f"[split_mode=subject_independent] test={test_subject} val={val_subject} "
+          f"train={len(train_subjects)} subjects")
+    print(f"  All subjects ({len(subjects)}): {subjects}")
+    print(f"  file counts: train={len(train_files)} val={len(val_files)} test={len(test_files)}")
+    print("=" * 70)
+
+    # files 已经是相对 cwd 的完整路径（list_stress_files_by_subject 已经拼过 split 目录），
+    # 所以这里 root 传空字符串，os.path.join("", full_path) 等价于 full_path 本身。
+    train_dataset = StressLoader("", train_files, data_key=data_key, label_key=label_key)
+    test_dataset = StressLoader("", test_files, data_key=data_key, label_key=label_key)
+    val_dataset = StressLoader("", val_files, data_key=data_key, label_key=label_key)
+    print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    return train_dataset, test_dataset, val_dataset
+
+
 def _collect_pickle_files(root_dir):
     """
     递归收集目录下所有.pkl和.pickle文件
@@ -1273,20 +1422,27 @@ def prepare_Sleep_dataset(root, data_key='signal', label_key='label'):
 
 def get_metrics(output, target, metrics, is_binary, threshold=0.5):
     if is_binary:
-        if 'roc_auc' not in metrics or sum(target) * (len(target) - sum(target)) != 0:  # to prevent all 0 or all 1 and raise the AUROC error
-            results = binary_metrics_fn(
-                target,
-                output,
-                metrics=metrics,
-                threshold=threshold,
-            )
-        else:
-            results = {
-                "accuracy": 0.0,
-                "balanced_accuracy": 0.0,
-                "pr_auc": 0.0,
-                "roc_auc": 0.0,
-            }
+        # [LOSO] Stress 某一折的 val/test 受试者可能只有单一类别（17 个受试者里有 11 个
+        # 只做过 increase 或只做过 normal），此时 roc_auc/pr_auc 在数学上未定义
+        # （sklearn 会直接 raise ValueError），但 accuracy/balanced_accuracy 不受影响、
+        # 完全可以正常算。旧代码在这种情况下把四个指标全部硬编码成 0.0（不是没算出
+        # 来，是压根没调用 sklearn），导致 loso_mode 用 val balanced_accuracy 选
+        # best epoch 时，只要某折的 val 受试者是单类别，每个 epoch 都会读到硬编码的
+        # 0.0，best_epoch 就会永远停在第 1 个满足 0.0 > -1.0 的 epoch，跟模型实际
+        # 训练效果毫无关系。这里改成只对不可定义的 roc_auc/pr_auc 返回 NaN，
+        # accuracy/balanced_accuracy 照常计算 -- 跟 cbramod_finetune/finetune_evaluator.py
+        # 的 get_metrics_for_binaryclass 是同一套处理方式。
+        degenerate = sum(target) * (len(target) - sum(target)) == 0
+        undefined_metrics = {'roc_auc', 'pr_auc'} if degenerate else set()
+        results = binary_metrics_fn(
+            target,
+            output,
+            metrics=[m for m in metrics if m not in undefined_metrics],
+            threshold=threshold,
+        )
+        for m in undefined_metrics:
+            if m in metrics:
+                results[m] = float('nan')
     else:
         results = multiclass_metrics_fn(
             target, output, metrics=metrics
