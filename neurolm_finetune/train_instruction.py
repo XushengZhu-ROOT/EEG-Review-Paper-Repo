@@ -530,6 +530,12 @@ def main(args):
     best_epoch = -1
     best_test_payload = None
     train_time_sec = 0.0
+
+    # ===== [新增] 非LOSO任务（KaggleERN/Stress等）的 best-val-bacc checkpoint 追踪。
+    # 默认 args.save_ckpt=False 时只做比较、不 clone 权重、不落盘，不影响现有行为。=====
+    ckpt_best_val_bacc = -1.0
+    ckpt_best_epoch = -1
+    ckpt_best_model_state = None
     if loso_enabled and device_type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -685,6 +691,17 @@ def main(args):
                     print(metric + ':', results_val[metric])
             _print_confusion_matrices(results_val, dataset_info, "Val")
             results_test = evaluate(raw_model, dataset_info, dataset_info['data_loader_test'], decode)
+
+            # ===== [新增] 追踪 val_bacc 最高的 epoch，供 --save_ckpt 落盘用（默认关闭，
+            # 不影响现有行为）。只看 all_datasets[0]，和上面 LOSO 分支的约定一致。=====
+            if dataset_info is all_datasets[0]:
+                val_bacc_this = results_val.get('balanced_accuracy')
+                if val_bacc_this is not None and val_bacc_this > ckpt_best_val_bacc:
+                    ckpt_best_val_bacc = val_bacc_this
+                    ckpt_best_epoch = epoch
+                    if args.save_ckpt and master_process:
+                        ckpt_best_model_state = {k: v.clone().cpu() for k, v in raw_model.state_dict().items()}
+
             print('=' * 10)
             print('Test:')
             for metric in results_test.keys():
@@ -769,6 +786,26 @@ def main(args):
                 if ddp:
                     destroy_process_group()
                 raise
+
+    # ===== [新增] 非LOSO任务的 checkpoint 落盘，默认关闭（--save_ckpt 不传则什么都不做，
+    # 和之前整段被注释掉时行为一致）。打开后落盘的是 val_bacc 最高那一轮的权重，
+    # 而不是训练循环走到哪就存到哪。=====
+    if args.save_ckpt and master_process and not loso_enabled:
+        if ckpt_best_model_state is not None:
+            os.makedirs(checkpoint_out_dir, exist_ok=True)
+            ckpt_save_path = os.path.join(
+                checkpoint_out_dir,
+                f'ckpt-best-epoch{ckpt_best_epoch}-valBacc{ckpt_best_val_bacc:.5f}.pt'
+            )
+            torch.save({
+                'model': ckpt_best_model_state,
+                'epoch': ckpt_best_epoch,
+                'val_balanced_accuracy': ckpt_best_val_bacc,
+                'model_args': model_args,
+            }, ckpt_save_path)
+            print(f"Saved best checkpoint (val_bacc={ckpt_best_val_bacc:.5f} at epoch {ckpt_best_epoch}) to {ckpt_save_path}")
+        else:
+            print("Warning: --save_ckpt was set but no best checkpoint was recorded; skipping save.")
 
     if ddp:
         destroy_process_group()
@@ -1518,6 +1555,9 @@ def get_args():
     parser.add_argument('--warmup_epochs', default=1, type=int)
     parser.add_argument('--warmup_ratio', type=float, default=0.1)
     parser.add_argument('--save_ckpt_freq', default=5, type=int)
+    parser.add_argument('--save_ckpt', default=False, action='store_true',
+                         help='Save the best-val-balanced-accuracy checkpoint for non-LOSO runs '
+                              '(e.g. KaggleERN/Stress). Off by default; LOSO runs are unaffected.')
     parser.add_argument('--block_size', default=1024, type=int)
 
     parser.add_argument('--learning_rate', type=float, default=5e-4, metavar='LR',

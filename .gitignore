@@ -218,6 +218,16 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .DS_Store
+
+# Motor-LOSO param-count scripts + per-run LOSO artifacts (results/confusion
+# matrices/param breakdowns) and p-value analysis scripts -- local scratch,
+# not synced to GitHub.
+count_motor_loso_params*.py
+loso_confusion_matrix*.npy
+loso_results*.csv
+motor_loso_param_breakdown.md
+/p_value/
+
 biot_finetune/log/
 biot_finetune/pretrained-models/
 biot_finetune/AllSubjects_Epochs/

@@ -643,6 +643,18 @@ def supervised(args):
         monitor="val_auroc", patience=5, verbose=False, mode="max"
     )
 
+    # [修复] 此前 callbacks=[] 意味着 enable_checkpointing=True 用的是 PL 默认的
+    # "最后一轮" checkpoint,下面 trainer.test(ckpt_path="best") 名不副实地一直在
+    # 用最后一轮而不是验证集 val_bacc 最好的一轮。这里补上 ModelCheckpoint(monitor="val_bacc"),
+    # 和 run_multiclass_supervised.py 里 Motion-LOSO 路径已经验证过的写法保持一致。
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_bacc",
+        mode="max",
+        save_top_k=1,
+        filename="best-{epoch:02d}-{val_bacc:.5f}",
+        auto_insert_metric_name=False,
+    )
+
     trainer = pl.Trainer(
         devices=[0],
         accelerator="gpu",
@@ -652,7 +664,7 @@ def supervised(args):
         enable_checkpointing=True,
         logger=logger,
         max_epochs=args.epochs,
-        callbacks=[],
+        callbacks=[checkpoint_callback],
         # callbacks=[early_stop_callback],
     )
 

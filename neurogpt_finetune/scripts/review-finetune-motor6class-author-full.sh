@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 dataset=motor6class
-dataset_path="../mydata_motor_data_20channels"
+dataset_path="../AllSubjects_Epochs"
 matrix_p_path="../tMatrix_22x20_motor.npy"
 gpu_id=0
 pos_weight=-1.0  # 6分类任务，不需要pos_weight

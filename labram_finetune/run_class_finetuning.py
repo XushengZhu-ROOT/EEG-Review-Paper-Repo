@@ -926,11 +926,12 @@ def main(args, ds_init):
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    max_accuracy = 0.0
-    max_accuracy_test = 0.0
+    max_val_bacc = 0.0
+    max_test_bacc = 0.0
 
     # ===== [LOSO] 按验证集 balanced_accuracy 选出的最佳 epoch（20折 subject_independent
-    # 用）。纯粹是额外的记账，不改变上面 max_accuracy 这条已有分支的行为/其他数据集的训练流程。=====
+    # 用）。上面 checkpoint-best.pth 的选择标准现在也已统一改为 val_bacc，
+    # 这里的记账逻辑因此变为冗余但仍然正确（两者选出的应是同一个 epoch），保留不动。=====
     loso_mode = getattr(args, 'split_mode', 'random_epoch') == 'subject_independent'
     best_val_bacc = -1.0
     best_epoch_loso = 0
@@ -987,13 +988,13 @@ def main(args, ds_init):
             test_stats = evaluate(data_loader_test, model, device, header='Test:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
             print(f"Accuracy of the network on the {len(dataset_test)} test EEG: {test_stats['accuracy']:.2f}%")
             
-            if max_accuracy < val_stats["accuracy"]:
-                max_accuracy = val_stats["accuracy"]
+            if max_val_bacc < val_stats["balanced_accuracy"]:
+                max_val_bacc = val_stats["balanced_accuracy"]
                 if args.output_dir and args.save_ckpt:
                     utils.save_model(
                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                         loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
-                max_accuracy_test = test_stats["accuracy"]
+                max_test_bacc = test_stats["balanced_accuracy"]
 
             # ===== [LOSO] 按验证集 balanced_accuracy 记录最佳 epoch 的模型权重（内存中），
             # 用于训练结束后重新对 test 集做一次干净的推理，事后保存 npz/json。=====
@@ -1004,7 +1005,7 @@ def main(args, ds_init):
                     best_epoch_loso = epoch + 1
                     best_model_state_loso = {k: v.clone().cpu() for k, v in model_without_ddp.state_dict().items()}
 
-            print(f'Max accuracy val: {max_accuracy:.2f}%, max accuracy test: {max_accuracy_test:.2f}%')
+            print(f'Max val bacc: {max_val_bacc:.2f}%, max test bacc: {max_test_bacc:.2f}%')
             if log_writer is not None:
                 for key, value in val_stats.items():
                     if key == 'accuracy':

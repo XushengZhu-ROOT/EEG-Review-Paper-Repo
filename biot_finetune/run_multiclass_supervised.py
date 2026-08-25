@@ -1333,8 +1333,7 @@ def prepare_BiotSleep_dataloader(args):
 
 class BestEpochTracker(pl.Callback):
     """[新增] 纯观察者：记录验证集 val_bacc 最好的那个 epoch（1-indexed），
-    不修改 LitModel_finetune 的任何训练/验证逻辑，只读 trainer.callback_metrics。
-    仅在 Motion + subject_independent 20折路径下挂载。"""
+    不修改 LitModel_finetune 的任何训练/验证逻辑，只读 trainer.callback_metrics。"""
 
     def __init__(self, monitor="val_bacc"):
         self.monitor = monitor
@@ -1686,26 +1685,22 @@ def supervised(args):
     #     monitor="val_f1_macro", patience=5, verbose=True, mode="max"
     # )
 
-    # [新增] 仅在 Motion + subject_independent 20折路径下挂载
-    # ModelCheckpoint(monitor="val_bacc")：此前 callbacks=[] 意味着
-    # enable_checkpointing=True 用的是 PL 默认的"最后一轮"checkpoint，
-    # 下面 trainer.test(ckpt_path="best") 名不副实地一直在用最后一轮而不是
-    # 验证集最好的一轮。这里修好这个选择逻辑，但只作用于这条新路径，
-    # 其他数据集 / Motion 的 random_epoch 路径都保持 callbacks=[] 不变。
-    checkpoint_callback = None
-    best_epoch_tracker = None
-    if is_motion_loso:
-        checkpoint_callback = ModelCheckpoint(
-            monitor="val_bacc",
-            mode="max",
-            save_top_k=1,
-            filename="best-{epoch:02d}-{val_bacc:.5f}",
-            auto_insert_metric_name=False,
-        )
-        best_epoch_tracker = BestEpochTracker(monitor="val_bacc")
-        callbacks = [checkpoint_callback, best_epoch_tracker]
-    else:
-        callbacks = []  # 移除早停回调
+    # [修复] 此前只在 Motion + subject_independent 20折路径下才挂载
+    # ModelCheckpoint(monitor="val_bacc")，其他数据集(含 Sleep/ISRUC)保持
+    # callbacks=[]，等于 enable_checkpointing=True 用的是 PL 默认的"最后一轮"
+    # checkpoint，下面 trainer.test(ckpt_path="best") 名不副实地一直在用最后
+    # 一轮而不是验证集 val_bacc 最好的一轮。val_bacc 在 LitModel_finetune 的
+    # validation_epoch_end 里对所有数据集都会记录，这里改为统一挂载，不再按
+    # 数据集区分。
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_bacc",
+        mode="max",
+        save_top_k=1,
+        filename="best-{epoch:02d}-{val_bacc:.5f}",
+        auto_insert_metric_name=False,
+    )
+    best_epoch_tracker = BestEpochTracker(monitor="val_bacc")
+    callbacks = [checkpoint_callback, best_epoch_tracker]
 
     trainer = pl.Trainer(
         # devices=[0],

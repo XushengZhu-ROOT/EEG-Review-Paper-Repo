@@ -4,6 +4,7 @@ import math
 import torch
 from torch import nn
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pathlib import Path
 import json
 from datetime import datetime
@@ -96,6 +97,9 @@ batch_size = 64
 max_epochs = 50
 max_lr = 4e-4
 weight_decay = 1e-2  # 权重衰减（用于 AdamW）
+
+# [新增] 是否额外保存 valid_balanced_accuracy 最高那一轮的 checkpoint；默认关闭，不影响现有行为
+save_ckpt = False
 
 # 模型微调方式（默认值）
 freeze_encoder = False      # True = 线性探测（只训头部），False = 全局微调
@@ -712,6 +716,16 @@ def main():
     # ==================== 训练器配置 ====================
     # 这里不再使用 LearningRateMonitor（它需要 logger），只用最简 callbacks
     callbacks = []
+    if save_ckpt:
+        # [新增] 默认关闭；打开后按 valid_balanced_accuracy 选模保存 checkpoint，
+        # 而不是 enable_checkpointing=False 时压根不存任何权重。
+        callbacks.append(ModelCheckpoint(
+            monitor="valid_balanced_accuracy",
+            mode="max",
+            save_top_k=1,
+            filename="best-{epoch:02d}-{valid_balanced_accuracy:.5f}",
+            auto_insert_metric_name=False,
+        ))
 
     # 计算 steps_per_epoch（用于 OneCycleLR）
     global steps_per_epoch
@@ -721,7 +735,7 @@ def main():
         accelerator=accelerator,
         max_epochs=max_epochs,
         callbacks=callbacks,
-        enable_checkpointing=False,  # 不保存checkpoint
+        enable_checkpointing=save_ckpt,  # 默认 False，和之前行为一致；True 时按 valid_balanced_accuracy 选模
         logger=False,                # 不使用默认logger，我们自己记录
         enable_progress_bar=True,    # 显示进度条
     )

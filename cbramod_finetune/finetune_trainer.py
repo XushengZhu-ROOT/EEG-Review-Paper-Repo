@@ -422,7 +422,7 @@ class Trainer(object):
                     'val_cm': val_cm.tolist(),
                     'test_acc': float(test_acc),
                     'test_bacc': float(test_bacc),
-                    'test_pr_auc': float(val_pr_auc),
+                    'test_pr_auc': float(test_pr_auc),
                     'test_roc_auc': float(test_roc_auc),
                     'test_cm': test_cm.tolist(),
                     'learning_rate': float(current_lr),
@@ -436,8 +436,8 @@ class Trainer(object):
                 print(f"  Test - acc: {test_acc:.5f}, bacc: {test_bacc:.5f}, pr_auc: {test_pr_auc:.5f}, roc_auc: {test_roc_auc:.5f}")
                 print(f"  LR: {current_lr:.5f}, Time: {epoch_time/60:.2f} mins")
 
-                if val_roc_auc > best_metrics['val_roc_auc']:
-                    print(">>> Val ROC AUC increasing... saving weights!")
+                if val_bacc > best_metrics['val_bacc']:
+                    print(">>> Val BACC increasing... saving weights!")
                     best_metrics.update({
                         'epoch': epoch + 1,
                         'val_acc': val_acc,
@@ -483,11 +483,14 @@ class Trainer(object):
             os.makedirs(self.params.model_dir)
         
         model_path = os.path.join(
-            self.params.model_dir, 
-            f"best_model_epoch{best_metrics['epoch']}_testAcc{test_acc:.5f}_testBacc{test_bacc:.5f}.pth"
+            self.params.model_dir,
+            f"best_model_epoch{best_metrics['epoch']}_testAcc{best_metrics['test_acc']:.5f}_testBacc{best_metrics['test_bacc']:.5f}.pth"
         )
-        torch.save(self.model.state_dict(), model_path)
-        print(f"Model saved to {model_path}")
+        if self.best_model_states is not None:
+            torch.save(self.best_model_states, model_path)
+            print(f"Model saved to {model_path}")
+        else:
+            print("Warning: no best model state was recorded (best_model_states is None); skipping checkpoint save.")
         
         self.save_training_logs(final_results)
 
