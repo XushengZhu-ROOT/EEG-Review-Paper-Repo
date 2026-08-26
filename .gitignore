@@ -10,6 +10,11 @@
 !cbramod_finetune/datasets/
 !neurolm_finetune/text_dataset_maker/
 
+# Repo-wide: any file or folder (at any depth, any project) with "smoke" in its
+# name is smoke-test scaffolding/scripts/data -- local validation only, never
+# synced to GitHub.
+**/*[Ss]moke*
+
 # Claude Code local project settings -- machine-local, not shared via GitHub
 .claude/
 
@@ -230,6 +235,7 @@ loso_confusion_matrix*.npy
 loso_results*.csv
 motor_loso_param_breakdown.md
 /p_value/
+/google.py
 
 biot_finetune/log/
 biot_finetune/pretrained-models/

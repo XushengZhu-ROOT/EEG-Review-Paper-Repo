@@ -35,6 +35,103 @@ class TUABLoader(torch.utils.data.Dataset):
         X = torch.FloatTensor(X)
         return X, Y
 
+
+# ===== Stress: cross-model-stable sample_id (ported verbatim from
+# labram_finetune/utils.py's compute_stress_sample_id / cbramod_finetune's
+# custom_stress_dataset.py compute_stress_sample_id -- same regex/format so
+# BIOT/ST produce identical sample_id strings to the other models for the
+# same underlying chunk files). chunk_id looks like
+# "Sub04_increase_edf27_chunk0012" (preprocessing/stress_preprocess.ipynb /
+# stress_data/_run_*_preprocess.py's save_chunks()). =====
+_STRESS_SAMPLE_ID_RE = re.compile(r'^Sub(\d+)_(increase|normal)_edf(\d+)_chunk(\d+)$')
+_STRESS_SUBJECT_RE = re.compile(r'(Sub\d+)_')
+
+
+def compute_stress_sample_id(chunk_id):
+    """'Sub04_increase_edf27_chunk0012' -> 'S04_edf27_chunk0012'."""
+    m = _STRESS_SAMPLE_ID_RE.match(chunk_id)
+    if not m:
+        raise ValueError(f"Cannot parse chunk_id for sample_id: {chunk_id!r}")
+    subject_num = int(m.group(1))
+    edf_num = int(m.group(3))
+    local_idx = int(m.group(4))
+    return f"S{subject_num:02d}_edf{edf_num}_chunk{local_idx:04d}"
+
+
+def extract_stress_subject_id(name):
+    """'Sub04_increase_edf27_chunk0012.pickle' (or any path containing it) -> 'Sub04'."""
+    m = _STRESS_SUBJECT_RE.search(os.path.basename(name))
+    return m.group(1) if m else None
+
+
+def list_stress_files_by_subject(root):
+    """Scan root/{train,val,test}/*.pickle and group full paths by subject
+    ('Sub04' -> [path, ...]), for building a subject-independent split."""
+    subject_to_files = defaultdict(list)
+    for split in ("train", "val", "test"):
+        split_dir = os.path.join(root, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for fname in os.listdir(split_dir):
+            if not fname.endswith(".pickle"):
+                continue
+            sid = extract_stress_subject_id(fname)
+            if sid is None:
+                continue
+            subject_to_files[sid].append(os.path.join(split_dir, fname))
+    return subject_to_files
+
+
+class StressLoader(torch.utils.data.Dataset):
+    """Stress loader shared by both BIOT (200Hz, no filter -- preprocess_stress_biot)
+    and STTransformer (250Hz, 4-40Hz band-pass -- preprocess_stress_sttransformer):
+    both pipelines already resample to their own target rate, and both feed the
+    model raw (channels, time) chunks (no reshape, unlike cbramod's own loader),
+    so a single class parameterized by default_rate covers both -- same shape as
+    TUABLoader but with subject/sample_id support for LOSO."""
+
+    def __init__(self, root, files, sampling_rate=200, default_rate=200, return_sample_id=False):
+        self.root = root
+        self.files = files
+        self.default_rate = default_rate
+        self.sampling_rate = sampling_rate
+        self.return_sample_id = return_sample_id
+
+        if self.return_sample_id:
+            self.sample_ids = [
+                compute_stress_sample_id(os.path.splitext(os.path.basename(f))[0])
+                for f in self.files
+            ]
+            if len(set(self.sample_ids)) != len(self.sample_ids):
+                raise ValueError(
+                    "Duplicate sample_id detected in StressLoader; check for "
+                    "duplicate/conflicting chunk files."
+                )
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["X"]
+
+        if self.sampling_rate != self.default_rate:
+            n_target = int(round(X.shape[-1] * self.sampling_rate / self.default_rate))
+            X = resample(X, n_target, axis=-1)
+
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+
+        X = torch.tensor(X, dtype=torch.float32)
+        Y = torch.tensor(int(sample["y"]), dtype=torch.long)
+
+        if self.return_sample_id:
+            return X, Y, self.sample_ids[index]
+        return X, Y
+
+
 class KaggleERNLoader(torch.utils.data.Dataset):
     def __init__(self, root, files, sampling_rate=200):
         self.root = root
@@ -662,6 +759,16 @@ def collate_fn_biot_sleep_with_epoch_id(batch):
 def collate_fn_motion_with_sample_id(batch):
     """
     自定义collate函数，用于处理MotionLoader(return_sample_id=True)返回(X, Y, sample_id)的情况
+    """
+    X_list, Y_list, sample_id_list = zip(*batch)
+    X_batch = torch.stack(X_list, dim=0)
+    Y_batch = torch.stack(Y_list, dim=0)
+    sample_id_batch = list(sample_id_list)
+    return X_batch, Y_batch, sample_id_batch
+
+def collate_fn_stress_with_sample_id(batch):
+    """
+    自定义collate函数，用于处理StressLoader(return_sample_id=True)返回(X, Y, sample_id)的情况
     """
     X_list, Y_list, sample_id_list = zip(*batch)
     X_batch = torch.stack(X_list, dim=0)

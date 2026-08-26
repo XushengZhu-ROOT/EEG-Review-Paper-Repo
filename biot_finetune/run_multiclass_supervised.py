@@ -2,6 +2,13 @@ import os
 import argparse
 import pickle
 
+# [GPU 环境兼容] 见 run_binary_supervised.py 顶部同样的说明：TensorBoardLogger
+# 会触发 tensorboard 尝试 `import tensorflow`，在有 cgroup CPU 配额限制的容器
+# 里（比如 DSMLP）可能导致进程卡住不响应 Ctrl+C。必须在 tensorboard/
+# pytorch_lightning 被 import 之前设置这个标记。
+import tensorboard.compat
+tensorboard.compat.notf = True
+
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -1492,6 +1499,151 @@ def save_motion_fold_results(args, lightning_model, checkpoint_callback, motion_
           f"best_epoch={best_epoch} balanced_accuracy={balanced_accuracy:.5f}")
 
 
+def save_sleep_epoch_results(args, lightning_model, checkpoint_callback, val_loader, test_loader,
+                              best_epoch, train_time_sec, save_dir):
+    """[Sleep] 用 val_bacc 最好的那个 epoch(checkpoint_callback.best_model_path)对 val/test
+    集各重新做一次干净推理，保存：
+      sleep_{model}_val.npz / sleep_{model}_test.npz
+        -- sample_id(=epoch_id，已排序) / y_true / y_pred / y_prob(N,5) / subject_id / epoch_index
+      sleep_{model}.json
+        -- 模型名/任务/split方式+seed/超参数/总epoch数/best_epoch/val_bacc/test_bacc/
+           数据目录/checkpoint路径/val与test各类样本数
+    跟 save_motion_fold_results 同一个思路：显式从 best checkpoint 重新加载权重，不依赖
+    trainer.test(ckpt_path="best") 的隐式行为。val_loader/test_loader 复用 supervised()
+    里已经建好的那两个（Sleep/BiotSleep 的 prepare_*_dataloader 本来就已经用
+    return_epoch_id=True 构造，不用重新建）。sample_id 是 preprocess_sleep.py 里的
+    epoch_id（形如 "sub01_ep0000"），用 ^sub(\\d+)_ep(\\d+)$ 解析出 subject_id 和
+    epoch_index（epoch_index = 这个受试者整夜第几个 epoch）。
+    任何失败都直接抛异常，不静默跳过。
+    """
+    best_ckpt_path = checkpoint_callback.best_model_path
+    if not best_ckpt_path or not os.path.exists(best_ckpt_path):
+        raise RuntimeError(
+            f"save_sleep_epoch_results: no best checkpoint found (best_model_path={best_ckpt_path!r})"
+        )
+    state = torch.load(best_ckpt_path, map_location="cpu")
+    lightning_model.load_state_dict(state["state_dict"])
+
+    model = lightning_model.model
+    device = next(model.parameters()).device
+    model.eval()
+
+    task = args.task_name if args.task_name else args.dataset.lower()
+    model_name = args.model_name
+    os.makedirs(save_dir, exist_ok=True)
+
+    sid_re = re.compile(r'^sub(\d+)_ep(\d+)$')
+
+    def _run_split(loader, split_name):
+        sample_ids, y_true, y_pred, y_prob, subject_ids, epoch_indices = [], [], [], [], [], []
+        with torch.no_grad():
+            for X, Y, batch_epoch_ids in loader:
+                X = X.to(device)
+                logits = model(X)
+                probs = torch.softmax(logits, dim=1)
+                preds = torch.argmax(logits, dim=1)
+                for i, sid in enumerate(batch_epoch_ids):
+                    m = sid_re.match(sid)
+                    if not m:
+                        raise ValueError(f"Cannot parse subject_id/epoch_index from sample_id: {sid!r}")
+                    sample_ids.append(sid)
+                    y_true.append(int(Y[i].item()))
+                    y_pred.append(int(preds[i].cpu().item()))
+                    y_prob.append(probs[i].cpu().numpy())
+                    subject_ids.append(int(m.group(1)))
+                    epoch_indices.append(int(m.group(2)))
+
+        if len(sample_ids) == 0:
+            raise RuntimeError(f"save_sleep_epoch_results: no samples collected for split={split_name!r}.")
+
+        sample_ids_arr = np.array(sample_ids)
+        order = np.argsort(sample_ids_arr)
+        sample_ids_arr = sample_ids_arr[order]
+        y_true_arr = np.array(y_true, dtype=np.int64)[order]
+        y_pred_arr = np.array(y_pred, dtype=np.int64)[order]
+        y_prob_arr = np.array(y_prob, dtype=np.float32)[order]
+        subject_id_arr = np.array(subject_ids, dtype=np.int64)[order]
+        epoch_index_arr = np.array(epoch_indices, dtype=np.int64)[order]
+
+        npz_path = os.path.join(save_dir, f"{task}_{model_name}_{split_name}.npz")
+        if os.path.exists(npz_path):
+            ts = _time.strftime("%Y%m%d-%H%M%S")
+            backup_path = f"{npz_path}.bak-{ts}"
+            os.rename(npz_path, backup_path)
+            print(f"[warn] existing sleep result found, backed up to {backup_path}")
+
+        np.savez(
+            npz_path,
+            sample_id=sample_ids_arr, y_true=y_true_arr, y_pred=y_pred_arr, y_prob=y_prob_arr,
+            subject_id=subject_id_arr, epoch_index=epoch_index_arr,
+        )
+        if not os.path.exists(npz_path):
+            raise RuntimeError(f"save_sleep_epoch_results: failed to write {npz_path}")
+        _reload = np.load(npz_path)
+        for key in ("sample_id", "y_true", "y_pred", "y_prob", "subject_id", "epoch_index"):
+            if key not in _reload:
+                raise RuntimeError(f"save_sleep_epoch_results: {npz_path} missing key {key!r} after write")
+
+        bacc = float(balanced_accuracy_score(y_true_arr, y_pred_arr))
+        class_counts = np.bincount(y_true_arr, minlength=args.n_classes).tolist()
+        print(f"Saved sleep {split_name} predictions to {npz_path} (balanced_accuracy={bacc:.5f})")
+        return npz_path, bacc, class_counts
+
+    val_npz_path, val_bacc, val_class_counts = _run_split(val_loader, "val")
+    test_npz_path, test_bacc, test_class_counts = _run_split(test_loader, "test")
+
+    hyperparams = {
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "model": args.model,
+        "sampling_rate": args.sampling_rate,
+        "n_classes": args.n_classes,
+        "freeze_backbone": bool(getattr(args, "freeze_backbone", False)),
+    }
+
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    peak_gpu_mem_mb = (torch.cuda.max_memory_allocated(0) / (1024 ** 2)) if torch.cuda.is_available() else None
+
+    meta = {
+        "model_name": model_name,
+        "task": task,
+        "dataset": args.dataset,
+        "split_mode": "pooled_random_epoch",  # 见 preprocess_sleep.py：全体受试者按 epoch 分层随机切分，不是 LOSO
+        "total_epochs": args.epochs,
+        "best_epoch": best_epoch,
+        "val_balanced_accuracy": val_bacc,
+        "test_balanced_accuracy": test_bacc,
+        "val_class_counts": val_class_counts,
+        "test_class_counts": test_class_counts,
+        "checkpoint_path": best_ckpt_path,
+        "val_npz_path": val_npz_path,
+        "test_npz_path": test_npz_path,
+        "saved_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": hyperparams,
+        "train_time_sec": train_time_sec,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "gpu_name": gpu_name,
+    }
+
+    json_path = os.path.join(save_dir, f"{task}_{model_name}.json")
+    if os.path.exists(json_path):
+        ts = _time.strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{json_path}.bak-{ts}"
+        os.rename(json_path, backup_path)
+        print(f"[warn] existing sleep sidecar json found, backed up to {backup_path}")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"save_sleep_epoch_results: failed to write {json_path}")
+    with open(json_path) as f:
+        json.load(f)  # 回读校验 JSON 没写坏
+
+    print(f"Saved sleep metadata to {json_path}")
+    print(f"  best_epoch={best_epoch} val_bacc={val_bacc:.5f} test_bacc={test_bacc:.5f}")
+
+
 def supervised(args):
     motion_test_meta = None
     is_motion_loso = (
@@ -1747,6 +1899,14 @@ def supervised(args):
     if is_motion_loso:
         save_motion_fold_results(
             args, lightning_model, checkpoint_callback, motion_test_meta,
+            best_epoch_tracker.best_epoch, train_time_sec, save_dir=(args.fold_results_dir or log_dir),
+        )
+
+    # [Sleep] 按 val_bacc 最好的 epoch 对 val/test 各存一份 npz/json，供事后算
+    # per-stage recall/confusion matrix/macro-F1/kappa/CI，不用重跑训练。
+    if args.dataset in ("Sleep", "BiotSleep"):
+        save_sleep_epoch_results(
+            args, lightning_model, checkpoint_callback, val_loader, test_loader,
             best_epoch_tracker.best_epoch, train_time_sec, save_dir=(args.fold_results_dir or log_dir),
         )
 

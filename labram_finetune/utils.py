@@ -1062,7 +1062,8 @@ class MotorLoader(torch.utils.data.Dataset):
         return torch.FloatTensor(X), Y
 
 class SleepLoader(torch.utils.data.Dataset):
-    def __init__(self, root, files, sampling_rate=200, data_key='signal', label_key='label', expected_channels=6):
+    def __init__(self, root, files, sampling_rate=200, data_key='signal', label_key='label', expected_channels=6,
+                 return_sample_id=False):
         self.root = root
         self.files = files
         self.default_rate = 200
@@ -1070,6 +1071,16 @@ class SleepLoader(torch.utils.data.Dataset):
         self.data_key = data_key
         self.label_key = label_key
         self.expected_channels = expected_channels
+        self.return_sample_id = return_sample_id
+
+        # sample_id 就是文件名本身（去掉 .pickle），preprocess_sleep.py 存盘时已经用
+        # epoch_id（形如 "sub01_ep0000"）当文件名，不需要像 Motor 那样再算一遍。
+        if self.return_sample_id:
+            self.sample_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.files]
+            if len(set(self.sample_ids)) != len(self.sample_ids):
+                raise ValueError(
+                    "Duplicate sample_id detected in SleepLoader; check for duplicate/conflicting epoch files."
+                )
 
     def __len__(self):
         return len(self.files)
@@ -1099,6 +1110,8 @@ class SleepLoader(torch.utils.data.Dataset):
         if self.sampling_rate != self.default_rate:
             X = resample(X, 10 * self.sampling_rate, axis=-1)
 
+        if self.return_sample_id:
+            return torch.FloatTensor(X), Y, self.sample_ids[index]
         return torch.FloatTensor(X), Y
 
 class SeedLoader(torch.utils.data.Dataset):

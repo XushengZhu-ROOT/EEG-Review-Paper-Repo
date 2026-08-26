@@ -4,6 +4,7 @@ https://github.com/935963004/NeuroLM
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -23,6 +24,7 @@ from pathlib import Path
 import tiktoken
 from utils import prepare_KaggleERN_dataset, prepare_STRESS_dataset, prepare_SEED7_dataset, prepare_motor_dataset, prepare_sleep_dataset, cosine_scheduler, get_metrics
 from utils import prepare_motor_dataset_loso, prepare_STRESS_dataset_loso
+from downstream_dataset import SleepLoader
 from torch.utils.data.dataset import ConcatDataset
 
 
@@ -812,6 +814,21 @@ def main(args):
                 'model_args': model_args,
             }, ckpt_save_path)
             print(f"Saved best checkpoint (val_bacc={ckpt_best_val_bacc:.5f} at epoch {ckpt_best_epoch}) to {ckpt_save_path}")
+
+            # ===== [Sleep] 用刚保存的最佳 epoch 权重，对 val/test 各做一次干净重推理，
+            # 存 npz/json（per-stage 指标事后从这两个文件算，不用重跑训练）=====
+            if all_datasets[0]['name'] == 'SLEEP':
+                raw_model.load_state_dict(ckpt_best_model_state)
+                raw_model.to(device)
+                peak_gpu_mem_mb = 0.0
+                gpu_name = 'cpu'
+                if device_type == 'cuda':
+                    peak_gpu_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                    gpu_name = torch.cuda.get_device_name(device)
+                save_sleep_epoch_results(
+                    args, raw_model, all_datasets[0], ckpt_best_epoch, ckpt_best_val_bacc,
+                    ckpt_save_path, train_time_sec, peak_gpu_mem_mb, gpu_name,
+                )
         else:
             print("Warning: --save_ckpt was set but no best checkpoint was recorded; skipping save.")
 
@@ -1539,6 +1556,128 @@ def save_fold_results(args, name, payload, fold_stats):
     print(f"[fold {args.fold}] saved: {npz_path}")
     print(f"[fold {args.fold}] saved: {json_path}")
     print(f"[fold {args.fold}] test balanced_accuracy = {fold_bacc:.4f} (best_epoch={fold_stats['best_epoch']})")
+
+
+_SLEEP_SAMPLE_ID_RE = re.compile(r'^sub(\d+)_ep(\d+)$')
+
+
+def save_sleep_epoch_results(args, raw_model, dataset_info, ckpt_best_epoch, ckpt_best_val_bacc,
+                              ckpt_save_path, train_time_sec, peak_gpu_mem_mb, gpu_name):
+    """[Sleep] 用调用方已经载入 raw_model 的最佳验证 epoch(按 val balanced_accuracy 选出)权重，
+    对 val 和 test 集各重新做一次干净的推理（带 sample_id），保存：
+      sleep_{model}_val.npz / sleep_{model}_test.npz
+        -- sample_id(=epoch_id，已排序) / y_true / y_pred / y_prob(N,5) / subject_id / epoch_index
+      sleep_{model}.json
+        -- 模型名/任务/split方式+seed/超参数/总epoch数/best_epoch/val_bacc/test_bacc/
+           数据目录/checkpoint路径/val与test各类样本数
+    复用 evaluate_probs()（原本给 LOSO Motor 用），Sleep 的 SleepLoader 已经支持
+    is_instruct=True 下的问答式评估格式，只是 return_sample_id 之前从没打开过。
+    sample_id 是 preprocess_sleep.py 里的 epoch_id（形如 "sub01_ep0000"），直接从里面
+    解析 subject_id 和 epoch_index（epoch_index = 这个受试者整夜第几个 epoch）。
+    任何失败都直接抛异常，不静默跳过。
+    """
+    dataset_val = dataset_info['dataset_val']
+    dataset_test = dataset_info['dataset_test']
+
+    class_token_ids, answer_pos = compute_class_token_ids(dataset_test, dataset_info['num_classes'])
+    eval_dataset_info = {**dataset_info, 'class_token_ids': class_token_ids, 'answer_pos': answer_pos}
+
+    task = args.task_name if args.task_name else dataset_info['name'].lower()
+    model_name = args.model_name
+    results_dir = args.results_dir if args.results_dir else args.out_dir
+    os.makedirs(results_dir, exist_ok=True)
+
+    def _run_split(dataset, split_name):
+        sid_dataset = SleepLoader(
+            dataset.root, dataset.files,
+            sampling_rate=dataset.sampling_rate,
+            eeg_max_len=dataset.eeg_max_len, text_max_len=dataset.text_max_len,
+            is_instruct=True, is_val=True, return_sample_id=True,
+        )
+        sid_loader = torch.utils.data.DataLoader(
+            sid_dataset, batch_size=int(args.eeg_batch_size * 1.5),
+            shuffle=False, num_workers=0,
+        )
+        payload = evaluate_probs(raw_model, eval_dataset_info, sid_loader)
+
+        order = np.argsort(payload['sample_id'].astype('U'), kind='stable')
+        sample_id = payload['sample_id'][order].astype('U')
+        y_true = payload['y_true'][order].astype(np.int64)
+        y_pred = payload['y_pred'][order].astype(np.int64)
+        y_prob = payload['y_prob'][order].astype(np.float32)
+        subject_id = payload['subject_id'][order].astype(np.int64)
+
+        epoch_index = []
+        for sid in sample_id:
+            m = _SLEEP_SAMPLE_ID_RE.match(sid)
+            if not m:
+                raise ValueError(f"Cannot parse epoch_index from sample_id: {sid!r}")
+            epoch_index.append(int(m.group(2)))
+        epoch_index = np.array(epoch_index, dtype=np.int64)
+
+        npz_path = os.path.join(results_dir, f"{task}_{model_name}_{split_name}.npz")
+        np.savez(
+            npz_path,
+            sample_id=sample_id, y_true=y_true, y_pred=y_pred, y_prob=y_prob,
+            subject_id=subject_id, epoch_index=epoch_index,
+        )
+        if not os.path.exists(npz_path):
+            raise RuntimeError(f"save_sleep_epoch_results: failed to write {npz_path}")
+
+        bacc = float(balanced_accuracy_score(y_true, y_pred))
+        class_counts = np.bincount(y_true, minlength=dataset_info['num_classes']).tolist()
+        print(f"Saved sleep {split_name} predictions to {npz_path} (balanced_accuracy={bacc:.5f})")
+        return npz_path, bacc, class_counts
+
+    val_npz_path, val_bacc, val_class_counts = _run_split(dataset_val, "val")
+    test_npz_path, test_bacc, test_class_counts = _run_split(dataset_test, "test")
+
+    hyperparams = {
+        'learning_rate': args.learning_rate,
+        'min_lr': args.min_lr,
+        'weight_decay': args.weight_decay,
+        'beta1': args.beta1,
+        'beta2': args.beta2,
+        'eeg_batch_size': args.eeg_batch_size,
+        'text_batch_size': args.text_batch_size,
+        'epochs': args.epochs,
+        'warmup_epochs': args.warmup_epochs,
+        'warmup_ratio': args.warmup_ratio,
+        'grad_clip': args.grad_clip,
+        'block_size': args.block_size,
+        'decay_lr': bool(args.decay_lr),
+        'seed': args.seed,
+    }
+
+    meta = {
+        'model_name': model_name,
+        'task': task,
+        'dataset': dataset_info['name'],
+        'split_mode': 'pooled_random_epoch',  # 见 preprocess_sleep.py：全体受试者按 epoch 分层随机切分，不是 LOSO
+        'seed': args.seed,
+        'dataset_path': args.dataset_dir,
+        'total_epochs': args.epochs,
+        'best_epoch': int(ckpt_best_epoch),
+        'val_balanced_accuracy': val_bacc,
+        'test_balanced_accuracy': test_bacc,
+        'val_class_counts': val_class_counts,
+        'test_class_counts': test_class_counts,
+        'checkpoint_path': ckpt_save_path,
+        'val_npz_path': val_npz_path,
+        'test_npz_path': test_npz_path,
+        'hyperparams': hyperparams,
+        'train_time_sec': train_time_sec,
+        'peak_gpu_mem_mb': peak_gpu_mem_mb,
+        'gpu_name': gpu_name,
+    }
+    json_path = os.path.join(results_dir, f"{task}_{model_name}.json")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(make_json_serializable(meta), f, ensure_ascii=False, indent=2)
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"save_sleep_epoch_results: failed to write {json_path}")
+
+    print(f"Saved sleep metadata to {json_path}")
+    print(f"  best_epoch={ckpt_best_epoch} val_bacc={val_bacc:.5f} test_bacc={test_bacc:.5f}")
 
 
 def get_args():

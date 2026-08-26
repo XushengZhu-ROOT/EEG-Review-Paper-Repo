@@ -531,6 +531,186 @@ def save_loso_fold_results(args, model_without_ddp, device, dataset_test, ch_nam
           f"best_epoch={best_epoch} balanced_accuracy={balanced_accuracy:.5f}")
 
 
+def save_sleep_epoch_results(args, model_without_ddp, device, dataset_val, dataset_test, ch_names,
+                              best_epoch, train_time_sec, n_parameters):
+    """[Sleep] 用调用方已经载入 model_without_ddp 的最佳验证 epoch(按 val balanced_accuracy 选出)
+    权重，对 val 和 test 集各重新做一次干净的推理（带 sample_id），保存：
+      sleep_{model}_val.npz / sleep_{model}_test.npz
+        -- sample_id(=epoch_id，已排序) / y_true / y_pred / y_prob(N,5) / subject_id / epoch_index
+      sleep_{model}.json
+        -- 模型名/任务/split方式+seed/lr/wd/bs/总epoch数/best_epoch/val_bacc/test_bacc/
+           数据目录/checkpoint路径/val与test各类样本数
+    跟 save_loso_fold_results 是同一套"不改训练逻辑，只复用已训练好的模型做一次推理并落盘"
+    的思路，Sleep 不是 LOSO，没有 fold/test_subject/val_subject，所以单独写一份，
+    sample_id 是 preprocess_sleep.py 里的 epoch_id（形如 "sub01_ep0000"），用
+    ^sub(\\d+)_ep(\\d+)$ 解析出 subject_id 和 epoch_index（epoch_index = 这个受试者
+    整夜第几个 epoch，直接是文件名里的数字，不用重新计算）。
+    任何失败（没有样本、写文件失败、写完读不回来）都直接抛异常，不静默跳过。
+    """
+    model_without_ddp.eval()
+    input_chans = utils.get_input_chans(ch_names) if ch_names is not None else None
+
+    task = args.task_name or args.dataset.lower()
+    model_name = args.model_name or "labram"
+    save_dir = args.fold_results_dir or args.output_dir
+    if not save_dir:
+        raise ValueError("save_sleep_epoch_results requires --fold_results_dir or --output_dir to be set")
+    os.makedirs(save_dir, exist_ok=True)
+
+    _VALID_T = {200, 600, 800, 1000, 6000}
+    sid_re = re.compile(r'^sub(\d+)_ep(\d+)$')
+
+    def _run_split(dataset, split_name):
+        sid_dataset = utils.SleepLoader(
+            dataset.root, dataset.files,
+            sampling_rate=dataset.sampling_rate,
+            data_key=dataset.data_key, label_key=dataset.label_key,
+            expected_channels=dataset.expected_channels,
+            return_sample_id=True,
+        )
+        sid_loader = torch.utils.data.DataLoader(
+            sid_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=0, collate_fn=utils.skip_failed_collate,
+        )
+
+        sample_ids, y_true, y_pred, y_prob, subject_ids, epoch_indices = [], [], [], [], [], []
+        with torch.no_grad():
+            for batch in sid_loader:
+                if batch is None:
+                    continue
+                X, Y, batch_sample_ids = batch
+                X = X.float().to(device, non_blocking=True) / 100
+                if len(X.shape) != 3:
+                    raise ValueError(f"save_sleep_epoch_results: unexpected input shape {X.shape}")
+                B, N, T = X.shape
+                if T not in _VALID_T:
+                    raise ValueError(f"save_sleep_epoch_results: unexpected time dimension T={T}")
+                X = X.view(B, N, T // 200, 200)
+
+                output = model_without_ddp(X, input_chans=input_chans)
+                probs = torch.softmax(output, dim=-1).cpu()
+                preds = torch.argmax(output, dim=-1).cpu()
+                for i, sid in enumerate(batch_sample_ids):
+                    m = sid_re.match(sid)
+                    if not m:
+                        raise ValueError(f"Cannot parse subject_id/epoch_index from sample_id: {sid!r}")
+                    sample_ids.append(sid)
+                    y_true.append(int(Y[i]))
+                    y_pred.append(int(preds[i].item()))
+                    y_prob.append(probs[i].numpy())
+                    subject_ids.append(int(m.group(1)))
+                    epoch_indices.append(int(m.group(2)))
+
+        if len(sample_ids) == 0:
+            raise RuntimeError(f"save_sleep_epoch_results: no samples collected for split={split_name!r}.")
+
+        sample_ids_arr = np.array(sample_ids)
+        order = np.argsort(sample_ids_arr)
+        sample_ids_arr = sample_ids_arr[order]
+        y_true_arr = np.array(y_true, dtype=np.int64)[order]
+        y_pred_arr = np.array(y_pred, dtype=np.int64)[order]
+        y_prob_arr = np.array(y_prob, dtype=np.float32)[order]
+        subject_id_arr = np.array(subject_ids, dtype=np.int64)[order]
+        epoch_index_arr = np.array(epoch_indices, dtype=np.int64)[order]
+
+        npz_path = os.path.join(save_dir, f"{task}_{model_name}_{split_name}.npz")
+        if os.path.exists(npz_path):
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            backup_path = f"{npz_path}.bak-{ts}"
+            os.rename(npz_path, backup_path)
+            print(f"[warn] existing sleep result found, backed up to {backup_path}")
+
+        np.savez(
+            npz_path,
+            sample_id=sample_ids_arr,
+            y_true=y_true_arr,
+            y_pred=y_pred_arr,
+            y_prob=y_prob_arr,
+            subject_id=subject_id_arr,
+            epoch_index=epoch_index_arr,
+        )
+        if not os.path.exists(npz_path):
+            raise RuntimeError(f"save_sleep_epoch_results: failed to write {npz_path}")
+        _reload = np.load(npz_path)
+        for key in ("sample_id", "y_true", "y_pred", "y_prob", "subject_id", "epoch_index"):
+            if key not in _reload:
+                raise RuntimeError(f"save_sleep_epoch_results: {npz_path} missing key {key!r} after write")
+            if len(_reload[key]) != len(sample_ids_arr):
+                raise RuntimeError(f"save_sleep_epoch_results: {npz_path} key {key!r} length mismatch after write")
+
+        from sklearn.metrics import balanced_accuracy_score
+        bacc = float(balanced_accuracy_score(y_true_arr, y_pred_arr))
+        class_counts = np.bincount(y_true_arr, minlength=5).tolist()
+        print(f"Saved sleep {split_name} predictions to {npz_path} (balanced_accuracy={bacc:.5f})")
+        return npz_path, bacc, class_counts
+
+    val_npz_path, val_bacc, val_class_counts = _run_split(dataset_val, "val")
+    test_npz_path, test_bacc, test_class_counts = _run_split(dataset_test, "test")
+
+    checkpoint_path = os.path.join(args.output_dir, "checkpoint-best.pth") if args.output_dir else None
+    if checkpoint_path and not os.path.exists(checkpoint_path):
+        checkpoint_path = None
+
+    hyperparams = {
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "optimizer": args.opt,
+        "seed": args.seed,
+        "layer_decay": args.layer_decay,
+        "warmup_epochs": args.warmup_epochs,
+        "drop_path": args.drop_path,
+        "smoothing": args.smoothing,
+        "freeze_backbone": bool(args.freeze_backbone),
+        "channel_size": args.channel_size,
+        "model": args.model,
+        "n_parameters": n_parameters,
+    }
+
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    peak_gpu_mem_mb = (torch.cuda.max_memory_allocated(0) / (1024 ** 2)) if torch.cuda.is_available() else None
+
+    meta = {
+        "model_name": model_name,
+        "task": task,
+        "dataset": args.dataset,
+        "split_mode": getattr(args, 'split_mode', 'random_epoch'),
+        "seed": args.seed,
+        "dataset_path": args.dataset_path,
+        "total_epochs": args.epochs,
+        "best_epoch": best_epoch,
+        "val_balanced_accuracy": val_bacc,
+        "test_balanced_accuracy": test_bacc,
+        "val_class_counts": val_class_counts,
+        "test_class_counts": test_class_counts,
+        "checkpoint_path": checkpoint_path,
+        "val_npz_path": val_npz_path,
+        "test_npz_path": test_npz_path,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": hyperparams,
+        "train_time_sec": train_time_sec,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "gpu_name": gpu_name,
+    }
+
+    json_path = os.path.join(save_dir, f"{task}_{model_name}.json")
+    if os.path.exists(json_path):
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{json_path}.bak-{ts}"
+        os.rename(json_path, backup_path)
+        print(f"[warn] existing sleep sidecar json found, backed up to {backup_path}")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"save_sleep_epoch_results: failed to write {json_path}")
+    with open(json_path) as f:
+        json.load(f)  # 回读校验 JSON 没写坏
+
+    print(f"Saved sleep metadata to {json_path}")
+    print(f"  best_epoch={best_epoch} val_bacc={val_bacc:.5f} test_bacc={test_bacc:.5f}")
+
+
 def main(args, ds_init):
     utils.init_distributed_mode(args)
 
@@ -956,10 +1136,13 @@ def main(args, ds_init):
     # 用）。上面 checkpoint-best.pth 的选择标准现在也已统一改为 val_bacc，
     # 这里的记账逻辑因此变为冗余但仍然正确（两者选出的应是同一个 epoch），保留不动。=====
     loso_mode = getattr(args, 'split_mode', 'random_epoch') == 'subject_independent'
+    # [Sleep] Sleep 不是 LOSO（没有 fold/test_subject/val_subject），但同样需要"按
+    # val_bacc 选最佳 epoch -> 干净重推理 -> 存 npz/json"这一套，复用同一份记账逻辑。
+    capture_best_epoch = loso_mode or args.dataset == 'Sleep'
     best_val_bacc = -1.0
     best_epoch_loso = 0
     best_model_state_loso = None
-    if loso_mode and torch.cuda.is_available():
+    if capture_best_epoch and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -1019,9 +1202,9 @@ def main(args, ds_init):
                         loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
                 max_test_bacc = test_stats["balanced_accuracy"]
 
-            # ===== [LOSO] 按验证集 balanced_accuracy 记录最佳 epoch 的模型权重（内存中），
-            # 用于训练结束后重新对 test 集做一次干净的推理，事后保存 npz/json。=====
-            if loso_mode:
+            # ===== [LOSO/Sleep] 按验证集 balanced_accuracy 记录最佳 epoch 的模型权重（内存中），
+            # 用于训练结束后重新对 val/test 集做一次干净的推理，事后保存 npz/json。=====
+            if capture_best_epoch:
                 current_val_bacc = val_stats.get('balanced_accuracy')
                 if current_val_bacc is not None and current_val_bacc > best_val_bacc:
                     best_val_bacc = current_val_bacc
@@ -1101,18 +1284,24 @@ def main(args, ds_init):
     # 对 test 集重新推理一次，保存 {task}_{model}_fold{i:02d}.npz/.json，
     # 让所有下游指标事后都能从这两个文件重新算，不需要重跑训练。
     # 保存失败直接抛异常退出，不静默跳过。=====
-    if loso_mode and utils.is_main_process():
+    if capture_best_epoch and utils.is_main_process():
         if best_model_state_loso is None:
             raise RuntimeError(
-                "LOSO fold training finished but best_model_state_loso is None "
+                "LOSO/Sleep training finished but best_model_state_loso is None "
                 "(val balanced_accuracy was never recorded) -- check --epochs / dataset."
             )
         model_without_ddp.load_state_dict(best_model_state_loso)
         model_without_ddp.to(device)
-        save_loso_fold_results(
-            args, model_without_ddp, device, dataset_test, ch_names,
-            best_epoch_loso, total_time, n_parameters,
-        )
+        if args.dataset == 'Sleep':
+            save_sleep_epoch_results(
+                args, model_without_ddp, device, dataset_val, dataset_test, ch_names,
+                best_epoch_loso, total_time, n_parameters,
+            )
+        else:
+            save_loso_fold_results(
+                args, model_without_ddp, device, dataset_test, ch_names,
+                best_epoch_loso, total_time, n_parameters,
+            )
 
     # 保存詳細的資源使用報告
     if args.output_dir and utils.is_main_process():

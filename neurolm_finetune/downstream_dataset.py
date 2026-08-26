@@ -565,7 +565,14 @@ class SleepLoader(Dataset):
     - 5 classes: 0, 1, 2, 3, 4
     - Data length: 30 seconds (6000 samples at 200Hz sampling rate)
     """
-    def __init__(self, root, files, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False):
+    def __init__(self, root, files, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False,
+                 # [Sleep] 事后按最佳 val_bacc epoch 存 npz 时用；不影响现有训练/评估行为
+                 # （默认 False）。跟 Motor 的 sample_id 不同，Sleep 的 sample_id 就是
+                 # preprocess_sleep.py 存盘时用的 epoch_id 文件名本身（形如
+                 # "sub01_ep0000"），不能用 _build_stable_sample_ids 重新编号，否则
+                 # 会丢失"整夜第几个 epoch"这个真实位置信息（这里的 files 通常只是
+                 # train/val/test 里的一个子集，重新编号会跟原始 epoch_id 对不上）。
+                 return_sample_id=False):
         self.root = root
         self.files = files
         self.default_rate = 200
@@ -574,6 +581,15 @@ class SleepLoader(Dataset):
         self.is_val = is_val
         self.eeg_max_len = eeg_max_len
         self.text_max_len = text_max_len
+        self.return_sample_id = return_sample_id
+
+        if self.return_sample_id:
+            self.sample_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.files]
+            self.subject_ids = [_parse_subject_id(f) for f in self.files]
+            if len(set(self.sample_ids)) != len(self.sample_ids):
+                raise ValueError(
+                    "Duplicate sample_id detected in SleepLoader; check for duplicate/conflicting epoch files."
+                )
 
         # 6 channels for Sleep dataset: ['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
         self.ch_names = ['C3', 'C4', 'F3', 'F4', 'O1', 'O2']
@@ -654,8 +670,11 @@ class SleepLoader(Dataset):
         gpt_mask[:, :, valid_eeg_len:X_eeg.size(0)] = 0
         
         if self.is_val:
+            if self.return_sample_id:
+                return (X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool(),
+                        self.sample_ids[index], self.subject_ids[index])
             return X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
-        
+
         Y_text = torch.full_like(text, fill_value=-1)
         prompt_len = self.prompt.size(0) - 1
         Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]
