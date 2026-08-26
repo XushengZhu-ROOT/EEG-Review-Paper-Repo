@@ -13,8 +13,14 @@ class CustomDataset(Dataset):
             mode='train',
             channel_size=6,
             window_size=30,
+            return_sample_id=False,
     ):
         super(CustomDataset, self).__init__()
+        # [Sleep] 按最佳 epoch checkpoint 做事后干净推理时用；不影响现有训练/评估
+        # 行为（默认 False）。sample_id 就是 preprocess_sleep.py 存盘时用的
+        # epoch_id（形如 "sub01_ep0000"，即文件名去掉 .pickle），直接从文件名取，
+        # 不用像 Motor 那样重新编号。
+        self.return_sample_id = return_sample_id
         mode_dir = os.path.join(data_dir, mode)
         if not os.path.exists(mode_dir):
             raise ValueError(f"Data directory {mode_dir} does not exist!")
@@ -75,9 +81,12 @@ class CustomDataset(Dataset):
             )
         
         data = data.reshape(self.channel_size, self.window_size, 200)
-        
+
         # 数据归一化：参考其他数据集，除以100
         # 注意：如果数据已经归一化，可能需要调整
+        if self.return_sample_id:
+            sample_id = os.path.splitext(os.path.basename(file))[0]
+            return data / 100.0, label, sample_id
         return data / 100.0, label
 
     def collate(self, batch):

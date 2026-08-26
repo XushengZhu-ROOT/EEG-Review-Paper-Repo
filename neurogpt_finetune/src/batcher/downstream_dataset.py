@@ -582,6 +582,7 @@ class Sleep5ClassDataset(EEGDataset):
         root_path="",
         matrix_p_path=None,
         gpt_only=True,
+        return_sample_id=False,
     ):
         super().__init__(
             filenames,
@@ -592,6 +593,29 @@ class Sleep5ClassDataset(EEGDataset):
             root_path=root_path,
             gpt_only=gpt_only,
         )
+
+        # [Sleep] 按 val_bacc 最佳 epoch 事后干净推理时用；默认 False，不影响现有
+        # 训练/评估行为。sample_id 就是 preprocess_sleep.py 存盘时用的 epoch_id
+        # （形如 "sub01_ep0000"，即文件名去掉 .pickle），直接从文件名解析，一次性
+        # 算好存成列表（不用像 Motor6ClassDataset.get_trials_all() 那样连带把全部
+        # 数据读进内存——Sleep5ClassDataset 本来就是惰性加载，这里保持惰性）。
+        self.return_sample_id = return_sample_id
+        if self.return_sample_id:
+            self.sample_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.filenames]
+            sid_re = re.compile(r'^sub(\d+)_ep(\d+)$')
+            self.subject_ids = []
+            self.epoch_indices = []
+            for sid in self.sample_ids:
+                m = sid_re.match(sid)
+                if not m:
+                    raise ValueError(f"Cannot parse subject_id/epoch_index from sample_id: {sid!r}")
+                self.subject_ids.append(int(m.group(1)))
+                self.epoch_indices.append(int(m.group(2)))
+            if len(set(self.sample_ids)) != len(self.sample_ids):
+                raise ValueError(
+                    "Duplicate sample_id detected in Sleep5ClassDataset; "
+                    "check for duplicate/conflicting epoch files."
+                )
 
         # 加载通道转换矩阵 P (22, 6)
         try:
@@ -675,8 +699,11 @@ class Sleep5ClassDataset(EEGDataset):
         # 归一化（复用 EEGDataset.normalize）
         trial_data_normalized = self.normalize(mapped_data[np.newaxis, ...])[0]
 
-        return self.preprocess_sample(
+        result = self.preprocess_sample(
             sample=trial_data_normalized,
             seq_len=self.num_chunks,  # 30
             labels=label,
         )
+        if self.return_sample_id:
+            result["sample_id"] = self.sample_ids[idx]
+        return result
