@@ -1,8 +1,8 @@
 
 # set -e
 
-dataset=KaggleERN
-# dataset_path=寫在run_binary_supervised.py裡
+dataset=KaggleERN-ST
+dataset_dir="kaggle_data_st"
 gpu_id=2
 sample_length=3
 epochs=50
@@ -41,6 +41,7 @@ for bs in "${BS_LIST[@]}"; do
             CUDA_VISIBLE_DEVICES=${gpu_id} python run_binary_supervised.py \
             --exp_name ${exp_name} \
             --dataset ${dataset} \
+            --dataset_dir ${dataset_dir} \
             --n_classes 1 \
             --in_channels ${dataset_channels} \
             --sampling_rate 200 \
@@ -51,7 +52,8 @@ for bs in "${BS_LIST[@]}"; do
             --pos_weight ${pos_weight} \
             --epochs ${epochs} \
             --model ${classifier_type} \
-            --output_dir ${output_dir}
+            --output_dir ${output_dir} \
+            --model_name st
             # (可選) 在每次訓練結束後添加一個延遲，以確保 GPU 釋放資源
             sleep 5
         done
