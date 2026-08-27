@@ -318,14 +318,22 @@ def prepare_KaggleERN_dataloader(args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
+    # [KaggleERN-ST] STTransformer 不用 BIOT 预训练权重，跟 Sleep(BiotSleep/Sleep)、
+    # Motion(Motion/Motion-ST)、Stress(Stress/Stress-ST) 一样单独给一份它自己预处理
+    # 的数据（notebook 里 extract_epochs_sttransformer：resample 250Hz + 4-40Hz
+    # 带通 + notch，明显不同于 BIOT 的 resample 200Hz），不再跟 BIOT 共用
+    # s42_n56-biot。"kaggle_data_st" 是占位路径，同事在自己 sh 里改成服务器上的
+    # 真实路径，或者直接用 --dataset_dir 覆盖（两种都行）。
     dataset_paths = {
-        "KaggleERN": "/work/HHRI-AI/UCSD_EEG/eeg_data/EEG_data/EEGPT_Data/KaggleERN/s42_n56-biot"
+        "KaggleERN": "/work/HHRI-AI/UCSD_EEG/eeg_data/EEG_data/EEGPT_Data/KaggleERN/s42_n56-biot",
+        "KaggleERN-ST": "kaggle_data_st",
     }
     if args.dataset not in dataset_paths:
         raise ValueError(f"Undefined dataset: {args.dataset}")
 
     # [KaggleERN bestval] --dataset_dir 显式指定时优先用它（smoke 测试指向本地
-    # ./biot_kaggleern_data_smoke），不传则维持原有硬编码绝对路径不变。
+    # ./biot_kaggleern_data_smoke 或 ./st_kaggleern_data_smoke），不传则维持
+    # dataset_paths 里对应 --dataset 的路径不变。
     root = getattr(args, "dataset_dir", None) or dataset_paths[args.dataset]
 
     train_files = os.listdir(os.path.join(root, "train"))
@@ -842,8 +850,10 @@ def save_kaggleern_epoch_results(args, lightning_model, checkpoint_callback,
     device = next(model.parameters()).device
     model.eval()
 
+    # [KaggleERN-ST] 跟 prepare_KaggleERN_dataloader 用同一份 dataset_paths，保持一致。
     dataset_paths = {
-        "KaggleERN": "/work/HHRI-AI/UCSD_EEG/eeg_data/EEG_data/EEGPT_Data/KaggleERN/s42_n56-biot"
+        "KaggleERN": "/work/HHRI-AI/UCSD_EEG/eeg_data/EEG_data/EEGPT_Data/KaggleERN/s42_n56-biot",
+        "KaggleERN-ST": "kaggle_data_st",
     }
     root = getattr(args, "dataset_dir", None) or dataset_paths[args.dataset]
 
@@ -986,7 +996,7 @@ def supervised(args):
     # get data loaders
     if args.dataset in ["TUAB", "CustomStress-16chan", "CustomStress-30chan"]:
         train_loader, test_loader, val_loader = prepare_TUAB_dataloader(args)
-    elif args.dataset in ["KaggleERN"]:
+    elif args.dataset in ["KaggleERN", "KaggleERN-ST"]:
         train_loader, test_loader, val_loader = prepare_KaggleERN_dataloader(args)
     elif args.dataset in ["Stress", "Stress-ST"]:
         train_loader, test_loader, val_loader, stress_test_meta = prepare_Stress_dataloader(args)
@@ -1191,7 +1201,7 @@ def supervised(args):
     )
 
     # train the model
-    is_kaggleern = args.dataset == "KaggleERN"
+    is_kaggleern = args.dataset in ("KaggleERN", "KaggleERN-ST")
     if (is_stress_loso or is_kaggleern) and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     train_start_time = _time.time()
