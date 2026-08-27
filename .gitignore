@@ -10,6 +10,12 @@
 !cbramod_finetune/datasets/
 !neurolm_finetune/text_dataset_maker/
 
+# Same rationale, CJK-named results folders the patterns above don't catch:
+# 結果 / 结果统计 = aggregated experiment results / stats -- local scratch, never synced.
+**/*結果*/
+**/*结果*/
+**/结果统计/
+
 # Repo-wide: any file or folder (at any depth, any project) with "smoke" in its
 # name is smoke-test scaffolding/scripts/data -- local validation only, never
 # synced to GitHub.

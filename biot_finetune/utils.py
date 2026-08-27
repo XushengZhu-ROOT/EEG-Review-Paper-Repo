@@ -133,11 +133,17 @@ class StressLoader(torch.utils.data.Dataset):
 
 
 class KaggleERNLoader(torch.utils.data.Dataset):
-    def __init__(self, root, files, sampling_rate=200):
+    # [KaggleERN bestval] return_sample_id=False 时行为完全不变（现有训练/评估调用点
+    # 不受影响）。True 时额外返回 sample_id（preprocess_KaggleERN_new.ipynb 存盘时
+    # 写进 pickle 的 'epoch_id'，形如 "S02_Sess01_FB004"；找不到就退化成文件名本身），
+    # 跟 finetune_evaluator.py/compute_metrics_from_npz.py 已经在用的 "^S(\d+)_" 被试号
+    # 解析约定保持一致。
+    def __init__(self, root, files, sampling_rate=200, return_sample_id=False):
         self.root = root
         self.files = files
         self.default_rate = 200
         self.sampling_rate = sampling_rate
+        self.return_sample_id = return_sample_id
 
     def __len__(self):
         return len(self.files)
@@ -154,6 +160,9 @@ class KaggleERNLoader(torch.utils.data.Dataset):
         )
         Y = sample["label"]
         X = torch.FloatTensor(X)
+        if self.return_sample_id:
+            sample_id = sample.get("epoch_id", os.path.splitext(os.path.basename(self.files[index]))[0])
+            return X, Y, sample_id
         return X, Y
 
 # ===== Motion: cross-model-stable sample_id (ported from
@@ -773,6 +782,19 @@ def collate_fn_stress_with_sample_id(batch):
     X_list, Y_list, sample_id_list = zip(*batch)
     X_batch = torch.stack(X_list, dim=0)
     Y_batch = torch.stack(Y_list, dim=0)
+    sample_id_batch = list(sample_id_list)
+    return X_batch, Y_batch, sample_id_batch
+
+
+def collate_fn_kaggleern_with_sample_id(batch):
+    """
+    [KaggleERN bestval] 自定义collate函数，用于处理KaggleERNLoader(return_sample_id=True)
+    返回(X, Y, sample_id)的情况。Y 在 KaggleERNLoader 里是原始 label（不是 tensor），
+    跟 collate_fn_stress_with_sample_id 不同，这里用 torch.tensor 而不是 torch.stack。
+    """
+    X_list, Y_list, sample_id_list = zip(*batch)
+    X_batch = torch.stack(X_list, dim=0)
+    Y_batch = torch.tensor(Y_list, dtype=torch.float32)
     sample_id_batch = list(sample_id_list)
     return X_batch, Y_batch, sample_id_batch
 

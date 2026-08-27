@@ -15,9 +15,21 @@ class CustomDataset(Dataset):
             mode='train',
             channel_size=56,
             window_size=3,
+            return_sample_id=False,
     ):
         super(CustomDataset, self).__init__()
-        self.files = [os.path.join(data_dir, mode, file) for file in os.listdir(os.path.join(data_dir, mode))]
+        # [KaggleERN bestval] 按最佳 epoch checkpoint 做事后干净推理时用；不影响现有
+        # 训练/评估行为（默认 False）。sample_id 就是 preprocess_KaggleERN_new.ipynb
+        # 存盘时用的 epoch_id（形如 "S02_Sess01_FB004"，即文件名去掉 .pickle），
+        # 前缀 "S(\d+)_" 就是被试号，跟 finetune_evaluator.py 的
+        # save_fold_predictions_npz 已经在用的 subj_re 保持一致。
+        self.return_sample_id = return_sample_id
+        # [bugfix] os.listdir 不保证顺序；sort 一下让 train/val/test 每次构造的文件
+        # 顺序都一样，方便复现和跟 sample_id 排序后的 npz 对齐（val/test 用 shuffle=False，
+        # 顺序不稳定会让"这次跑出来的第 N 个 batch"不可复现，虽不影响最终聚合指标）。
+        self.files = sorted(
+            os.path.join(data_dir, mode, file) for file in os.listdir(os.path.join(data_dir, mode))
+        )
         self.channel_size = channel_size
         self.window_size = window_size
 
@@ -32,6 +44,9 @@ class CustomDataset(Dataset):
         label = data_dict['label']
         # data = signal.resample(data, 2000, axis=-1)
         data = data.reshape(self.channel_size, self.window_size, 200) # for 30 channels
+        if self.return_sample_id:
+            sample_id = os.path.splitext(os.path.basename(file))[0]
+            return data/100, label, sample_id
         return data/100, label
 
     def collate(self, batch):

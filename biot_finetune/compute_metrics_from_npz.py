@@ -52,6 +52,10 @@ def bootstrap_ci_by_subject(y_true, y_pred, subject_id, n_classes, n_bootstrap=1
     subj_to_idx = {s: np.where(subject_id == s)[0] for s in subjects}
 
     bacc_samples, kappa_samples, macro_f1_samples, per_class_recall_samples = [], [], [], []
+    # [KaggleERN] 二分类任务额外收集正类 binary F1 的 bootstrap 样本，跟 macro_f1
+    # 并列存——类别不均衡时（如 pos_weight=0.413）macro_f1 会被多数类拉高，掩盖
+    # 少数类表现，f1_pos 只看正类，能更如实反映不均衡数据下的效果。
+    f1_pos_samples = [] if n_classes == 2 else None
     # 小样本 bootstrap 时，某次重采样很常见地不会覆盖全部 n_classes 个类别（比如
     # ISRUC 只有 10 个受试者，重采样出来的子集完全没有 REM 很正常），这时
     # recall_score/f1_score 对"预测了但真实标签里没有的类别"会打印
@@ -70,6 +74,8 @@ def bootstrap_ci_by_subject(y_true, y_pred, subject_id, n_classes, n_bootstrap=1
             kappa_samples.append(cohen_kappa_score(yt, yp, labels=labels_present))
             macro_f1_samples.append(f1_score(yt, yp, average="macro", labels=labels_present, zero_division=0))
             per_class_recall_samples.append(recall_score(yt, yp, labels=labels, average=None, zero_division=0))
+            if n_classes == 2:
+                f1_pos_samples.append(f1_score(yt, yp, pos_label=1, average="binary", zero_division=0))
 
     if len(bacc_samples) == 0:
         raise RuntimeError("bootstrap_ci_by_subject: every resample was empty; check subject_id/y_true.")
@@ -79,7 +85,7 @@ def bootstrap_ci_by_subject(y_true, y_pred, subject_id, n_classes, n_bootstrap=1
         return [float(lo), float(hi)]
 
     per_class_recall_arr = np.stack(per_class_recall_samples, axis=0)  # (n_bootstrap_eff, n_classes)
-    return {
+    result = {
         "ci_n_bootstrap": n_bootstrap,
         "ci_n_subjects": int(n_subj),
         "balanced_accuracy_ci95": _pct(bacc_samples),
@@ -87,6 +93,9 @@ def bootstrap_ci_by_subject(y_true, y_pred, subject_id, n_classes, n_bootstrap=1
         "macro_f1_ci95": _pct(macro_f1_samples),
         "per_class_recall_ci95": [_pct(per_class_recall_arr[:, c]) for c in range(n_classes)],
     }
+    if n_classes == 2:
+        result["f1_pos_ci95"] = _pct(f1_pos_samples)
+    return result
 
 
 def compute_metrics(npz_path, n_classes, ci=False, n_bootstrap=1000, ci_seed=0):
@@ -154,6 +163,10 @@ def compute_metrics(npz_path, n_classes, ci=False, n_bootstrap=1000, ci_seed=0):
             pr_auc = float(auc(recall, precision))
         metrics["roc_auc"] = roc_auc
         metrics["pr_auc"] = pr_auc
+        # f1_pos（正类 binary F1，跟宏平均的 macro_f1 不是一回事）在类别不均衡的
+        # 二分类任务（如 KaggleERN 的 pos_weight=0.413）上更能反映少数类表现；
+        # zero_division=0 把"这一折正类样本数为 0"处理成 0 而不是抛警告/异常。
+        metrics["f1_pos"] = float(f1_score(y_true, y_pred, pos_label=1, average="binary", zero_division=0))
 
     if ci:
         metrics.update(bootstrap_ci_by_subject(
@@ -197,7 +210,7 @@ def main():
               f"kappa={m['kappa']:.4f}  macro_f1={m['macro_f1']:.4f}")
         print(f"  per_class_recall={dict(zip(labels_for_print, ['%.4f' % r for r in m['per_class_recall']]))}")
         if 'roc_auc' in m:
-            print(f"  roc_auc={m['roc_auc']:.4f}  pr_auc={m['pr_auc']:.4f}")
+            print(f"  roc_auc={m['roc_auc']:.4f}  pr_auc={m['pr_auc']:.4f}  f1_pos={m['f1_pos']:.4f}")
         if 'balanced_accuracy_ci95' in m:
             lo, hi = m['balanced_accuracy_ci95']
             print(f"  balanced_accuracy 95% CI (n_subjects={m['ci_n_subjects']}, "
@@ -208,6 +221,9 @@ def main():
             print(f"  kappa 95% CI: [{lo:.4f}, {hi:.4f}]")
             for name, (lo, hi) in zip(labels_for_print, m['per_class_recall_ci95']):
                 print(f"  per_class_recall[{name}] 95% CI: [{lo:.4f}, {hi:.4f}]")
+            if 'f1_pos_ci95' in m:
+                lo, hi = m['f1_pos_ci95']
+                print(f"  f1_pos 95% CI: [{lo:.4f}, {hi:.4f}]")
 
         json_path = os.path.splitext(npz_path)[0] + ".json"
         if os.path.exists(json_path):

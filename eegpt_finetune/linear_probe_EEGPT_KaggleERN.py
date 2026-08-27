@@ -1,5 +1,7 @@
-import random 
+import argparse
+import random
 import os
+import re
 import math
 import torch
 from torch import nn
@@ -129,14 +131,19 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
         - 'label' : int, 0/1
         - 'epoch_id': str
     """
-    def __init__(self, root_dir: str, split: str = "train", expected_channels: int = 56):
+    def __init__(self, root_dir: str, split: str = "train", expected_channels: int = 56,
+                 return_epoch_id: bool = False):
         super().__init__()
         self.root_dir = root_dir
         self.split = split
         self.split_dir = os.path.join(root_dir, split)
         assert os.path.isdir(self.split_dir), f"{self.split_dir} 不存在"
-        
+
         self.expected_channels = expected_channels
+        # [KaggleERN bestval] 按最佳 epoch 权重做事后干净推理时用；不影响现有训练/
+        # 评估行为（默认 False）。sample_id 就是 pickle 里存的 'epoch_id'
+        # （形如 "S02_Sess01_FB004"），找不到就退化成文件名本身。
+        self.return_epoch_id = return_epoch_id
 
         # 过滤：只保留expected_channels通道的文件
         all_files = [
@@ -190,6 +197,9 @@ class KaggleEEGDataset(torch.utils.data.Dataset):
         x = torch.tensor(x, dtype=torch.float32)  # (C, T)
         y = torch.tensor(y, dtype=torch.long)
 
+        if self.return_epoch_id:
+            epoch_id = obj.get("epoch_id") or os.path.splitext(os.path.basename(path))[0]
+            return x, y, epoch_id
         return x, y
 
 
@@ -302,11 +312,19 @@ class LitEEGPTCausal(pl.LightningModule):
         
         self.running_scores = {"train":[], "valid":[]}
         self.is_sanity=True
-        
+
         # 用于记录混淆矩阵和指标
         self.output_dir = None  # 将在训练时设置
-        
-    
+
+        # [KaggleERN bestval] 按 valid_balanced_accuracy 记录最佳 epoch 的模型权重
+        # （内存中，CPU tensor），训练结束后用它对 val/test 集做一次干净重推理，存
+        # npz/json。跟 save_ckpt（磁盘 checkpoint，默认关闭）是两回事，这个不受
+        # save_ckpt 开关影响。跟 linear_probe_EEGPT_Sleep.py 是同一个思路。
+        self.best_val_bacc = -1.0
+        self.best_epoch = -1
+        self.best_state = None
+
+
     def forward(self, x):
         B, C, T = x.shape
         x = x/100
@@ -392,6 +410,12 @@ class LitEEGPTCausal(pl.LightningModule):
         
         print(f"\n[Epoch {epoch}] Validation - Acc: {acc:.4f}, BAcc: {bacc:.4f}")
         print(f"Confusion Matrix:\n{cm}")
+
+        # [KaggleERN bestval] 记录 valid_balanced_accuracy 最高的 epoch 权重（内存中）
+        if bacc > self.best_val_bacc:
+            self.best_val_bacc = bacc
+            self.best_epoch = epoch
+            self.best_state = {k: v.clone().cpu() for k, v in self.state_dict().items()}
 
         # 保存到文件
         if self.output_dir is not None:
@@ -623,6 +647,106 @@ def check_experiment_complete(batch_size, max_lr, weight_decay, freeze_encoder,
     return True, output_dir
 
 
+_KAGGLEERN_SUBJECT_RE = re.compile(r'^S(\d+)_')
+
+
+def save_kaggleern_epoch_results(model, output_dir, hyperparams, train_time_sec):
+    """[KaggleERN bestval] 用调用方已经载入 model 的最佳 valid_balanced_accuracy epoch
+    权重，对 val/test 集各重新做一次干净的推理（带 sample_id），保存：
+      kaggleern_eegpt_val.npz / kaggleern_eegpt_test.npz
+        -- sample_id(=epoch_id，已排序) / y_true / y_pred / y_prob(N,2) / subject_id
+      kaggleern_eegpt.json
+        -- 模型名/任务/超参数/总epoch数/best_epoch/val_bacc/test_bacc/数据目录/
+           val与test各类样本数
+    跟 linear_probe_EEGPT_Sleep.py 的 save_sleep_epoch_results 同一个思路：这里模型
+    本来就是 num_classes=2 的 softmax 分类器（不是 biot/cbramod 那种单 logit+sigmoid），
+    所以直接复用多分类的 npz 存法即可，n_classes=2 时 y_prob 天然就是 (N, 2)。
+    sample_id 是 preprocess_KaggleERN_new.ipynb 存盘时的 epoch_id（形如
+    "S02_Sess01_FB004"），用 ^S(\\d+)_ 解析出 subject_id，跟 finetune_evaluator.py/
+    compute_metrics_from_npz.py 已经在用的约定一致。任何失败都直接抛异常，不静默跳过。
+    """
+    device = next(model.parameters()).device
+    model.eval()
+
+    def _run_split(split_name):
+        dataset = KaggleEEGDataset(data_root, split=split_name, expected_channels=56,
+                                    return_epoch_id=True)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, num_workers=0, shuffle=False, pin_memory=False,
+        )
+
+        sample_ids, y_true, y_pred, y_prob, subject_ids = [], [], [], [], []
+        with torch.no_grad():
+            for x, y, batch_epoch_ids in loader:
+                x = x.to(device)
+                _, logit = model(x)
+                probs = torch.softmax(logit, dim=-1).cpu()
+                preds = torch.argmax(logit, dim=-1).cpu()
+                for i, sid in enumerate(batch_epoch_ids):
+                    m = _KAGGLEERN_SUBJECT_RE.match(sid)
+                    if not m:
+                        raise ValueError(f"Cannot parse subject_id from sample_id: {sid!r}")
+                    sample_ids.append(sid)
+                    y_true.append(int(y[i].item()))
+                    y_pred.append(int(preds[i].item()))
+                    y_prob.append(probs[i].numpy())
+                    subject_ids.append(int(m.group(1)))
+
+        if len(sample_ids) == 0:
+            raise RuntimeError(f"save_kaggleern_epoch_results: no samples collected for split={split_name!r}.")
+
+        sample_ids_arr = np.array(sample_ids)
+        order = np.argsort(sample_ids_arr)
+        sample_ids_arr = sample_ids_arr[order]
+        y_true_arr = np.array(y_true, dtype=np.int64)[order]
+        y_pred_arr = np.array(y_pred, dtype=np.int64)[order]
+        y_prob_arr = np.array(y_prob, dtype=np.float32)[order]
+        subject_id_arr = np.array(subject_ids, dtype=np.int64)[order]
+
+        npz_path = output_dir / f"kaggleern_eegpt_{split_name}.npz"
+        np.savez(
+            npz_path,
+            sample_id=sample_ids_arr, y_true=y_true_arr, y_pred=y_pred_arr, y_prob=y_prob_arr,
+            subject_id=subject_id_arr,
+        )
+        if not npz_path.exists():
+            raise RuntimeError(f"save_kaggleern_epoch_results: failed to write {npz_path}")
+
+        bacc = float(balanced_accuracy_score(y_true_arr, y_pred_arr))
+        class_counts = np.bincount(y_true_arr, minlength=num_classes).tolist()
+        print(f"Saved kaggleern {split_name} predictions to {npz_path} (balanced_accuracy={bacc:.5f})")
+        return str(npz_path), bacc, class_counts
+
+    val_npz_path, val_bacc, val_class_counts = _run_split("val")
+    test_npz_path, test_bacc, test_class_counts = _run_split("test")
+
+    meta = {
+        "model_name": "eegpt",
+        "task": "kaggleern",
+        "dataset_path": data_root,
+        "split_mode": "pooled_random_epoch",  # 见 preprocess_KaggleERN_new.ipynb：全体受试者按 epoch 随机切分，不是 LOSO
+        "total_epochs": max_epochs,
+        "best_epoch": model.best_epoch,
+        "val_balanced_accuracy": val_bacc,
+        "test_balanced_accuracy": test_bacc,
+        "val_class_counts": val_class_counts,
+        "test_class_counts": test_class_counts,
+        "val_npz_path": val_npz_path,
+        "test_npz_path": test_npz_path,
+        "saved_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": hyperparams,
+        "train_time_sec": train_time_sec,
+    }
+    json_path = output_dir / "kaggleern_eegpt.json"
+    with open(json_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    if not json_path.exists():
+        raise RuntimeError(f"save_kaggleern_epoch_results: failed to write {json_path}")
+
+    print(f"Saved kaggleern metadata to {json_path}")
+    print(f"  best_epoch={model.best_epoch} val_bacc={val_bacc:.5f} test_bacc={test_bacc:.5f}")
+
+
 def main():
     # 重新设定种子（实验级别）
     seed_torch(9)
@@ -749,12 +873,61 @@ def main():
     print(f"模式: {'线性探测' if freeze_encoder else '全局微调'}")
     print(f"Epochs: {max_epochs}, Batch size: {batch_size}, LR: {max_lr}\n")
 
+    train_start_time = datetime.now()
     trainer.fit(model, train_loader, valid_loader)
+    train_time_sec = (datetime.now() - train_start_time).total_seconds()
 
     print("\n训练完成！结果保存在:", output_dir.absolute())
 
+    # [KaggleERN bestval] 用 valid_balanced_accuracy 最高的 epoch 权重，对 val/test
+    # 各存一份 npz/json，供事后算 F1/per-class recall/confusion matrix/AUROC/AUPRC/CI，
+    # 不用重跑训练。
+    if model.best_state is None:
+        raise RuntimeError(
+            "KaggleERN training finished but model.best_state is None "
+            "(valid_balanced_accuracy was never recorded) -- check max_epochs / data_root."
+        )
+    model.load_state_dict(model.best_state)
+    model.to(next(model.parameters()).device)
+    save_kaggleern_epoch_results(model, output_dir, config, train_time_sec)
+
+
+def _parse_single_run_args():
+    """[新增] 只在传了 --single_run 时生效，跑固定的一组超参数（best-val / smoke 用），
+    不传任何参数时完全不影响原来 BS_LIST/LR_LIST/WD_LIST 网格搜索的行为。"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--single_run", action="store_true",
+                        help="Run once with the hyperparameters below instead of the BS_LIST/LR_LIST/WD_LIST grid search.")
+    parser.add_argument("--data_root", type=str, default=None)
+    parser.add_argument("--task_name", type=str, default=None, help="overrides TASK_NAME, used to name the output/ dir")
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--max_lr", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--max_epochs", type=int, default=None)
+    parser.add_argument("--save_ckpt", action="store_true")
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
+    _cli = _parse_single_run_args()
+    if _cli.single_run:
+        if _cli.data_root is not None:
+            data_root = _cli.data_root
+        if _cli.task_name is not None:
+            TASK_NAME = _cli.task_name
+        if _cli.batch_size is not None:
+            batch_size = _cli.batch_size
+        if _cli.max_lr is not None:
+            max_lr = _cli.max_lr
+        if _cli.weight_decay is not None:
+            weight_decay = _cli.weight_decay
+        if _cli.max_epochs is not None:
+            max_epochs = _cli.max_epochs
+        if _cli.save_ckpt:
+            save_ckpt = True
+        main()
+        raise SystemExit(0)
+
     # 网格搜索：遍历所有 (batch_size, lr, weight_decay) 组合
     for bs in BS_LIST:
         for lr in LR_LIST:

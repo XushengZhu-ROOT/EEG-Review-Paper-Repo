@@ -910,14 +910,56 @@ class StressLoader(torch.utils.data.Dataset):
         return torch.FloatTensor(X), Y
 
 
+# [KaggleERN channel fix] 完整的 56 通道原始蒙太奇顺序，跟
+# eegpt_finetune/linear_probe_EEGPT_KaggleERN.py 的 use_channels_names 一致
+# （也是 preprocessing/preprocess_KaggleERN_new.ipynb 里 df_to_raw_full() 存盘时
+# 的 CSV 列顺序）。labram/neurolm 现有的 55 通道 ch_names 列表比这份少一个 'PO8'——
+# 核对过 labram 自己的 standard_1020 字典，PO8 明明在里面（Seed 任务的 ch_names
+# 也在用它），说明当初漏抄了这一个，不是故意排除。但线上已经跑过并且产出过真实
+# 结果的 s42_n55-labram/s42_n55-neurolm 数据本身就是 55 通道（历史 HPO 跑得通就是
+# 证据——56 通道喂给只有 55 个位置编码的模型会在 pos_embed 那里直接 shape 对不上），
+# 所以这里不改动模型实际吃的通道数，只是让 loader 在拿到 56 通道的原始数据（新
+# smoke 数据就是这样)时，自动按名字丢掉 PO8 对齐到 55；已经是 55 通道的真实数据
+# 完全不受影响。
+KAGGLEERN_FULL_56_CH_NAMES = [
+    'FP1', 'FP2', 'AF7', 'AF3', 'AF4', 'AF8', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8',
+    'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5', 'C3', 'C1', 'CZ', 'C2',
+    'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3',
+    'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7', 'POZ', 'PO8', 'O1', 'O2',
+]
+
+
+def kaggleern_select_channel_idx(used_ch_names):
+    """给定模型实际使用的通道名列表（如 labram 的 55 通道 ch_names），
+    返回它们在 KAGGLEERN_FULL_56_CH_NAMES 里的下标列表，供 KaggleERNLoader
+    在遇到 56 通道原始数据时按名字选出对应的 55 个通道。"""
+    return [KAGGLEERN_FULL_56_CH_NAMES.index(name) for name in used_ch_names]
+
+
 class KaggleERNLoader(torch.utils.data.Dataset):
-    def __init__(self, root, files, sampling_rate=200, data_key='X', label_key='y'):
+    def __init__(self, root, files, sampling_rate=200, data_key='X', label_key='y',
+                 return_sample_id=False, select_channel_idx=None):
         self.root = root
         self.files = files
         self.default_rate = 200
         self.sampling_rate = sampling_rate
         self.data_key = data_key
         self.label_key = label_key
+        # [KaggleERN 通道修复] 只在原始数据是完整 56 通道时生效（见上面
+        # kaggleern_select_channel_idx 的说明）；真实的 55 通道数据不受影响，
+        # 不传这个参数（None）也完全不受影响，向后兼容。
+        self.select_channel_idx = select_channel_idx
+        # [KaggleERN bestval] 按最佳 epoch 权重做事后干净推理时用；不影响现有训练/
+        # 评估行为（默认 False）。sample_id 就是文件名本身（去掉 .pickle），
+        # preprocess_KaggleERN_new.ipynb 存盘时已经用 epoch_id（形如
+        # "S02_Sess01_FB004"）当文件名，不需要像 Motor 那样再算一遍。
+        self.return_sample_id = return_sample_id
+        if self.return_sample_id:
+            self.sample_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.files]
+            if len(set(self.sample_ids)) != len(self.sample_ids):
+                raise ValueError(
+                    "Duplicate sample_id detected in KaggleERNLoader; check for duplicate/conflicting epoch files."
+                )
 
     def __len__(self):
         return len(self.files)
@@ -932,10 +974,16 @@ class KaggleERNLoader(torch.utils.data.Dataset):
             raise KeyError(f"Label key '{self.label_key}' not found in {sample_path}")
 
         X = sample[self.data_key]
+        # [KaggleERN 通道修复] 只有真的是 56 通道原始数据时才做选择；已经是
+        # 目标通道数（55）的真实数据原样通过，不受影响。
+        if self.select_channel_idx is not None and X.shape[0] == len(KAGGLEERN_FULL_56_CH_NAMES):
+            X = X[self.select_channel_idx]
         if self.sampling_rate != self.default_rate:
             X = resample(X, 10 * self.sampling_rate, axis=-1)
         Y = sample[self.label_key]
         X = torch.FloatTensor(X)
+        if self.return_sample_id:
+            return X, Y, self.sample_ids[index]
         return X, Y
 
 # ===== [LOSO] 跨模型稳定的 sample_id，与 cbramod_finetune/datasets/motortask_dataset.py 的
@@ -1232,7 +1280,7 @@ def prepare_TUAB_dataset(root):
     return train_dataset, test_dataset, val_dataset
 
 
-def prepare_KaggleERN_dataset(root, data_key='signal', label_key='label'):
+def prepare_KaggleERN_dataset(root, data_key='signal', label_key='label', select_channel_idx=None):
     # set random seed
     seed = 12345
     np.random.seed(seed)
@@ -1245,9 +1293,11 @@ def prepare_KaggleERN_dataset(root, data_key='signal', label_key='label'):
     print(len(train_files), len(val_files), len(test_files))
 
     # prepare training and test data loader
-    train_dataset = KaggleERNLoader(os.path.join(root, "train"), train_files, data_key=data_key, label_key=label_key)
-    test_dataset = KaggleERNLoader(os.path.join(root, "test"), test_files, data_key=data_key, label_key=label_key)
-    val_dataset = KaggleERNLoader(os.path.join(root, "val"), val_files, data_key=data_key, label_key=label_key)
+    # select_channel_idx: [KaggleERN 通道修复] 见 kaggleern_select_channel_idx，
+    # None 时行为完全不变。
+    train_dataset = KaggleERNLoader(os.path.join(root, "train"), train_files, data_key=data_key, label_key=label_key, select_channel_idx=select_channel_idx)
+    test_dataset = KaggleERNLoader(os.path.join(root, "test"), test_files, data_key=data_key, label_key=label_key, select_channel_idx=select_channel_idx)
+    val_dataset = KaggleERNLoader(os.path.join(root, "val"), val_files, data_key=data_key, label_key=label_key, select_channel_idx=select_channel_idx)
     print(len(train_files), len(val_files), len(test_files))
     return train_dataset, test_dataset, val_dataset
 

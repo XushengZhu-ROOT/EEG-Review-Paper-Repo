@@ -100,6 +100,7 @@ from model import (
 from utils import (
     KaggleERNLoader, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE,
     StressLoader, collate_fn_stress_with_sample_id, list_stress_files_by_subject,
+    collate_fn_kaggleern_with_sample_id,
 )
 
 
@@ -323,7 +324,9 @@ def prepare_KaggleERN_dataloader(args):
     if args.dataset not in dataset_paths:
         raise ValueError(f"Undefined dataset: {args.dataset}")
 
-    root = dataset_paths[args.dataset]
+    # [KaggleERN bestval] --dataset_dir 显式指定时优先用它（smoke 测试指向本地
+    # ./biot_kaggleern_data_smoke），不传则维持原有硬编码绝对路径不变。
+    root = getattr(args, "dataset_dir", None) or dataset_paths[args.dataset]
 
     train_files = os.listdir(os.path.join(root, "train"))
     np.random.shuffle(train_files)
@@ -807,6 +810,172 @@ def save_stress_fold_results(args, lightning_model, checkpoint_callback, stress_
           f"best_epoch={best_epoch} balanced_accuracy={balanced_accuracy:.5f}")
 
 
+def save_kaggleern_epoch_results(args, lightning_model, checkpoint_callback,
+                                  best_epoch, train_time_sec, save_dir):
+    """[KaggleERN bestval] 用 val_bacc 最好的那个 epoch(checkpoint_callback.best_model_path)
+    对 val/test 集各重新做一次干净推理，保存：
+      kaggleern_{model}_val.npz / kaggleern_{model}_test.npz
+        -- sample_id(=epoch_id，已排序) / y_true / y_pred / y_prob(N,2) / subject_id
+      kaggleern_{model}.json
+        -- 模型名/任务/超参数/总epoch数/best_epoch/val_bacc/test_bacc/checkpoint路径/
+           val与test各类样本数
+
+    跟 run_multiclass_supervised.py 的 save_sleep_epoch_results 同一个思路（KaggleERN
+    跟 Sleep 一样是固定的 train/val/test 单次划分，不是 LOSO，所以 val/test 都要存）；
+    区别在于这里是二分类，模型输出单个 logit，sigmoid+0.5 阈值出 y_pred，y_prob 拼成
+    (N, 2) 的 [1-P(positive), P(positive)]，跟 save_stress_fold_results 用同一套约定。
+
+    这里重新构造 val/test 的 DataLoader（KaggleERNLoader(..., return_sample_id=True)），
+    不复用 supervised() 里已经建好的 val_loader/test_loader——那两个是训练用的普通
+    (X, Y) 二元组，不带 sample_id。跟 save_stress_fold_results 是同一个思路。
+    任何失败都直接抛异常，不静默跳过。
+    """
+    best_ckpt_path = checkpoint_callback.best_model_path
+    if not best_ckpt_path or not os.path.exists(best_ckpt_path):
+        raise RuntimeError(
+            f"save_kaggleern_epoch_results: no best checkpoint found (best_model_path={best_ckpt_path!r})"
+        )
+    state = torch.load(best_ckpt_path, map_location="cpu")
+    lightning_model.load_state_dict(state["state_dict"])
+
+    model = lightning_model.model
+    device = next(model.parameters()).device
+    model.eval()
+
+    dataset_paths = {
+        "KaggleERN": "/work/HHRI-AI/UCSD_EEG/eeg_data/EEG_data/EEGPT_Data/KaggleERN/s42_n56-biot"
+    }
+    root = getattr(args, "dataset_dir", None) or dataset_paths[args.dataset]
+
+    task = args.task_name if args.task_name else args.dataset.lower()
+    model_name = args.model_name
+    os.makedirs(save_dir, exist_ok=True)
+
+    subj_re = re.compile(r'^S(\d+)_')
+
+    def _run_split(split_name):
+        files = os.listdir(os.path.join(root, split_name))
+        loader = torch.utils.data.DataLoader(
+            KaggleERNLoader(os.path.join(root, split_name), files,
+                             sampling_rate=args.sampling_rate, return_sample_id=True),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn_kaggleern_with_sample_id,
+        )
+
+        sample_ids, y_true, y_pred, y_prob, subject_ids = [], [], [], [], []
+        with torch.no_grad():
+            for X, Y, batch_sample_ids in loader:
+                X = X.to(device)
+                logits = model(X).view(-1)
+                prob_pos = torch.sigmoid(logits)
+                preds = (prob_pos > 0.5).long()
+                probs = torch.stack([1 - prob_pos, prob_pos], dim=-1)
+                for i, sid in enumerate(batch_sample_ids):
+                    m = subj_re.match(sid)
+                    if not m:
+                        raise ValueError(f"Cannot parse subject_id from sample_id: {sid!r}")
+                    sample_ids.append(sid)
+                    y_true.append(int(Y[i].item()))
+                    y_pred.append(int(preds[i].cpu().item()))
+                    y_prob.append(probs[i].cpu().numpy())
+                    subject_ids.append(int(m.group(1)))
+
+        if len(sample_ids) == 0:
+            raise RuntimeError(f"save_kaggleern_epoch_results: no samples collected for split={split_name!r}.")
+
+        sample_ids_arr = np.array(sample_ids)
+        order = np.argsort(sample_ids_arr)
+        sample_ids_arr = sample_ids_arr[order]
+        y_true_arr = np.array(y_true, dtype=np.int64)[order]
+        y_pred_arr = np.array(y_pred, dtype=np.int64)[order]
+        y_prob_arr = np.array(y_prob, dtype=np.float32)[order]
+        subject_id_arr = np.array(subject_ids, dtype=np.int64)[order]
+
+        npz_path = os.path.join(save_dir, f"{task}_{model_name}_{split_name}.npz")
+        if os.path.exists(npz_path):
+            ts = _time.strftime("%Y%m%d-%H%M%S")
+            backup_path = f"{npz_path}.bak-{ts}"
+            os.rename(npz_path, backup_path)
+            print(f"[warn] existing kaggleern result found, backed up to {backup_path}")
+
+        np.savez(
+            npz_path,
+            sample_id=sample_ids_arr, y_true=y_true_arr, y_pred=y_pred_arr, y_prob=y_prob_arr,
+            subject_id=subject_id_arr,
+        )
+        if not os.path.exists(npz_path):
+            raise RuntimeError(f"save_kaggleern_epoch_results: failed to write {npz_path}")
+        _reload = np.load(npz_path)
+        for key in ("sample_id", "y_true", "y_pred", "y_prob", "subject_id"):
+            if key not in _reload:
+                raise RuntimeError(f"save_kaggleern_epoch_results: {npz_path} missing key {key!r} after write")
+
+        bacc = float(balanced_accuracy_score(y_true_arr, y_pred_arr))
+        class_counts = np.bincount(y_true_arr, minlength=2).tolist()
+        print(f"Saved kaggleern {split_name} predictions to {npz_path} (balanced_accuracy={bacc:.5f})")
+        return npz_path, bacc, class_counts
+
+    val_npz_path, val_bacc, val_class_counts = _run_split("val")
+    test_npz_path, test_bacc, test_class_counts = _run_split("test")
+
+    hyperparams = {
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "model": args.model,
+        "dataset_channels": args.dataset_channels,
+        "in_channels": args.in_channels,
+        "sample_length": args.sample_length,
+        "sampling_rate": args.sampling_rate,
+        "token_size": args.token_size,
+        "hop_length": args.hop_length,
+        "freeze_backbone": bool(args.freeze_backbone),
+    }
+
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    peak_gpu_mem_mb = (torch.cuda.max_memory_allocated(0) / (1024 ** 2)) if torch.cuda.is_available() else None
+
+    meta = {
+        "model_name": model_name,
+        "task": task,
+        "dataset": args.dataset,
+        "split_mode": "pooled_random_epoch",  # 见 preprocess_KaggleERN_new.ipynb：全体受试者按 epoch 随机切分，不是 LOSO
+        "total_epochs": args.epochs,
+        "best_epoch": best_epoch,
+        "val_balanced_accuracy": val_bacc,
+        "test_balanced_accuracy": test_bacc,
+        "val_class_counts": val_class_counts,
+        "test_class_counts": test_class_counts,
+        "checkpoint_path": best_ckpt_path,
+        "val_npz_path": val_npz_path,
+        "test_npz_path": test_npz_path,
+        "saved_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": hyperparams,
+        "train_time_sec": train_time_sec,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "gpu_name": gpu_name,
+    }
+
+    json_path = os.path.join(save_dir, f"{task}_{model_name}.json")
+    if os.path.exists(json_path):
+        ts = _time.strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{json_path}.bak-{ts}"
+        os.rename(json_path, backup_path)
+        print(f"[warn] existing kaggleern sidecar json found, backed up to {backup_path}")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"save_kaggleern_epoch_results: failed to write {json_path}")
+    with open(json_path) as f:
+        json.load(f)  # 回读校验 JSON 没写坏
+
+    print(f"Saved kaggleern metadata to {json_path}")
+    print(f"  best_epoch={best_epoch} val_bacc={val_bacc:.5f} test_bacc={test_bacc:.5f}")
+
+
 def supervised(args):
     stress_test_meta = None
     is_stress_loso = (
@@ -1022,7 +1191,8 @@ def supervised(args):
     )
 
     # train the model
-    if is_stress_loso and torch.cuda.is_available():
+    is_kaggleern = args.dataset == "KaggleERN"
+    if (is_stress_loso or is_kaggleern) and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     train_start_time = _time.time()
     trainer.fit(
@@ -1041,6 +1211,14 @@ def supervised(args):
     if is_stress_loso:
         save_stress_fold_results(
             args, lightning_model, checkpoint_callback, stress_test_meta,
+            best_epoch_tracker.best_epoch, train_time_sec, save_dir=(args.fold_results_dir or log_dir),
+        )
+
+    # [KaggleERN bestval] KaggleERN 是固定 train/val/test 单次划分（不是 LOSO），
+    # 跟 Sleep 一样 val/test 都要存，用 val_bacc 最好的 epoch 重新推理两遍。
+    if is_kaggleern:
+        save_kaggleern_epoch_results(
+            args, lightning_model, checkpoint_callback,
             best_epoch_tracker.best_epoch, train_time_sec, save_dir=(args.fold_results_dir or log_dir),
         )
 
@@ -1114,6 +1292,12 @@ if __name__ == "__main__":
                         help="task label used in saved filenames; defaults to dataset.lower()")
     parser.add_argument("--fold_results_dir", type=str, default=None,
                         help="where to save {task}_{model}_fold{i}.npz/json; defaults to the run's log_dir")
+    # [KaggleERN bestval] 覆盖 prepare_KaggleERN_dataloader() 里硬编码的远程绝对路径；
+    # 不传时行为完全不变（还是走 dataset_paths["KaggleERN"] 那个绝对路径），只有显式传
+    # --dataset_dir 才会用这里的目录（smoke 测试时指向 ./biot_kaggleern_data_smoke）。
+    parser.add_argument("--dataset_dir", type=str, default=None,
+                        help="Override the dataset root directory for --dataset KaggleERN "
+                             "(must contain train/val/test subdirs); default uses the hardcoded path.")
     args = parser.parse_args()
 
     if args.dataset_channels is None:

@@ -13,6 +13,8 @@ from utils import (
     extract_motor_subject_id,
     compute_stress_sample_id,
     extract_stress_subject_id,
+    compute_kaggleern_sample_id,
+    extract_kaggleern_subject_id,
 )
 
 
@@ -29,10 +31,8 @@ class KaggleERNDataset(EEGDataset):
         root_path="",
         matrix_p_path=None,
         gpt_only=True,
-        # [LOSO] 是否在 __getitem__ 中额外返回 sample_id（仅 Stress 任务 subject_independent
-        # 划分使用）。默认 False，与现有 KaggleERN / stress random_epoch 调用点行为完全一致。
-        # Stress 的 chunk 文件名（'SubNN_increase_edfNN_chunkNNNN'）才能被
-        # compute_stress_sample_id/extract_stress_subject_id 解析；KaggleERN 不支持置 True。
+        # [KaggleERN bestval] 是否在 __getitem__ 中额外返回 sample_id（best-val 训练
+        # 结束后对 val/test 做干净重推理时用）。默认 False，不影响现有训练/评估行为。
         return_sample_id=False,
     ):
         super().__init__(
@@ -122,11 +122,11 @@ class KaggleERNDataset(EEGDataset):
 
             if self.return_sample_id:
                 chunk_id = os.path.splitext(os.path.basename(file_path))[0]
-                sample_ids_all.append(compute_stress_sample_id(chunk_id))
-                subj = extract_stress_subject_id(file_path)
+                sample_ids_all.append(compute_kaggleern_sample_id(chunk_id))
+                subj = extract_kaggleern_subject_id(file_path)
                 if subj is None:
                     raise ValueError(f"Cannot extract subject id from {file_path}")
-                subject_ids_all.append(int(subj[3:]))
+                subject_ids_all.append(int(subj[1:]))
 
         total_num = len(trials_all)
 

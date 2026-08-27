@@ -71,10 +71,34 @@ def get_chans(ch_names):
         chans.append(standard_1020.index(ch_name))
     return chans
 
+_KAGGLEERN_SUBJECT_RE = re.compile(r'^S(\d+)_')
+
+# [KaggleERN 通道修复] 完整的 56 通道原始蒙太奇顺序，跟
+# eegpt_finetune/linear_probe_EEGPT_KaggleERN.py 的 use_channels_names 一致（也是
+# preprocessing/preprocess_KaggleERN_new.ipynb 里 df_to_raw_full() 存盘时的 CSV
+# 列顺序）。KaggleERNLoader.ch_names（下面，55 通道）比这份少一个 'PO8'——核对过
+# neurolm 自己 dataset.py 的 standard_1020 字典，PO8 明明在里面，说明当初漏抄了
+# 这一个，不是故意排除。但线上已经跑过并且产出过真实 HPO 结果的 s42_n55-neurolm
+# 数据本身就是 55 通道（历史结果就是证据），所以这里不改模型实际吃的通道数，只是
+# 让 loader 在拿到 56 通道的原始数据（新 smoke 数据就是这样）时自动按名字丢掉
+# PO8 对齐到 55；已经是 55 通道的真实数据完全不受影响。
+_KAGGLEERN_FULL_56_CH_NAMES = [
+    'FP1', 'FP2', 'AF7', 'AF3', 'AF4', 'AF8', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8',
+    'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5', 'C3', 'C1', 'CZ', 'C2',
+    'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3',
+    'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7', 'POZ', 'PO8', 'O1', 'O2',
+]
+
+
 class KaggleERNLoader(Dataset):
     # increase: 1
     # normal: 0
-    def __init__(self, root, files, chan_size, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False):
+    def __init__(self, root, files, chan_size, sampling_rate=200, eeg_max_len=-1, text_max_len=-1, is_instruct=False, is_val=False,
+                 # [KaggleERN bestval] 是否额外返回 (sample_id, subject_id)（仅
+                 # is_val=True 时生效）。默认 False，保持旧调用点字节不变。sample_id
+                 # 就是文件名本身（去掉 .pickle），preprocess_KaggleERN_new.ipynb
+                 # 存盘时已经用 epoch_id（形如 "S02_Sess01_FB004"）当文件名。
+                 return_sample_id=False):
         self.root = root
         self.files = files
         self.chan_size = chan_size
@@ -84,8 +108,25 @@ class KaggleERNLoader(Dataset):
         self.is_val = is_val
         self.eeg_max_len = eeg_max_len
         self.text_max_len = text_max_len
+        self.return_sample_id = return_sample_id
+
+        if self.return_sample_id:
+            self.sample_ids = [os.path.splitext(os.path.basename(f))[0] for f in files]
+            self.subject_ids = []
+            for sid in self.sample_ids:
+                m = _KAGGLEERN_SUBJECT_RE.match(sid)
+                if not m:
+                    raise ValueError(f"Cannot parse subject_id from sample_id: {sid!r}")
+                self.subject_ids.append(int(m.group(1)))
+            if len(set(self.sample_ids)) != len(self.sample_ids):
+                raise ValueError(
+                    "Duplicate sample_id detected in KaggleERNLoader; check for duplicate/conflicting epoch files."
+                )
 
         self.ch_names = ['FP1', 'FP2', 'AF7', 'AF3', 'AF4', 'AF8', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5', 'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7', 'POZ', 'O1', 'O2']
+        # [KaggleERN 通道修复] 只在 __getitem__ 遇到 56 通道原始数据时才会用上，
+        # 见上面 _KAGGLEERN_FULL_56_CH_NAMES 的说明。
+        self._select_channel_idx = [_KAGGLEERN_FULL_56_CH_NAMES.index(name) for name in self.ch_names]
 
         if is_instruct:
             enc = tiktoken.get_encoding("gpt2")
@@ -104,6 +145,11 @@ class KaggleERNLoader(Dataset):
         sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
         X = sample["signal"]
         Y = sample["label"]
+
+        # [KaggleERN 通道修复] 只有真的是 56 通道原始数据时才做选择；已经是目标
+        # 通道数（55）的真实数据原样通过，不受影响。
+        if X.shape[0] == len(_KAGGLEERN_FULL_56_CH_NAMES):
+            X = X[self._select_channel_idx]
 
         # data = torch.FloatTensor(X / 100)
         data = torch.FloatTensor(X)
@@ -160,8 +206,14 @@ class KaggleERNLoader(Dataset):
         gpt_mask[:, :, valid_eeg_len:X_eeg.size(0)] = 0
         
         if self.is_val:
+            if self.return_sample_id:
+                # [KaggleERN bestval] evaluate_probs() 要求 9 元组，末两个是
+                # sample_id / subject_id，跟 CustomStressLoader(is_val=True,
+                # return_sample_id=True) 的约定一致。
+                return (X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool(),
+                        self.sample_ids[index], self.subject_ids[index])
             return X_eeg, text, Y, input_chans, input_time, eeg_mask.bool(), gpt_mask.bool()
-        
+
         Y_text = torch.full_like(text, fill_value=-1)
         prompt_len = self.prompt.size(0)
         Y_text[prompt_len - 1:valid_text_len - 1] = text[prompt_len:valid_text_len]

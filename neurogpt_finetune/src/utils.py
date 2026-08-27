@@ -179,6 +179,30 @@ def extract_stress_subject_id(name):
     return m.group(1) if m else None
 
 
+# ===== [KaggleERN bestval] KaggleERN 的 epoch_id 命名跟 Stress 不一样（形如
+# "S02_Sess01_FB004"，preprocess_KaggleERN_new.ipynb 存盘时用的就是这个当文件名），
+# 不能套用 compute_stress_sample_id/extract_stress_subject_id 的 "SubNN_..." 正则，
+# 这里单独写一份，跟 biot_finetune/finetune_evaluator.py 等已经在用的
+# "^S(\\d+)_" 被试号解析约定保持一致。 =====
+_KAGGLEERN_SAMPLE_ID_RE = re.compile(r'^S(\d+)_')
+_KAGGLEERN_SUBJECT_RE = re.compile(r'^(S\d+)_')
+
+
+def compute_kaggleern_sample_id(epoch_id):
+    """KaggleERN 的 epoch_id 本来就是唯一、稳定、跨模型一致的标识（各架构的
+    preprocess_KaggleERN_new.ipynb 都用它当文件名），不需要像 Motor/Stress 那样
+    重新编号，原样返回即可；这里只做一次格式校验，防止传入意料之外的文件名。"""
+    if not _KAGGLEERN_SAMPLE_ID_RE.match(epoch_id):
+        raise ValueError(f"Cannot parse epoch_id for sample_id: {epoch_id!r}")
+    return epoch_id
+
+
+def extract_kaggleern_subject_id(name):
+    """'S02_Sess01_FB004.pickle'（或包含它的任意路径）-> 'S02'。"""
+    m = _KAGGLEERN_SUBJECT_RE.search(os.path.basename(name))
+    return m.group(1) if m else None
+
+
 def list_stress_files_by_subject(root):
     """[LOSO] 扫描 root/{train,val,test}/*.pickle，按受试者分组（'Sub04' -> [abs_path, ...]），
     用于构造 Stress 任务的受试者独立（LOSO）划分。返回绝对路径。"""

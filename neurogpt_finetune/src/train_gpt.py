@@ -545,6 +545,188 @@ def save_sleep_epoch_results(config: Dict, trainer: Trainer, val_dataset, test_d
     print(f"  best_epoch={meta['best_epoch']} val_bacc={val_bacc:.5f} test_bacc={test_bacc:.5f}")
 
 
+def _kaggleern_prediction_to_npz_fields(dataset, prediction):
+    """[KaggleERN bestval] 把 trainer.predict(dataset) 的结果（dataset 以
+    return_sample_id=True 构造，predict() 内部走确定性的 SequentialSampler，顺序与
+    dataset.sample_ids/.subject_ids 逐条对应）转成排好序的 sample_id/y_true/y_pred/
+    y_prob/subject_id 数组。跟 _sleep_prediction_to_npz_fields 是同一个思路，区别
+    只是 KaggleERN 的 sample_id（形如 "S02_Sess01_FB004"）没有 epoch_index 概念，
+    npz 里不存这一项——跟 save_loso_fold_results 的 Motor6Class npz schema一致。
+    """
+    sample_ids = dataset.sample_ids
+    subject_ids = dataset.subject_ids
+    n = len(sample_ids)
+    if n == 0:
+        raise RuntimeError("_kaggleern_prediction_to_npz_fields: dataset has 0 samples, refusing to save an empty file.")
+
+    preds_logits = np.asarray(prediction.predictions)
+    y_true_raw = np.asarray(prediction.label_ids)
+    if len(y_true_raw) != n:
+        raise RuntimeError(
+            f"_kaggleern_prediction_to_npz_fields: label length mismatch "
+            f"(labels={len(y_true_raw)}, expected {n} from dataset)"
+        )
+
+    # "decoding" 训练模式下模型对每个样本输出的是逐 chunk(时间步)的 logits，可能跟
+    # label_ids 的长度 n 对不上，需要按 chunk 维度取平均——跟
+    # _sleep_prediction_to_npz_fields/trainer/make.py::make_decoding_accuracy_metrics()
+    # 处理的是同一种情况，这里复刻同样的做法。
+    if len(preds_logits) != n:
+        if len(preds_logits) % n != 0:
+            raise RuntimeError(
+                f"_kaggleern_prediction_to_npz_fields: prediction length {len(preds_logits)} is not a "
+                f"multiple of dataset length {n}; cannot reshape into (n, num_chunks, num_classes)."
+            )
+        num_chunks_effective = len(preds_logits) // n
+        preds_logits = preds_logits.reshape(n, num_chunks_effective, -1).mean(axis=1)
+        print(f"[info] pooled decoding-style predictions: {n}*{num_chunks_effective} chunks -> {n} epoch-level logits")
+
+    # encoder/base.py 在 --ft-only-encoder=True 时把 n_outputs<=2 的分类头折叠成单个
+    # logit（BCEWithLogitsLoss），跟 save_loso_fold_results/_sleep_prediction_to_npz_fields
+    # 的判定逻辑一致：(N,1) 或 1维时走 sigmoid+阈值，否则走 softmax+argmax。
+    if preds_logits.shape[-1] == 1 or preds_logits.ndim == 1:
+        logits_1d = preds_logits.reshape(-1).astype(np.float32)
+        prob_pos = torch.sigmoid(torch.from_numpy(logits_1d)).numpy()
+        y_pred_all = (logits_1d > 0).astype(np.int64)
+        y_prob_all = np.stack([1.0 - prob_pos, prob_pos], axis=-1)
+    else:
+        y_prob_all = torch.nn.functional.softmax(torch.from_numpy(preds_logits).float(), dim=-1).numpy()
+        y_pred_all = preds_logits.argmax(axis=-1)
+
+    sample_ids_arr = np.array(sample_ids)
+    order = np.argsort(sample_ids_arr)
+    return {
+        "sample_id": sample_ids_arr[order],
+        "y_true": y_true_raw.astype(np.int64)[order],
+        "y_pred": y_pred_all.astype(np.int64)[order],
+        "y_prob": y_prob_all.astype(np.float32)[order],
+        "subject_id": np.array(subject_ids, dtype=np.int64)[order],
+    }
+
+
+def save_kaggleern_epoch_results(config: Dict, trainer: Trainer, val_dataset, test_dataset,
+                                  val_prediction, test_prediction, train_time_sec: float) -> None:
+    """[KaggleERN bestval] 保存 KaggleERN 的 val/test 结果：
+      kaggleern_{model}_val.npz / kaggleern_{model}_test.npz
+        -- sample_id(=epoch_id，已排序) / y_true / y_pred / y_prob(N,2) / subject_id
+      kaggleern_{model}.json
+        -- 模型名/任务/lr/wd/bs/best_epoch/val_bacc/test_bacc/数据目录/val与test各类样本数
+    跟 save_sleep_epoch_results 同一个思路：直接复用 trainer.predict() 已经算出来的
+    结果（val_dataset/test_dataset 都以 return_sample_id=True 构造），不重新加载
+    模型/重新推理，也不改动训练逻辑。KaggleERN 不是 LOSO，没有 fold/test_subject/
+    val_subject，所以单独写一份。任何失败都直接抛异常退出，不静默跳过。
+    """
+    if not (getattr(val_dataset, "return_sample_id", False) and getattr(test_dataset, "return_sample_id", False)):
+        raise RuntimeError("save_kaggleern_epoch_results requires val/test datasets built with return_sample_id=True")
+
+    val_data = _kaggleern_prediction_to_npz_fields(val_dataset, val_prediction)
+    test_data = _kaggleern_prediction_to_npz_fields(test_dataset, test_prediction)
+
+    task = config.get("task_name") or config["dataset_name"]
+    model_name = config.get("model_name") or "neurogpt"
+    save_dir = config.get("fold_results_dir") or config["log_dir"]
+    if not save_dir:
+        raise ValueError("save_kaggleern_epoch_results requires --fold-results-dir or --log-dir to be set")
+    os.makedirs(save_dir, exist_ok=True)
+
+    val_npz_path = os.path.join(save_dir, f"{task}_{model_name}_val.npz")
+    test_npz_path = os.path.join(save_dir, f"{task}_{model_name}_test.npz")
+    for path, data in ((val_npz_path, val_data), (test_npz_path, test_data)):
+        if os.path.exists(path):
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_path = f"{path}.bak-{ts}"
+            os.rename(path, backup_path)
+            print(f"[warn] existing kaggleern result found, backed up to {backup_path}")
+        np.savez(path, **data)
+        if not os.path.exists(path):
+            raise RuntimeError(f"save_kaggleern_epoch_results: failed to write {path}")
+        _reload = np.load(path)
+        for key in ("sample_id", "y_true", "y_pred", "y_prob", "subject_id"):
+            if key not in _reload:
+                raise RuntimeError(f"save_kaggleern_epoch_results: {path} missing key {key!r} after write")
+            if len(_reload[key]) != len(data["sample_id"]):
+                raise RuntimeError(f"save_kaggleern_epoch_results: {path} key {key!r} length mismatch after write")
+
+    from sklearn.metrics import balanced_accuracy_score
+    val_bacc = float(balanced_accuracy_score(val_data["y_true"], val_data["y_pred"]))
+    test_bacc = float(balanced_accuracy_score(test_data["y_true"], test_data["y_pred"]))
+    n_classes = config.get("num_decoding_classes") or 2
+    val_class_counts = np.bincount(val_data["y_true"], minlength=n_classes).tolist()
+    test_class_counts = np.bincount(test_data["y_true"], minlength=n_classes).tolist()
+
+    metric_key = config["metric_for_best_model"]
+    best_epoch, best_step = None, None
+    if trainer.state.best_metric is not None:
+        for entry in trainer.state.log_history:
+            if metric_key in entry and abs(entry[metric_key] - trainer.state.best_metric) < 1e-6:
+                best_epoch = entry.get("epoch")
+                best_step = entry.get("step")
+                break
+    if best_epoch is None:
+        raise RuntimeError(
+            "save_kaggleern_epoch_results: could not determine best_epoch from trainer.state "
+            f"(best_metric={trainer.state.best_metric}, metric_for_best_model={metric_key!r})."
+        )
+
+    hyperparams = {
+        "learning_rate": config["learning_rate"],
+        "weight_decay": config["weight_decay"],
+        "per_device_training_batch_size": config["per_device_training_batch_size"],
+        "training_steps": config["training_steps"],
+        "eval_every_n_steps": config["eval_every_n_steps"],
+        "optim": config["optim"],
+        "seed": config["seed"],
+        "metric_for_best_model": metric_key,
+        "cls_head_layer": config["cls_head_layer"],
+        "ft_only_encoder": config["ft_only_encoder"],
+        "num_hidden_layers": config["num_hidden_layers"],
+        "num_encoder_layers": config["num_encoder_layers"],
+        "embedding_dim": config["embedding_dim"],
+    }
+
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    peak_gpu_mem_mb = (torch.cuda.max_memory_allocated(0) / (1024 ** 2)) if torch.cuda.is_available() else None
+
+    meta = {
+        "model_name": model_name,
+        "task": task,
+        "dataset": config["dataset_name"],
+        "split_mode": "pooled_random_epoch",  # 见 preprocess_KaggleERN_new.ipynb：全体受试者按 epoch 随机切分，不是 LOSO
+        "dataset_path": config.get("dst_data_path"),
+        "best_epoch": int(round(best_epoch)),
+        "best_epoch_exact": best_epoch,
+        "best_step": best_step,
+        "val_balanced_accuracy": val_bacc,
+        "test_balanced_accuracy": test_bacc,
+        "val_class_counts": val_class_counts,
+        "test_class_counts": test_class_counts,
+        "val_npz_path": val_npz_path,
+        "test_npz_path": test_npz_path,
+        "saved_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": hyperparams,
+        "train_time_sec": train_time_sec,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "gpu_name": gpu_name,
+    }
+
+    json_path = os.path.join(save_dir, f"{task}_{model_name}.json")
+    if os.path.exists(json_path):
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{json_path}.bak-{ts}"
+        os.rename(json_path, backup_path)
+        print(f"[warn] existing kaggleern sidecar json found, backed up to {backup_path}")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    if not os.path.exists(json_path):
+        raise RuntimeError(f"save_kaggleern_epoch_results: failed to write {json_path}")
+    with open(json_path) as f:
+        json.load(f)  # 回读校验 JSON 没写坏
+
+    print(f"Saved kaggleern val/test predictions to {val_npz_path} / {test_npz_path}")
+    print(f"Saved kaggleern metadata to {json_path}")
+    print(f"  best_epoch={meta['best_epoch']} val_bacc={val_bacc:.5f} test_bacc={test_bacc:.5f}")
+
+
 def train(config: Dict = None) -> Trainer:
     """Model training according to config.
     -> see get_args() below for all command
@@ -671,7 +853,11 @@ def train(config: Dict = None) -> Trainer:
 
             matrix_p_path = ""
             if dataset_name == "KaggleERN":
-                matrix_p_path = "../inputs/tMatrix_22x56_KaggleERN.npy"
+                # [KaggleERN bestval fix] 之前指向 "../inputs/tMatrix_22x56_KaggleERN.npy"，
+                # 但 neurogpt_finetune 目录下根本没有 inputs/ 子目录（tMatrix_22x30_stress.npy/
+                # tMatrix_22x6_seed.npy 这些矩阵文件都是直接放在 neurogpt_finetune/ 下），
+                # 跑什么都会在 KaggleERNDataset.__init__ 里 FileNotFoundError。改成实际文件位置。
+                matrix_p_path = "../tMatrix_22x56.npy"
             elif dataset_name == "stress":
                 matrix_p_path = "../inputs/tMatrix_22x30_stress.npy"
             else:
@@ -708,6 +894,11 @@ def train(config: Dict = None) -> Trainer:
                 root_path=test_path,
                 matrix_p_path=matrix_p_path,
                 gpt_only=not config["use_encoder"],
+                # [KaggleERN bestval] test_dataset 只在训练结束后被 trainer.predict()
+                # 用一次（不像 validation_dataset 会被周期性训练中评估复用），可以
+                # 直接打开 return_sample_id，不影响正常训练/评估流程。只对 KaggleERN
+                # 开，不动这个分支里共用的 "stress" 数据集的现有行为。
+                return_sample_id=(dataset_name == "KaggleERN"),
             )
 
         elif dataset_name == "motor6class":
@@ -1146,6 +1337,28 @@ def train(config: Dict = None) -> Trainer:
             )
             val_prediction = trainer.predict(val_dataset_for_npz)
             save_sleep_epoch_results(
+                config, trainer, val_dataset_for_npz, test_dataset,
+                val_prediction, test_prediction, train_time_sec,
+            )
+        elif config["dataset_name"] == "KaggleERN":
+            # [KaggleERN bestval] 同样的思路：test_dataset 在构造时已经
+            # return_sample_id=True（见上面的 KaggleERNDataset 构造），val_dataset
+            # 复用当时用过的 val_files/val_path/matrix_p_path，单独建一份
+            # return_sample_id=True 的实例，理由跟 Sleep 分支一致——不能直接改
+            # validation_dataset 本身，那个还要被 HF Trainer 训练期间的周期性 eval 复用。
+            val_dataset_for_npz = KaggleERNDataset(
+                val_files,
+                sample_keys=["inputs", "attention_mask"],
+                chunk_len=config["chunk_len"],
+                num_chunks=config["num_chunks"],
+                ovlp=config["chunk_ovlp"],
+                root_path=val_path,
+                matrix_p_path=matrix_p_path,
+                gpt_only=not config["use_encoder"],
+                return_sample_id=True,
+            )
+            val_prediction = trainer.predict(val_dataset_for_npz)
+            save_kaggleern_epoch_results(
                 config, trainer, val_dataset_for_npz, test_dataset,
                 val_prediction, test_prediction, train_time_sec,
             )
