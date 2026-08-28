@@ -1,1 +1,0 @@
-bash scripts/review-finetune-motortask_R2_loso.sh

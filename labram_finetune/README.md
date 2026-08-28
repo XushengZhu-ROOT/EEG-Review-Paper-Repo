@@ -1,1 +1,0 @@
-bash review-finetune-Motor-LOSO.sh
